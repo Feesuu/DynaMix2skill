@@ -50,7 +50,7 @@ def test_cluster_analyst_uses_all_members_not_member_cap():
     analyst = ClusterAnalyst(None, None, ClusterAnalystConfig())  # type: ignore[arg-type]
     community = ExperienceCommunity(community_id="C0", level=0, member_weights={f"t{i}": 1.0 for i in range(20)})
     members = [ExperienceItem(item_id=f"t{i}", level=0, kind=ITEM_KIND_TRAJECTORY, text=f"trace {i}", embedding=[1.0], metadata={"analysis_bundle": f"bundle {i}"}) for i in range(20)]
-    prompt = analyst._build_prompt(community, members)
+    prompt = analyst._build_prompt(community, members, "raw_extractor")
     payload = json.loads(prompt)
     assert len(payload["members"]) == 20
     assert "Use all provided members" in " ".join(payload["hard_constraints"])
@@ -111,8 +111,8 @@ def test_cluster_prompt_preflight_records_tokens(tmp_path):
     analyst = ClusterAnalyst(None, None, ClusterAnalystConfig(tokenizer_required=False, allow_regex_tokenizer_fallback=True, max_prompt_tokens=100000, prompt_token_report_path=str(tmp_path / "prompt_tokens.json")))  # type: ignore[arg-type]
     community = ExperienceCommunity(community_id="C_budget", level=0, member_weights={"t0": 1.0})
     members = [ExperienceItem(item_id="t0", level=0, kind=ITEM_KIND_TRAJECTORY, text="trace", embedding=[1.0], metadata={"analysis_bundle": "bundle text"})]
-    system = analyst._system_prompt()
-    user = analyst._build_prompt(community, members)
+    system = analyst._system_prompt("raw_extractor")
+    user = analyst._build_prompt(community, members, "raw_extractor")
     analyst._preflight_prompt_budget(community, system, user, len(members))
     report = json.loads((tmp_path / "prompt_tokens.json").read_text())
     assert report["events"][0]["community_id"] == "C_budget"
@@ -124,10 +124,15 @@ def test_cluster_prompt_preflight_fails_when_over_budget():
     community = ExperienceCommunity(community_id="C_too_big", level=0, member_weights={"t0": 1.0})
     members = [ExperienceItem(item_id="t0", level=0, kind=ITEM_KIND_TRAJECTORY, text="trace", embedding=[1.0], metadata={"analysis_bundle": "many tokens here"})]
     with pytest.raises(ValueError):
-        analyst._preflight_prompt_budget(community, analyst._system_prompt(), analyst._build_prompt(community, members), len(members))
+        analyst._preflight_prompt_budget(
+            community,
+            analyst._system_prompt("raw_extractor"),
+            analyst._build_prompt(community, members, "raw_extractor"),
+            len(members),
+        )
 
 
-def test_budget_refinement_retains_oversize_singleton_as_fallback_community():
+def test_budget_refinement_retains_oversize_singleton_as_diagnostic_community():
     from dynamix_core.tree_builder import ProjectedGmmTreeBuilder
 
     cfg = default_hierarchy_config({
@@ -157,10 +162,12 @@ def test_budget_refinement_retains_oversize_singleton_as_fallback_community():
     assert community.member_weights == {"too_long": 1.0}
     assert community.metadata["oversize_singleton"] is True
     assert community.metadata["llm_summary_skipped"] is True
-    assert clustering.summary_budget["oversize_singleton_fallback_count"] == 1
+    assert clustering.summary_budget["oversize_singleton_skipped_count"] == 1
+    assert clustering.summary_budget["oversize_singleton_fallback_count"] == 0
+    assert "do not generate ExperienceCards" in clustering.summary_budget["note"]
 
 
-def test_cluster_analyst_uses_non_llm_fallback_for_oversize_singleton():
+def test_cluster_analyst_skips_diagnostic_oversize_singleton():
     analyst = ClusterAnalyst(None, None, ClusterAnalystConfig(tokenizer_required=False, allow_regex_tokenizer_fallback=True))  # type: ignore[arg-type]
     community = ExperienceCommunity(
         community_id="C_oversize",
@@ -177,14 +184,7 @@ def test_cluster_analyst_uses_non_llm_fallback_for_oversize_singleton():
         metadata={"instruction": "Format the workbook.", "analysis_bundle": "very long bundle"},
     )
     cards = asyncio.run(analyst.summarize(community, [member]))
-    assert len(cards) == 1
-    card = cards[0]
-    assert card.kind == ITEM_KIND_EXPERIENCE_CARD
-    assert card.embedding == [0.25, 0.75]
-    assert list(card.generated_from_community_ids) == ["C_oversize"]
-    assert card.metadata["oversize_singleton_fallback"] is True
-    assert card.metadata["llm_summary_skipped"] is True
-    assert card.metadata["placement"]["target"] == "reference"
+    assert cards == []
     assert analyst.config.token_report == []
 
 
@@ -266,13 +266,15 @@ def test_cluster_prompt_uses_minimal_experience_schema():
     analyst = ClusterAnalyst(None, None, ClusterAnalystConfig())  # type: ignore[arg-type]
     community = ExperienceCommunity(community_id="C_schema", level=0, member_weights={"t0": 1.0})
     member = ExperienceItem(item_id="t0", level=0, kind=ITEM_KIND_TRAJECTORY, text="trace", embedding=[1.0], metadata={"analysis_bundle": "bundle"})
-    payload = json.loads(analyst._build_prompt(community, [member]))
+    payload = json.loads(analyst._build_prompt(community, [member], "raw_extractor"))
     schema = payload["output_schema"]
-    assert set(schema) == {"name", "trigger", "content", "placement", "confidence"}
+    assert set(schema) == {"cards"}
+    card_schema = schema["cards"][0]
+    assert set(card_schema) == {"name", "trigger", "content", "placement", "confidence"}
     forbidden = {"shared_patterns", "success_motifs", "anti_patterns", "shared_patch_hints", "reference_materials", "script_files", "skill_placement"}
-    assert not (forbidden & set(schema))
+    assert not (forbidden & set(card_schema))
     constraints = " ".join(payload["hard_constraints"])
-    assert "Do not output fields except name, trigger, content, placement, confidence" in constraints
+    assert "Do not output fields except cards and each card's name, trigger, content, placement, confidence" in constraints
 
 
 def test_render_card_text_minimal_schema_only():
