@@ -1,0 +1,41 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Runtime artifacts and experiment outputs
+runs/
+data/
+cache/
+logs/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# Generated package/build outputs
+build/
+dist/
+*.egg-info/
+
+# Large model/checkpoint artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin

@@ -1,0 +1,99 @@
+{
+  "scenario": "static_build",
+  "output_dir": "/mnt/data/yaodong/codes/DynaMix2skill/runs/qwen_train200_tree_main_001",
+  "records_path": "/mnt/data/yaodong/codes/DynaMix2skill/runs/qwen_cli_only_train200_001/records.json",
+  "generation": {
+    "base_url": "http://10.26.1.21:18002/v1",
+    "model": "Qwen3.5-9B",
+    "api_key": "EMPTY",
+    "temperature": 0.6,
+    "timeout_seconds": 600,
+    "max_concurrency": 4,
+    "thinking_mode": false,
+    "extra_body": {
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "debug_dir": "/mnt/data/yaodong/codes/DynaMix2skill/runs/qwen_train200_tree_main_001/analysis/generation_debug"
+  },
+  "embedding": {
+    "base_url": "http://127.0.0.1:18003/v1",
+    "model": "Qwen3-Embedding-8B",
+    "api_key": "EMPTY",
+    "max_model_len": 32000,
+    "max_input_tokens": 32000,
+    "truncate_long_texts": true,
+    "batch_size": 8,
+    "max_concurrency": 4,
+    "cache_path": "/mnt/data/yaodong/codes/DynaMix2skill/runs/qwen_train200_tree_main_001/cache/qwen3_embedding_cache.sqlite",
+    "tokenizer_model": "/mnt/data/grouph_share/models/modelscope/models/Qwen/Qwen3-Embedding-8B",
+    "tokenizer_required": true,
+    "truncation_strategy": "head"
+  },
+  "chunked_embedding": {
+    "enabled": true,
+    "chunk_tokens": 28000,
+    "overlap_tokens": 1000,
+    "pooling": "mean",
+    "add_special_tokens": false,
+    "normalize_after_pooling": false,
+    "fail_if_chunk_exceeds_model_limit": true
+  },
+  "hierarchy": {
+    "projection": {
+      "method": "local_pca",
+      "variance_ratio": 0.9,
+      "max_dim": 32,
+      "min_dim": 2,
+      "whiten": false
+    },
+    "gmm_bic": {
+      "covariance_type": "spherical",
+      "num_restarts": 5,
+      "kmeans_init_iters": 15,
+      "max_iter": 100,
+      "tol": 0.0001,
+      "min_covar": 1e-06,
+      "min_split_size": 16,
+      "min_effective_samples_per_component": 8,
+      "abs_kmax": 64,
+      "max_concurrent_candidates": 1,
+      "max_concurrent_restarts": 1
+    },
+    "soft_membership": {
+      "save_soft_edges": true,
+      "recursive_assignment": "cumulative_mass",
+      "cumulative_mass_coverage": 0.9
+    },
+    "budget_refinement": {
+      "enabled": true,
+      "apply_to_level": 0,
+      "selection_policy": "bic_best_with_token_progress",
+      "min_token_reduction_fraction": 0.1,
+      "fallback": "pca_token_balanced_binary",
+      "flatten_refinement_leaves_to_l0": true,
+      "skip_oversize_singleton": true
+    },
+    "summary_budget": {
+      "max_model_tokens": 100000,
+      "budget_ratio": 0.85,
+      "prompt_overhead_reserve_tokens": 8000
+    },
+    "random_seed": 42
+  },
+  "analyst": {
+    "prompt_style": "trace2skill_cluster_level_v2",
+    "confidence_floor": 0.05,
+    "tokenizer_model": "/mnt/data/grouph_share/models/modelscope/models/Qwen/Qwen3-Embedding-8B",
+    "tokenizer_required": true,
+    "allow_regex_tokenizer_fallback": false,
+    "multi_card_max_level": 0,
+    "max_cards_l0": null,
+    "max_cards_higher": 1,
+    "higher_level_mode": "single_abstraction",
+    "truncate_higher_level_extra_cards": true
+  },
+  "max_levels": 8,
+  "skill_output_dir_name": "skills"
+}

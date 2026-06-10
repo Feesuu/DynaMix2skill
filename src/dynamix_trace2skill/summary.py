@@ -1,0 +1,454 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Sequence
+
+from dynamix_core.data_structures import ExperienceCommunity, ExperienceItem, ITEM_KIND_EXPERIENCE_CARD, ITEM_KIND_TRAJECTORY
+from .clients import EmbeddingClient, GenerationClient
+from .tokenization import get_tokenizer, TokenizerUnavailable
+
+
+@dataclass
+class ClusterAnalystConfig:
+    """Configuration for cluster-level Trace2Skill-style abstraction.
+
+    The ExperienceCard schema is intentionally minimal.  The LLM must produce
+    only: name, trigger, content, placement, confidence.  Community size and
+    prompt budget are controlled before the analyst is called, never by member
+    truncation inside this prompt.
+    """
+
+    prompt_style: str = "trace2skill_cluster_minimal_experience_v6"
+    confidence_floor: float = 0.05
+    trace2skill_analysis_dir: str | None = None
+    tokenizer_model: str | None = None
+    tokenizer_required: bool = True
+    allow_regex_tokenizer_fallback: bool = False
+    # None means: derive from hierarchy.summary_budget.effective_token_budget in pipeline.
+    max_prompt_tokens: int | None = None
+    prompt_token_report_path: str | None = None
+    token_report: list[dict[str, Any]] = field(default_factory=list)
+
+    # Layer-aware card cardinality policy. L0 raw trajectory communities may
+    # yield multiple cards, but higher-level ExperienceCard communities should
+    # compress to exactly one higher-level card.
+    multi_card_max_level: int = 0
+    max_cards_l0: int | None = None
+    max_cards_higher: int = 1
+    higher_level_mode: str = "single_abstraction"
+    truncate_higher_level_extra_cards: bool = True
+
+
+class ClusterAnalyst:
+    """Trace2Skill analyst templates rewritten for trajectory clusters.
+
+    We use Trace2Skill's success/error analysis prompts as behavioral
+    references, but the output schema is deliberately small.  A community may
+    yield one or more cards, each with:
+
+        name, trigger, content, placement, confidence
+
+    No support_mass, no long structured guidance arrays, and no implicit
+    per-trace patch proposal.
+    """
+
+    def __init__(self, generation: GenerationClient, embedding: EmbeddingClient, config: ClusterAnalystConfig | None = None):
+        self.generation = generation
+        self.embedding = embedding
+        self.config = config or ClusterAnalystConfig()
+        self._templates = _load_trace2skill_templates(self.config.trace2skill_analysis_dir)
+
+    async def summarize(self, community: ExperienceCommunity, members: Sequence[ExperienceItem], clustering: Any | None = None) -> list[ExperienceItem]:
+        if _is_diagnostic_community(community):
+            return []
+        analyst_mode = _infer_analyst_mode(community, members, self.config)
+        system_prompt = self._system_prompt(analyst_mode)
+        prompt = self._build_prompt(community, members, analyst_mode)
+        self._preflight_prompt_budget(community, system_prompt, prompt, len(members))
+        payload = await self.generation.chat_json(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            schema_name="MinimalClusterExperienceCards",
+        )
+        cards_payload = _extract_cards_payload(payload)
+        llm_returned_card_count = len(cards_payload)
+        cards_payload, extra_cards_truncated = _enforce_cardinality_policy(cards_payload, analyst_mode, self.config)
+        items: list[ExperienceItem] = []
+        rendered_texts: list[str] = []
+        normalized_cards: list[dict[str, Any]] = []
+        for card_index, card in enumerate(cards_payload, start=1):
+            name = _required_string(card, "name")
+            trigger = _required_string(card, "trigger")
+            content = _required_string(card, "content")
+            confidence = max(float(card.get("confidence", 0.5)), self.config.confidence_floor)
+            placement = _normalize_placement(_required_mapping(card, "placement"), name=name)
+            normalized = {
+                "name": name,
+                "trigger": trigger,
+                "content": content,
+                "confidence": confidence,
+                "placement": placement,
+                "card_index": card_index,
+            }
+            normalized_cards.append(normalized)
+            rendered_texts.append(_render_card_text(normalized))
+
+        if not normalized_cards:
+            return []
+
+        embeddings = await self.embedding.embed_texts(rendered_texts, cache_namespace="experience_card")
+        total_cards = len(normalized_cards)
+        for normalized, text, embedding in zip(normalized_cards, rendered_texts, embeddings):
+            metadata = {
+                "name": normalized["name"],
+                "trigger": normalized["trigger"],
+                "content": normalized["content"],
+                "confidence": normalized["confidence"],
+                "placement": normalized["placement"],
+                "source_community_id": community.community_id,
+                "source_member_count": len(members),
+                "source_outcome_mode": community.outcome_mode,
+                "cluster_level_analyst": True,
+                "minimal_experience_schema": True,
+                "multi_card_experience_schema": True,
+                "source_card_index": normalized["card_index"],
+                "source_generated_card_count": total_cards,
+                "llm_returned_card_count": llm_returned_card_count,
+                "analyst_mode": analyst_mode,
+                "higher_level_single_card_enforced": analyst_mode == "experience_abstractor",
+                "higher_level_extra_cards_truncated": extra_cards_truncated,
+                "trace2skill_prompt_style_adapted": True,
+                "trace2skill_template_inheritance": True,
+                "iterative_rca_loop": False,
+                "member_truncation_applied": False,
+                "analysis_token_count": _safe_token_count(text, self.config.tokenizer_model, self.config.allow_regex_tokenizer_fallback),
+            }
+            item_id = f"E{community.level + 1}_{_short_hash(community.community_id + ':' + str(normalized['card_index']) + ':' + text)}"
+            items.append(
+                ExperienceItem(
+                    item_id=item_id,
+                    level=community.level + 1,
+                    kind=ITEM_KIND_EXPERIENCE_CARD,
+                    text=text,
+                    embedding=embedding,
+                    generated_from_community_ids=(community.community_id,),
+                    metadata=metadata,
+                )
+            )
+        return items
+
+    def _system_prompt(self, analyst_mode: str) -> str:
+        if analyst_mode == "raw_extractor":
+            mission = "Analyze one raw trajectory cluster and produce one or more reusable ExperienceCards."
+            rewrite_policy = """- If the cluster contains successful trajectories, distill reusable success lessons into cards.
+- If the cluster contains failed trajectories, distill reusable failure-prevention lessons into cards.
+- If the cluster is mixed, analyze success and failure evidence together, and split the output into multiple cards when the raw trajectory cluster supports multiple distinct reusable lessons.
+- If the cluster supports only one reusable lesson, return one card."""
+        else:
+            mission = "Analyze one cluster of lower-level ExperienceCards and produce exactly one higher-level ExperienceCard."
+            rewrite_policy = """- The input members are already lower-level ExperienceCards, not raw trajectories.
+- Your job is abstraction, not further extraction: identify the shared higher-level principle behind the lower-level cards.
+- Return exactly one card. Do not split the cluster into multiple cards.
+- If the community is somewhat mixed, write the broadest valid abstraction and lower the confidence instead of producing multiple cards."""
+        return f"""# Role
+You are an expert Trace2Skill-style AI agent trajectory analyst for spreadsheet manipulation tasks.
+
+# Mission
+{mission}
+
+# Trace2Skill template inheritance
+You must follow the evidence discipline of the Trace2Skill success/error analysis prompts below, but adapt their evidence unit from a single trajectory to a trajectory cluster.
+
+<adapted_success_system_template>
+{self._templates.get('success_system_llm', '')}
+</adapted_success_system_template>
+
+<adapted_error_system_template>
+{self._templates.get('error_system_llm', '')}
+</adapted_error_system_template>
+
+# Cluster-level rewrite
+{rewrite_policy}
+- v1 does not run Trace2Skill's iterative minimal-fix verifier loop, so do not claim verified root causes.
+
+# Minimal output schema
+Return one JSON object with a top-level cards list. For higher-level abstraction mode, that list must contain exactly one card. Each card must contain only these fields:
+- name: short name of the experience.
+- trigger: when a future agent should use this experience.
+- content: the concrete reusable experience/guidance. This is the main body.
+- placement: where this experience should be exported. Keep it minimal: target plus optional reference_kind.
+- confidence: float in (0, 1].
+
+Do not output support_mass. Do not output extra structured fields such as shared_patterns, success_motifs, anti_patterns, or patch_hints. Put the useful guidance in content. Do not duplicate semantically identical cards.
+"""
+
+    def _preflight_prompt_budget(self, community: ExperienceCommunity, system_prompt: str, user_prompt: str, member_count: int) -> None:
+        if self.config.max_prompt_tokens is None or int(self.config.max_prompt_tokens) <= 0:
+            return
+        text = system_prompt + "\n" + user_prompt
+        try:
+            tokenizer = get_tokenizer(self.config.tokenizer_model, allow_regex_fallback=self.config.allow_regex_tokenizer_fallback)
+            token_count = tokenizer.count(text)
+            tokenizer_name = tokenizer.name
+        except Exception as exc:
+            if self.config.tokenizer_required:
+                raise TokenizerUnavailable(f"cluster analyst tokenizer unavailable for prompt preflight: {exc}") from exc
+            token_count = max(1, (len(text) + 3) // 4)
+            tokenizer_name = "char_estimate_fallback"
+        event = {
+            "community_id": community.community_id,
+            "level": community.level,
+            "member_count": member_count,
+            "prompt_tokens": token_count,
+            "max_prompt_tokens": int(self.config.max_prompt_tokens),
+            "tokenizer": tokenizer_name,
+            "over_budget": token_count > int(self.config.max_prompt_tokens),
+        }
+        self.config.token_report.append(event)
+        if self.config.prompt_token_report_path:
+            path = Path(self.config.prompt_token_report_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"events": self.config.token_report}, ensure_ascii=False, indent=2), encoding="utf-8")
+        if event["over_budget"]:
+            raise ValueError(
+                f"Cluster analyst prompt exceeds token budget for community={community.community_id!r}: "
+                f"prompt_tokens={token_count}, max_prompt_tokens={self.config.max_prompt_tokens}. "
+                "The hierarchy summary_budget/token counts must force a finer split before analyst invocation."
+            )
+
+    def save_prompt_token_report(self, path: str | Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"events": self.config.token_report}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _build_prompt(self, community: ExperienceCommunity, members: Sequence[ExperienceItem], analyst_mode: str) -> str:
+        member_payloads = []
+        for item in members:
+            member_payloads.append({
+                "item_id": item.item_id,
+                "membership_weight": community.member_weights.get(item.item_id),
+                "success": item.metadata.get("success"),
+                "analysis_bundle": item.metadata.get("analysis_bundle", item.text),
+            })
+        return json.dumps({
+            "instruction": _mode_instruction(analyst_mode),
+            "analyst_mode": analyst_mode,
+            "cardinality_policy": {
+                "raw_extractor": "L0 raw trajectory communities may return one or more cards.",
+                "experience_abstractor": "L1+ ExperienceCard communities must return exactly one higher-level card.",
+            },
+            "template_user_prompt_adaptation": {
+                "success_user_template": self._templates.get("success_user_llm", ""),
+                "error_user_template": self._templates.get("error_user_llm", ""),
+                "replace_agent_log_with": "cluster_member_analysis_bundles",
+            },
+            "hard_constraints": [
+                "Use all provided members. Do not ignore later members or silently truncate the cluster.",
+                "Do not output support_mass.",
+                "Return a top-level cards list. Do not output fields except cards and each card's name, trigger, content, placement, confidence.",
+                "Do not output file_slug or rationale; filenames are assigned automatically by the exporter.",
+                "Do not copy absolute paths, output_path, xlsx filenames, raw long code blocks, XML/tool tags, or debug logs into reusable guidance.",
+                "Never mention ground truth, gold answers, hidden labels, or verifier internals as something the target agent can access.",
+                "Return valid JSON only.",
+            ],
+            "community": community.to_dict(),
+            "members": member_payloads,
+            "output_schema": {
+                "cards": [
+                    {
+                        "name": "string: short reusable experience name",
+                        "trigger": "string: when a future task should use this experience",
+                        "content": "string: concrete reusable guidance / lesson / procedure",
+                        "placement": {
+                            "target": "skill_md | reference | script",
+                            "reference_kind": "procedure | example | edge_case | note"
+                        },
+                        "confidence": "float in (0,1]"
+                    }
+                ]
+            },
+            "placement_rules": [
+                "Use target=skill_md for concise high-support guidance that should be preloaded.",
+                "Use target=reference for detailed examples, edge cases, narrow procedures, or lower-priority details.",
+                "Use target=script only when content is a complete deterministic helper script; otherwise use reference.",
+                "Do not put raw trajectory text, local paths, output paths, or ground-truth-specific content into any placement."
+            ]
+        }, ensure_ascii=False, indent=2)
+
+
+
+def _infer_analyst_mode(community: ExperienceCommunity, members: Sequence[ExperienceItem], config: ClusterAnalystConfig) -> str:
+    """Return the cardinality mode for this community.
+
+    L0 raw trajectory clusters are extraction units and may produce multiple
+    bottom-level cards. Once the members are ExperienceCards, each community is
+    an abstraction unit and should compress to a single higher-level card.
+    """
+    if int(community.level) <= int(config.multi_card_max_level) and any(item.kind == ITEM_KIND_TRAJECTORY for item in members):
+        return "raw_extractor"
+    return "experience_abstractor"
+
+
+def _mode_instruction(analyst_mode: str) -> str:
+    if analyst_mode == "raw_extractor":
+        return (
+            "Analyze this raw trajectory cluster once and produce one or more reusable ExperienceCards. "
+            "Each card should capture one distinct reusable lesson supported by the raw trajectories. "
+            "Follow the Trace2Skill success/error analysis discipline inherited in the system prompt, "
+            "but output the minimal cards-list schema only."
+        )
+    return (
+        "Analyze this cluster of lower-level ExperienceCards once and produce exactly one higher-level ExperienceCard. "
+        "Do not split the cluster into multiple cards. Your task is to identify the shared higher-level principle "
+        "behind the lower-level cards. Follow the Trace2Skill evidence discipline inherited in the system prompt, "
+        "but output the minimal cards-list schema only."
+    )
+
+
+def _enforce_cardinality_policy(
+    cards: list[dict[str, Any]],
+    analyst_mode: str,
+    config: ClusterAnalystConfig,
+) -> tuple[list[dict[str, Any]], int]:
+    if analyst_mode == "raw_extractor":
+        max_cards = config.max_cards_l0
+        if max_cards is None or int(max_cards) <= 0:
+            return cards, 0
+        limit = int(max_cards)
+    else:
+        limit = max(1, int(config.max_cards_higher))
+
+    if len(cards) <= limit:
+        return cards, 0
+    if analyst_mode == "experience_abstractor" and not config.truncate_higher_level_extra_cards:
+        raise ValueError(
+            f"higher-level ExperienceCard abstraction must return at most {limit} card(s), got {len(cards)}"
+        )
+    return cards[:limit], len(cards) - limit
+
+
+def _extract_cards_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    cards = payload.get("cards")
+    if cards is None:
+        # Backward compatibility for older single-card responses.
+        cards = [payload]
+    if not isinstance(cards, list):
+        raise ValueError("LLM ExperienceCard output must include a cards list")
+    result: list[dict[str, Any]] = []
+    for index, card in enumerate(cards, start=1):
+        if not isinstance(card, dict):
+            raise ValueError(f"cards[{index}] must be an object")
+        result.append(dict(card))
+    return result
+
+
+def _is_diagnostic_community(community: ExperienceCommunity) -> bool:
+    metadata = dict(community.metadata or {})
+    return bool(metadata.get("llm_summary_skipped") or metadata.get("oversize_singleton"))
+
+def _normalize_placement(value: dict[str, Any], *, name: str) -> dict[str, Any]:
+    target = str(value.get("target", "")).strip().lower()
+    aliases = {"main": "skill_md", "skill": "skill_md", "skill.md": "skill_md", "references": "reference", "ref": "reference", "code": "script", "scripts": "script"}
+    target = aliases.get(target, target)
+    if target not in {"skill_md", "reference", "script"}:
+        raise ValueError("placement.target must be one of: skill_md, reference, script")
+    # Minimal user-visible schema: LLM decides target and optional reference_kind only.
+    # Filenames are derived deterministically by the exporter from experience name + node id.
+    return {
+        "target": target,
+        "reference_kind": str(value.get("reference_kind", "note")).strip() or "note",
+    }
+
+
+def _load_trace2skill_templates(analysis_dir: str | None) -> dict[str, str]:
+    if analysis_dir:
+        root = Path(analysis_dir)
+    else:
+        root = Path(__file__).resolve().parents[2] / "analysis"
+    names = {
+        "success_system_llm": "success_analysis_system_llm.txt",
+        "success_user_llm": "success_analysis_user_llm.txt",
+        "error_system_llm": "error_analysis_system_llm.txt",
+        "error_user_llm": "error_analysis_user_llm.txt",
+    }
+    out: dict[str, str] = {}
+    for key, filename in names.items():
+        path = root / filename
+        try:
+            out[key] = _adapt_trace2skill_template(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            out[key] = ""
+    return out
+
+
+def _adapt_trace2skill_template(text: str) -> str:
+    """Rewrite obvious single-trajectory wording while preserving Trace2Skill structure."""
+    replacements = {
+        "single trajectory": "trajectory cluster",
+        "Single trajectory": "Trajectory cluster",
+        "one trajectory": "one trajectory cluster",
+        "One trajectory": "One trajectory cluster",
+        "the trajectory": "the trajectory cluster",
+        "The trajectory": "The trajectory cluster",
+        "this trajectory": "this trajectory cluster",
+        "This trajectory": "This trajectory cluster",
+        "agent trajectory": "agent trajectory cluster",
+        "Agent trajectory": "Agent trajectory cluster",
+    }
+    for src, dst in replacements.items():
+        text = text.replace(src, dst)
+    return text
+
+
+def _safe_token_count(text: str, tokenizer_model: str | None, allow_fallback: bool) -> int:
+    try:
+        return get_tokenizer(tokenizer_model, allow_regex_fallback=allow_fallback).count(text)
+    except Exception:
+        return max(1, (len(text) + 3) // 4)
+
+
+def _render_card_text(payload: dict[str, Any]) -> str:
+    name = _required_string(payload, "name")
+    trigger = _required_string(payload, "trigger")
+    content = _required_string(payload, "content")
+    lines = [f"# {name}", ""]
+    if trigger:
+        lines.extend(["## Trigger", trigger, ""])
+    lines.extend(["## Content", content.strip() or "No detailed reusable experience content was provided.", ""])
+    return "\n".join(lines).strip() + "\n"
+
+
+def _required_string(payload: dict[str, Any], key: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"LLM ExperienceCard output must include non-empty string field: {key}")
+    return value.strip()
+
+
+def _required_mapping(payload: dict[str, Any], key: str) -> dict[str, Any]:
+    value = payload.get(key)
+    if not isinstance(value, dict):
+        raise ValueError(f"LLM ExperienceCard output must include object field: {key}")
+    return dict(value)
+
+
+def _safe_token_list_count(values: Any) -> int:
+    if not isinstance(values, list):
+        return 0
+    return len([v for v in values if str(v).strip()])
+
+
+def _short_hash(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _slugify(text: str, max_len: int = 72) -> str:
+    text = text.lower()
+    text = "".join(ch if ch.isalnum() else "-" for ch in text)
+    text = "-".join(part for part in text.split("-") if part)
+    return (text[:max_len].strip("-") or "experience")
