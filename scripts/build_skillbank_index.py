@@ -13,7 +13,7 @@ from dynamix_trace2skill.skillbank import SkillBankSelector
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build a DynaMix skillbank embedding index over SKILL.md files")
+    parser = argparse.ArgumentParser(description="Build a DynaMix nodebank embedding index")
     parser.add_argument("--skillbank-root", required=True)
     parser.add_argument("--output", default=None, help="Index JSON path; default: <skillbank-root>/.dynamix_skillbank_index.json")
     parser.add_argument("--embedding-base-url", default="mock://deterministic")
@@ -29,7 +29,7 @@ def main() -> None:
     )
     docs, embeddings = selector._load_or_build_index()
     path = selector.cache_path
-    print(json.dumps({"index_path": str(path), "skill_count": len(docs), "embedding_dim": int(embeddings.shape[1]) if embeddings.ndim == 2 else 0}, ensure_ascii=False, indent=2))
+    print(json.dumps({"index_path": str(path), "node_count": len(docs), "embedding_dim": int(embeddings.shape[1]) if embeddings.ndim == 2 else 0}, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

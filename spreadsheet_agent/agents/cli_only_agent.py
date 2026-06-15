@@ -24,23 +24,23 @@ from ..system_prompts import load_full_system_prompt
 CLI_ONLY_SYSTEM_PROMPT = """You are a spreadsheet expert who can manipulate spreadsheets through Python code.
 
 You need to solve the given spreadsheet manipulation question, which contains the following information:
-- working_directory: The absolute path to your working directory where files are located.
+- working_directory: The current task directory where commands already run.
 - instruction: The question about spreadsheet manipulation.
-- spreadsheet_path: The absolute path of the spreadsheet file you need to manipulate.
+- spreadsheet_path: The task-relative spreadsheet file name, usually `input.xlsx`.
 - spreadsheet_content: The first few rows of the content of spreadsheet file.
 - instruction_type: There are two values (Cell-Level Manipulation, Sheet-Level Manipulation) used to indicate whether the answer to this question applies only to specific cells or to the entire worksheet.
 - answer_position: The position need to be modified or filled. For Cell-Level Manipulation questions, this field is filled with the cell position; for Sheet-Level Manipulation, it is the maximum range of cells you need to modify. You only need to modify or fill in values within the cell range specified by answer_position.
-- output_path: The absolute path where you must save the modified spreadsheet.
+- output_path: The task-relative file name where you must save the modified spreadsheet, usually `output.xlsx`.
 
 ## CRITICAL RESTRICTIONS
 
-You can ONLY read and write files within the **working_directory**. Any attempt to access files outside this directory will fail.
+You can ONLY read and write files within the **working_directory**.
 
 - **Allowed paths**: working_directory (and its subdirectories)
 - **Read from**: spreadsheet_path (inside working_directory)
 - **Write to**: output_path (inside working_directory)
 
-Do NOT create files outside the working_directory. Use the exact absolute paths provided.
+Do NOT create files outside the working_directory. Use the task-relative paths provided; do not search `/tmp` or copy files from other task directories.
 
 You have access to a bash tool that can execute any shell command.
 
@@ -51,6 +51,11 @@ You have access to a bash tool that can execute any shell command.
 3. Write and execute Python code to perform the manipulation
 4. Verify the output file was created successfully
 
+## Python Execution Rule
+
+Use `python -c` only for short read-only checks. For any workbook edit, loop,
+formula fill, or multi-step logic, write `solution.py` and run `python solution.py`.
+
 ## Action Examples
 
 ### Explore spreadsheet structure:
@@ -58,7 +63,7 @@ You have access to a bash tool that can execute any shell command.
 Action:
 {
     "name": "bash",
-    "arguments": {"command": "python -c \"import openpyxl; wb = openpyxl.load_workbook('/absolute/path/to/input.xlsx', data_only=True); [print(f'{s}: {wb[s].dimensions}, {wb[s].max_row} rows, {wb[s].max_column} cols') for s in wb.sheetnames]\""}
+    "arguments": {"command": "python -c \"import openpyxl; wb = openpyxl.load_workbook('input.xlsx', data_only=True); print(wb.sheetnames); print(wb.active.dimensions)\""}
 }
 
 ### Read specific cells or ranges:
@@ -66,15 +71,15 @@ Action:
 Action:
 {
     "name": "bash",
-    "arguments": {"command": "python -c \"import openpyxl; wb = openpyxl.load_workbook('/absolute/path/to/input.xlsx'); ws = wb.active; print('A1:', ws['A1'].value); print('Row 1:', [c.value for c in ws[1]])\""}
+    "arguments": {"command": "python -c \"import openpyxl; wb = openpyxl.load_workbook('input.xlsx'); ws = wb.active; print('A1:', ws['A1'].value); print('B1:', ws['B1'].value)\""}
 }
 
-### Write and execute a solution script:
+### Write and execute a solution script for workbook edits:
 
 Action:
 {
     "name": "bash",
-    "arguments": {"command": "cat <<'EOF' > solution.py\nimport openpyxl\n\nwb = openpyxl.load_workbook('/absolute/path/to/input.xlsx')\nws = wb.active\n\n# Perform manipulation based on instruction\nws['A1'] = 'new_value'\n\nwb.save('/absolute/path/to/output.xlsx')\nprint('Saved successfully')\nEOF\npython solution.py"}
+    "arguments": {"command": "cat <<'EOF' > solution.py\nimport openpyxl\n\nwb = openpyxl.load_workbook('input.xlsx')\nws = wb.active\n\n# Perform manipulation based on instruction\nws['A1'] = 'new_value'\n\nwb.save('output.xlsx')\nprint('Saved successfully')\nEOF\npython solution.py"}
 }
 
 ### Verify output:
@@ -82,7 +87,7 @@ Action:
 Action:
 {
     "name": "bash",
-    "arguments": {"command": "ls -la /absolute/path/to/output.xlsx && python -c \"import openpyxl; wb = openpyxl.load_workbook('/absolute/path/to/output.xlsx'); print('OK:', wb.active.dimensions)\""}
+    "arguments": {"command": "ls -la output.xlsx && python -c \"import openpyxl; wb = openpyxl.load_workbook('output.xlsx'); print('OK:', wb.active.dimensions)\""}
 }
 
 ### Signal task completion:
@@ -91,7 +96,7 @@ When you have successfully created the output file:
 
 ACTION: TASK_COMPLETE
 
-These are just examples - replace paths with the actual absolute paths from spreadsheet_path and output_path. Your goal is to produce the modified spreadsheet at the exact output_path, then signal completion with ACTION: TASK_COMPLETE.
+These are just examples. Your goal is to read `input.xlsx`, produce `output.xlsx` in the current task directory, then signal completion with ACTION: TASK_COMPLETE.
 """
 
 
@@ -136,23 +141,18 @@ class CLIOnlyAgent(BaseSpreadsheetAgent):
         ]
 
     def build_task_prompt(self, context) -> str:
-        """Build task prompt using official SpreadsheetBench format."""
-        import os
-        # Convert to absolute paths so agent knows exact locations
-        working_dir = os.path.abspath(context.working_dir)
-        input_file = os.path.abspath(context.input_file)
-        output_file = os.path.abspath(context.output_file)
-        
+        """Build task prompt using task-relative SpreadsheetBench paths."""
+
         return f"""Below is the spreadsheet manipulation question you need to solve:
 
 ### working_directory
-{working_dir}
+.
 
 ### instruction
 {context.instruction}
 
 ### spreadsheet_path
-{input_file}
+input.xlsx
 
 ### spreadsheet_content
 {context.spreadsheet_content}
@@ -164,10 +164,10 @@ class CLIOnlyAgent(BaseSpreadsheetAgent):
 {context.answer_position}
 
 ### output_path
-{output_file}
+output.xlsx
 
 ---
-**REMINDER**: You can ONLY access files within `{working_dir}`. Save output to the exact path: `{output_file}`
+**REMINDER**: Your bash commands already run inside the current task directory. Read only `input.xlsx`, save the final workbook as `output.xlsx`, and do not search `/tmp` or copy files from other task directories. If answer_position is a range, update every required cell in that range and verify representative target cells before completion.
 ---
 
 Solve the question and save the modified spreadsheet to the exact output_path shown above."""

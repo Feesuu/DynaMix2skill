@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import re
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Iterable
 
 import numpy as np
 
@@ -20,60 +19,80 @@ from .openai_compat import OpenAI as CompatOpenAI
 
 
 @dataclass(frozen=True)
-class SkillDocument:
-    skill_id: str
+class SkillNodeDocument:
+    node_id: str
+    item_id: str
     name: str
-    description: str
-    skill_dir: str
-    skill_path: str
+    trigger: str
     content: str
-    full_text: str
+    embedding_text: str
+    prompt_text: str
     sha256: str
+    level: int = 0
+    support_mass: float = 0.0
+    confidence: float = 0.0
+    source_community_id: str = ""
+    source_member_count: int = 0
+    analyst_mode: str = ""
 
 
 @dataclass(frozen=True)
 class SkillSelection:
-    skill: SkillDocument
+    skill: SkillNodeDocument
     score: float
 
 
-def discover_skill_documents(skillbank_root: str | Path) -> list[SkillDocument]:
+def discover_skill_documents(skillbank_root: str | Path) -> list[SkillNodeDocument]:
     root = Path(skillbank_root)
-    docs: list[SkillDocument] = []
     if not root.exists():
         raise FileNotFoundError(root)
-    for skill_path in sorted(root.rglob("SKILL.md")):
-        # Avoid indexing nested copies inside selected-skill compatibility roots.
-        if any(part in {"selected_skills", "__pycache__"} for part in skill_path.parts):
+    node_manifest = root / "node_bank_manifest.json"
+    if not node_manifest.exists():
+        raise FileNotFoundError(f"node bank manifest not found: {node_manifest}")
+    return _discover_node_documents(node_manifest)
+
+
+def _discover_node_documents(manifest_path: Path) -> list[SkillNodeDocument]:
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if payload.get("format") != "dynamix_node_skill_bank_v1":
+        raise ValueError(f"unsupported node bank manifest format: {payload.get('format')!r}")
+    docs: list[SkillNodeDocument] = []
+    for node in payload.get("nodes", []):
+        node_id = str(node.get("node_id") or node.get("item_id") or "").strip()
+        name = str(node.get("name") or node_id).strip()
+        trigger = str(node.get("trigger") or "").strip()
+        content = str(node.get("content") or "").strip()
+        if not node_id or not name or not trigger or not content:
             continue
-        raw = skill_path.read_text(encoding="utf-8")
-        frontmatter, body = _split_frontmatter(raw)
-        name = str(frontmatter.get("name") or skill_path.parent.name).strip()
-        description = str(frontmatter.get("description") or "").strip()
-        skill_id = _stable_skill_id(skill_path.parent.name, raw)
-        full_text = f"{name}\n{description}\n{body}".strip()
-        docs.append(SkillDocument(
-            skill_id=skill_id,
+        embedding_text = str(node.get("embedding_text") or _render_node_embedding_text(name=name, trigger=trigger, content=content)).strip()
+        prompt_text = str(node.get("prompt_text") or "").strip()
+        sha256 = str(node.get("sha256") or hashlib.sha256(embedding_text.encode("utf-8")).hexdigest())
+        docs.append(SkillNodeDocument(
+            node_id=node_id,
+            item_id=str(node.get("item_id") or node_id),
             name=name,
-            description=description,
-            skill_dir=str(skill_path.parent),
-            skill_path=str(skill_path),
-            content=body.strip(),
-            full_text=full_text,
-            sha256=hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            trigger=trigger,
+            content=content,
+            embedding_text=embedding_text,
+            prompt_text=prompt_text,
+            sha256=sha256,
+            level=int(node.get("level", 0) or 0),
+            support_mass=float(node.get("support_mass", 0.0) or 0.0),
+            confidence=float(node.get("confidence", 0.0) or 0.0),
+            source_community_id=str(node.get("source_community_id", "") or ""),
+            source_member_count=int(node.get("source_member_count", 0) or 0),
+            analyst_mode=str(node.get("analyst_mode", "") or ""),
         ))
     if not docs:
-        raise ValueError(f"no SKILL.md files found under skillbank root: {root}")
+        raise ValueError(f"no retrievable nodes found in node bank manifest: {manifest_path}")
     return docs
 
 
 class SkillBankSelector:
-    """Dense top-k skill selector over a folder of SKILL.md files.
+    """Dense top-k selector over a DynaMix node bank.
 
-    The selector embeds each SKILL.md once, embeds the current task query once,
-    then ranks by cosine similarity.  This is the selection layer needed when a
-    DynaMix run exports multiple skill folders but Trace2Skill can only preload a
-    small task-conditioned subset into the system prompt.
+    Each ExperienceCard node is embedded using only name, trigger, and content.
+    A heldout task query is embedded once and ranked by cosine similarity.
     """
 
     def __init__(
@@ -90,7 +109,7 @@ class SkillBankSelector:
         self.model = model
         self.api_key = api_key
         self.cache_path = Path(cache_path) if cache_path else self.skillbank_root / ".dynamix_skillbank_index.json"
-        self._docs: list[SkillDocument] | None = None
+        self._docs: list[SkillNodeDocument] | None = None
         self._embeddings: np.ndarray | None = None
 
     @classmethod
@@ -114,31 +133,31 @@ class SkillBankSelector:
         order = np.argsort(-scores)[: max(1, min(int(top_k), len(docs)))]
         return [SkillSelection(skill=docs[int(i)], score=float(scores[int(i)])) for i in order]
 
-    def _load_or_build_index(self) -> tuple[list[SkillDocument], np.ndarray]:
+    def _load_or_build_index(self) -> tuple[list[SkillNodeDocument], np.ndarray]:
         if self._docs is not None and self._embeddings is not None:
             return self._docs, self._embeddings
         docs = discover_skill_documents(self.skillbank_root)
-        expected = {doc.skill_path: doc.sha256 for doc in docs}
+        expected = {doc.node_id: doc.sha256 for doc in docs}
         if self.cache_path.exists():
             try:
                 payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
-                if payload.get("model") == self.model and payload.get("skill_hashes") == expected:
-                    self._docs = [SkillDocument(**item) for item in payload["skills"]]
+                if payload.get("model") == self.model and payload.get("document_hashes") == expected:
+                    self._docs = [SkillNodeDocument(**item) for item in payload["documents"]]
                     self._embeddings = np.asarray(payload["embeddings"], dtype=float)
                     self._embeddings = _normalize_matrix(self._embeddings)
                     return self._docs, self._embeddings
             except Exception:
                 pass
-        embeddings = np.asarray(self._embed([doc.full_text for doc in docs]), dtype=float)
+        embeddings = np.asarray(self._embed([doc.embedding_text for doc in docs]), dtype=float)
         embeddings = _normalize_matrix(embeddings)
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "format": "dynamix_skillbank_embedding_index_v1",
+            "format": "dynamix_skillbank_embedding_index_v2",
             "skillbank_root": str(self.skillbank_root),
             "model": self.model,
             "base_url": self.base_url,
-            "skill_hashes": expected,
-            "skills": [asdict(doc) for doc in docs],
+            "document_hashes": expected,
+            "documents": [asdict(doc) for doc in docs],
             "embeddings": embeddings.tolist(),
         }
         self.cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -155,61 +174,39 @@ class SkillBankSelector:
         return [list(item.embedding) for item in response.data]
 
 
-def selected_skills_to_system_content(selections: Iterable[SkillSelection]) -> str:
+def selected_experience_to_system_content(selections: Iterable[SkillSelection]) -> str:
+    selections = list(selections)
     lines: list[str] = [
-        "# Selected DynaMix Skills",
+        "# Retrieved Experience",
         "",
-        "The following skills were selected for this task by dense embedding similarity between the task query and the skill bank. Follow relevant selected skill guidance as Trace2Skill would follow a preloaded SKILL.md.",
+        "The following reusable experience was selected for this task. Use relevant guidance when it matches the spreadsheet operation; ignore irrelevant guidance.",
         "",
     ]
     for rank, selection in enumerate(selections, start=1):
-        skill = selection.skill
+        node = selection.skill
         lines.extend([
-            f"## Selected Skill {rank}: {skill.name}",
+            f"## Node {rank}: {node.name}",
             "",
-            f"- similarity_score: {selection.score:.6f}",
-            f"- skill_directory: `{skill.skill_dir}`",
-            f"- skill_file: `{skill.skill_path}`",
+            f"Trigger: {node.trigger}",
+            "",
+            "Guidance:",
+            node.content.strip(),
+            "",
         ])
-        if skill.description:
-            lines.append(f"- description: {skill.description}")
-        lines.extend(["", skill.content.strip(), ""])
     return "\n".join(lines).rstrip() + "\n"
 
 
-# No per-query skill-folder copying helper is provided.  The skillbank is a
-# run-level immutable directory.  Each query only selects top-k SKILL.md files
-# and references their fixed absolute skill directories in the prompt.  This is
-# concurrency-safe for local multi-worker runs.  If a future remote/Docker runner
-# is used, stage or mount the whole skillbank root once before the run and rewrite
-# the index paths to that remote-visible root; do not copy selected folders per task.
+# No per-query copying helper is provided.  The nodebank is a run-level immutable
+# directory; each query only selects top-k node records and injects their text
+# into the prompt.  This is concurrency-safe for local multi-worker runs.
 
 
-def _split_frontmatter(text: str) -> tuple[dict[str, str], str]:
-    if not text.startswith("---"):
-        return {}, text
-    try:
-        _, rest = text.split("---", 1)
-        fm, body = rest.split("---", 1)
-    except ValueError:
-        return {}, text
-    data: dict[str, str] = {}
-    for line in fm.splitlines():
-        if ":" in line:
-            key, value = line.split(":", 1)
-            data[key.strip()] = value.strip().strip('"\'')
-    return data, body.lstrip("\n")
-
-
-def _stable_skill_id(name: str, raw: str) -> str:
-    return f"{_slugify(name, max_len=48)}--{hashlib.sha1(raw.encode('utf-8')).hexdigest()[:8]}"
-
-
-def _slugify(text: str, max_len: int = 64) -> str:
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "-", text)
-    text = re.sub(r"-+", "-", text).strip("-")
-    return (text[:max_len].strip("-") or "skill")
+def _render_node_embedding_text(*, name: str, trigger: str, content: str) -> str:
+    return "\n".join([
+        f"name: {name.strip()}",
+        f"trigger: {trigger.strip()}",
+        f"content: {content.strip()}",
+    ]).strip()
 
 
 def _normalize(v: np.ndarray) -> np.ndarray:

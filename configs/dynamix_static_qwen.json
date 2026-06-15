@@ -54,7 +54,7 @@
       "max_iter": 100,
       "tol": 0.0001,
       "min_covar": 1e-06,
-      "min_split_size": 16,
+      "min_split_size": 8,
       "min_effective_samples_per_component": 8,
       "abs_kmax": 64,
       "max_concurrent_candidates": 1,

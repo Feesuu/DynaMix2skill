@@ -91,7 +91,7 @@ def write_split_manifest(data_path: Path, run_dir: Path, *, train_start: int, tr
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run Trace2Skill evolve -> DynaMix tree -> Trace2Skill heldout experiment")
+    parser = argparse.ArgumentParser(description="Run Trace2Skill train collection -> nodebank build -> heldout experiment")
     parser.add_argument("--data-path", required=True)
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--train-start", type=int, default=0)
@@ -108,7 +108,7 @@ def main() -> None:
     parser.add_argument("--python-executable", default=os.environ.get("DYNAMIX_PYTHON", sys.executable), help="Python executable used for all experiment stages; its bin dir is prepended to PATH so agent bash actions can call bare python")
     parser.add_argument("--max-turns", type=int, default=100)
     parser.add_argument("--thinking", choices=["true", "false", "null"], default="true", help="Unified Qwen thinking setting passed to Trace2Skill rollout and DynaMix analyst")
-    parser.add_argument("--skillbank-top-k", type=int, default=3, help="Select top-k DynaMix skill folders by Qwen3 embedding before each heldout task")
+    parser.add_argument("--skillbank-top-k", type=int, default=10, help="Select top-k DynaMix nodebank nodes by embedding before each heldout task")
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
@@ -220,6 +220,11 @@ def main() -> None:
             "max_concurrency": args.workers,
             "cache_path": str(run_dir / "cache" / "embedding_cache.sqlite"),
         },
+        "hierarchy": {
+            "gmm_bic": {
+                "min_split_size": 8,
+            },
+        },
         "analyst": {
             "prompt_style": "trace2skill_cluster_level_template_inheritance_v4",
             "confidence_floor": 0.05,
@@ -233,16 +238,14 @@ def main() -> None:
     run_stage("04_build_tree", [python_executable, "scripts/build_dynamix_tree.py", "--config", str(config_path)], cwd=repo, env=env, log_path=logs / "04_build_tree.log", marker_dir=markers, outputs=[tree_dir / "summary.json"], resume=args.resume)
 
     summary = json.loads((tree_dir / "summary.json").read_text(encoding="utf-8"))
-    manifest = json.loads(Path(summary["skill_manifest"]).read_text(encoding="utf-8"))
-    if not manifest.get("skills"):
-        raise RuntimeError("DynaMix produced no SKILL.md")
-    skillbank_root = Path(manifest.get("output_dir") or Path(summary["skill_manifest"]).parent)
-    skill_md = Path(manifest["skills"][0]["path"])
-    skills_root = run_dir / "trace2skill_dynamix_skills"
-    run_stage("05_install_skill", [python_executable, "scripts/install_dynamix_skill.py", "--skill-md", str(skill_md), "--output-skills-root", str(skills_root)], cwd=repo, env=env, log_path=logs / "05_install_skill.log", marker_dir=markers, outputs=[skills_root / "dynamix_install_manifest.json"], resume=args.resume)
-    # Enable per-task top-k skillbank selection during heldout.  Trace2Skill's
-    # prompt/action protocol remains unchanged; the agent simply receives the
-    # selected top-k SKILL.md contents in the usual preloaded skill slot.
+    manifest = json.loads(Path(summary["node_bank_manifest"]).read_text(encoding="utf-8"))
+    if int(manifest.get("node_count", 0)) <= 0:
+        raise RuntimeError("DynaMix produced no retrievable nodebank nodes")
+    skillbank_root = Path(manifest.get("output_dir") or Path(summary["node_bank_manifest"]).parent)
+    skills_root = run_dir / "trace2skill_empty_skills_dir"
+    skills_root.mkdir(parents=True, exist_ok=True)
+    # Enable per-task top-k nodebank selection during heldout.  The agent injects
+    # the selected node snippets directly into the usual preloaded-skill slot.
     env["DYNAMIX_SKILLBANK_ROOT"] = str(skillbank_root)
     env["DYNAMIX_SKILLBANK_TOP_K"] = str(max(0, int(args.skillbank_top_k)))
     env["DYNAMIX_SKILLBANK_EMBED_BASE_URL"] = args.embedding_base_url
@@ -287,8 +290,8 @@ def main() -> None:
         **runtime,
         "records_path": str(records),
         "tree_summary": str(tree_dir / "summary.json"),
-        "skill_md": str(skill_md),
         "skillbank_root": str(skillbank_root),
+        "node_bank_manifest": str(summary["node_bank_manifest"]),
         "skills_root": str(skills_root),
         "skillbank_top_k": int(args.skillbank_top_k),
         "skillbank_index": str(run_dir / "cache" / "skillbank_index.json"),

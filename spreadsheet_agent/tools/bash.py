@@ -47,6 +47,19 @@ def create_bash_tool(working_dir: str, timeout: int = 120):
                 output += f"\n[STDERR]\n{result.stderr}" if output else result.stderr
             if result.returncode != 0:
                 output += f"\n[Exit code: {result.returncode}]"
+                if "SyntaxError" in output:
+                    if "python -c" in command:
+                        output += (
+                            "\n[Recovery hint] This `python -c` command has invalid Python syntax. "
+                            "Do not retry the same one-line command. Write a multi-line `solution.py` "
+                            "with a heredoc, then run `python solution.py`."
+                        )
+                    elif "solution.py" in output:
+                        output += (
+                            "\n[Recovery hint] `solution.py` is not valid Python. Do not retry the same file. "
+                            "Simplify the code, avoid fragile nested quote formula strings, and write final "
+                            "computed values directly when that satisfies the target cells."
+                        )
             return output.strip() if output.strip() else "[Command completed with no output]"
         except subprocess.TimeoutExpired:
             return f"[ERROR] Command timed out after {timeout} seconds"

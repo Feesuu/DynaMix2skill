@@ -253,21 +253,16 @@ class BaseSpreadsheetAgent(ABC):
 
         Can be overridden by subclasses for custom formatting.
         """
-        # Convert to absolute paths so agent knows exact locations
-        working_dir = os.path.abspath(context.working_dir)
-        input_file = os.path.abspath(context.input_file)
-        output_file = os.path.abspath(context.output_file)
-        
         return f"""Below is the spreadsheet manipulation question you need to solve:
 
 ### working_directory
-{working_dir}
+.
 
 ### instruction
 {context.instruction}
 
 ### spreadsheet_path
-{input_file}
+input.xlsx
 
 ### spreadsheet_content
 {context.spreadsheet_content}
@@ -279,10 +274,10 @@ class BaseSpreadsheetAgent(ABC):
 {context.answer_position}
 
 ### output_path
-{output_file}
+output.xlsx
 
 ---
-**REMINDER**: You can ONLY access files within `{working_dir}`. Save output to the exact path: `{output_file}`
+**REMINDER**: Your bash commands already run inside the current task directory. Read only `input.xlsx`, save the final workbook as `output.xlsx`, and do not search `/tmp` or copy files from other task directories. If answer_position is a range, update every required cell in that range and verify representative target cells before completion.
 ---
 
 Execute Python code to solve the question and save the modified spreadsheet to the exact output_path shown above."""
@@ -341,9 +336,10 @@ Execute Python code to solve the question and save the modified spreadsheet to t
         Returns:
             Dictionary with 'success', 'answer', 'turns', and optionally 'error'
         """
-        # Set environment variables
-        os.environ["INPUT_FILE"] = context.input_file
-        os.environ["OUTPUT_FILE"] = context.output_file
+        # Keep the agent-facing file contract relative to the task cwd. The
+        # runner still uses absolute paths internally when checking outputs.
+        os.environ["INPUT_FILE"] = "input.xlsx"
+        os.environ["OUTPUT_FILE"] = "output.xlsx"
 
         # Build and run
         agent = self._ensure_agent(context.working_dir)
@@ -382,14 +378,14 @@ Execute Python code to solve the question and save the modified spreadsheet to t
                     
                     if self._logger:
                         self._logger.log_user_task(
-                            f"[System Check] The output file was NOT created at: {context.output_file}\n"
-                            f"Please return to work again until you create the output file at the exact path specified above, then signal ACTION: TASK_COMPLETE again."
+                            "[System Check] The output file was NOT created as `output.xlsx` in the current task directory.\n"
+                            "Please return to work again until you create `output.xlsx`, then signal ACTION: TASK_COMPLETE again."
                         )
-                    
+
                     # Continue the conversation with a reminder
                     result = agent.continue_with_message(
-                        f"[System Check] The output file was NOT created at: {context.output_file}\n"
-                        f"Please return to work again until you create the output file at the exact path specified above, then signal ACTION: TASK_COMPLETE again."
+                        "[System Check] The output file was NOT created as `output.xlsx` in the current task directory.\n"
+                        "Please return to work again until you create `output.xlsx`, then signal ACTION: TASK_COMPLETE again."
                     )
                     
                     # Re-check output file

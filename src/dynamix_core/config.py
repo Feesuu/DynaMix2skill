@@ -35,7 +35,7 @@ class GmmBicConfig:
     max_iter: int = 100
     tol: float = 1.0e-4
     min_covar: float = 1.0e-6
-    min_split_size: int = 16
+    min_split_size: int = 8
     # Used only to upper-bound searched K: kmax <= floor(total_weight / this value).
     # It is not a hard candidate-validity constraint.
     min_effective_samples_per_component: int = 8

@@ -360,9 +360,9 @@ def _summary_payload(
         "item_count": len(items),
         "community_count": len(communities),
         "layer_count": len(layers_payload),
-        "skill_count": None,
-        "skill_output_dir": None,
-        "skill_manifest": None,
+        "node_count": None,
+        "node_bank_dir": None,
+        "node_bank_manifest": None,
         "skillbank_index": None,
         "skillbank_index_skipped": True,
         "heldout_executed": False,
@@ -377,9 +377,9 @@ def _summary_payload(
     if skill_result is not None:
         summary.update(
             {
-                "skill_count": int(skill_result.skill_count),
-                "skill_output_dir": skill_result.output_dir,
-                "skill_manifest": skill_result.manifest_path,
+                "node_count": int(skill_result.node_count),
+                "node_bank_dir": skill_result.output_dir,
+                "node_bank_manifest": skill_result.manifest_path,
             }
         )
     return summary
@@ -829,7 +829,7 @@ async def _main_async(args: argparse.Namespace) -> dict[str, Any]:
             skill_export_payload = {
                 "attempted": True,
                 "ok": True,
-                "skill_count": int(skill_result.skill_count),
+                "node_count": int(skill_result.node_count),
                 "output_dir": skill_result.output_dir,
                 "manifest_path": skill_result.manifest_path,
                 "skillbank_index_skipped": True,

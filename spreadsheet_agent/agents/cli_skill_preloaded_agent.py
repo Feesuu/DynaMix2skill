@@ -10,19 +10,17 @@ when to read a skill file — the full guidance is already available in context.
 import json
 import os
 from datetime import datetime
-import re
 import sys
-from dataclasses import dataclass
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 from react_agent import Tool
 
 try:
-    from dynamix_trace2skill.skillbank import SkillBankSelector, selected_skills_to_system_content
+    from dynamix_trace2skill.skillbank import SkillBankSelector, selected_experience_to_system_content
 except Exception:  # pragma: no cover - DynaMix extension is optional for vanilla Trace2Skill use.
     SkillBankSelector = None  # type: ignore[assignment]
-    selected_skills_to_system_content = None  # type: ignore[assignment]
+    selected_experience_to_system_content = None  # type: ignore[assignment]
 
 from .base import BaseSpreadsheetAgent
 from ..tools import create_bash_tool
@@ -32,155 +30,33 @@ from ..system_prompts import render_full_system_prompt
 SKILLS_DIR = os.path.join(os.path.dirname(__file__), "..", "skills")
 
 
-@dataclass
-class SkillMetadata:
-    name: str
-    description: str
-    file_path: str
-
-
-def extract_skill_metadata(skill_file: str) -> SkillMetadata | None:
-    try:
-        with open(skill_file, "r", encoding="utf-8") as handle:
-            content = handle.read()
-    except OSError:
-        return None
-
-    frontmatter_match = re.match(r"^---\s*\n(.*?)\n---", content, re.DOTALL)
-    if not frontmatter_match:
-        return None
-
-    frontmatter = frontmatter_match.group(1)
-    name_match = re.search(r'^name:\s*["\']?([^"\'\n]+)["\']?\s*$', frontmatter, re.MULTILINE)
-    desc_match = re.search(
-        r'^description:\s*["\']?([^"\'\n]+)["\']?\s*$',
-        frontmatter,
-        re.MULTILINE,
-    )
-    if not name_match:
-        return None
-
-    return SkillMetadata(
-        name=name_match.group(1).strip(),
-        description=desc_match.group(1).strip() if desc_match else "",
-        file_path=skill_file,
-    )
-
-
-def discover_skills(skills_dir: str) -> list[SkillMetadata]:
-    skills = []
-    if not os.path.exists(skills_dir):
-        return skills
-
-    for entry in sorted(os.listdir(skills_dir)):
-        skill_dir = os.path.join(skills_dir, entry)
-        skill_file = os.path.join(skill_dir, "SKILL.md")
-        if not (os.path.isdir(skill_dir) and os.path.exists(skill_file)):
-            continue
-        metadata = extract_skill_metadata(skill_file)
-        if metadata is not None:
-            skills.append(metadata)
-    return skills
-
-
-def read_skill_content(skill: SkillMetadata) -> str:
-    """Read the full content of a skill file, stripping YAML frontmatter."""
-    try:
-        with open(skill.file_path, "r") as f:
-            content = f.read()
-
-        # Strip YAML frontmatter (already parsed into metadata)
-        if content.startswith("---"):
-            end = content.index("---", 3)
-            content = content[end + 3:].lstrip("\n")
-
-        return content
-    except Exception:
-        return ""
-
-
-def render_preloaded_skills_section(skills: list[tuple[SkillMetadata, str]], skills_dir: str) -> str:
-    """
-    Render the skills section with full skill content embedded.
-
-    Args:
-        skills: List of (metadata, content) tuples for each loaded skill.
-        skills_dir: Absolute path to the skills directory.
-    """
-    if not skills:
-        return ""
-
-    lines = [
-        "## Skills",
-        "",
-        "The following skills have been loaded for this session. Their full guidance is included below.",
-        "",
-    ]
-
-    for metadata, content in skills:
-        lines.extend([
-            f"### {metadata.name}",
-            "",
-            metadata.description,
-            "",
-            "---",
-            "",
-            content,
-            "",
-            "---",
-            "",
-        ])
-
-    lines.extend([
-        "### Skill Usage Rules",
-        "",
-        "**CRITICAL RULE**: If a skill above is relevant to your task and contains useful guidance",
-        "for the operation you need to perform, you MUST follow the skill's instructions. Only act",
-        "on your own judgment if:",
-        "- No skill is relevant to the task, OR",
-        "- The skill does not cover the specific operation you need to perform",
-        "",
-        "**Skill Authority**: When a skill has guidance for your operation, its instructions take",
-        "precedence over your general knowledge.",
-        "",
-        f"**Resources**: Scripts and other resources referenced in a skill are located in the skill's directory under `{skills_dir}`. Use the full path when running them (e.g., `python {skills_dir}/xlsx/recalc.py`).",
-        "",
-    ])
-
-    return "\n".join(lines)
-
-
-SPREADSHEET_SKILL_PRELOADED_CONTEXT = """You have a **bash** action to execute shell commands. Use it to run Python code.
-
-{skills_section}"""
-
-
 SPREADSHEET_SKILL_PRELOADED_EXAMPLES = """## Recommended Workflow
 
 1. **Analyze**: Read the instruction and spreadsheet_content to understand what needs to be done
-2. **Apply Skill Guidance**: Review the skill content loaded above. If any skill covers your operation, follow its guidance
-3. **Execute**: Write and run Python code following the skill's guidance when applicable
+2. **Apply Retrieved Experience**: Review the retrieved experience loaded above. If it covers your operation, follow its guidance
+3. **Execute**: Write and run Python code in the current directory, using `input.xlsx` and `output.xlsx`
 4. **Verify**: Check that the output file was created at the exact output_path
 5. **Complete**: Signal task completion with ACTION: TASK_COMPLETE
 
-**IMPORTANT**: Skill guidance is already loaded in your context above. Follow it when it covers your operation. Only use your own approach when no loaded skill covers your specific task.
+**IMPORTANT**: Retrieved experience is already loaded in your context above. Follow it when it covers your operation. Only use your own approach when no retrieved experience covers your specific task.
+**PYTHON RULE**: Use `python -c` only for short read-only checks. For any workbook edit, loop, formula fill, or multi-step logic, write `solution.py` and run `python solution.py`.
 
 ## Action Examples
 
-### Execute Python code (following loaded skill guidance when applicable):
+### Inspect workbook with simple Python:
 
 Action:
 {{
     "name": "bash",
-    "arguments": {{"command": "python -c \"import openpyxl; wb = openpyxl.load_workbook('/path/to/input.xlsx'); ws = wb.active; ws['D2'] = '=SUM(B2:C2)'; wb.save('/path/to/output.xlsx'); print('Done')\""}}
+    "arguments": {{"command": "python -c \"import openpyxl; wb = openpyxl.load_workbook('input.xlsx', data_only=True); print(wb.sheetnames); print(wb.active.dimensions)\""}}
 }}
 
-### Write and execute a solution script:
+### Write and execute a solution script for workbook edits:
 
 Action:
 {{
     "name": "bash",
-    "arguments": {{"command": "cat <<'EOF' > solution.py\\nimport openpyxl\\nwb = openpyxl.load_workbook('/path/to/input.xlsx')\\nws = wb.active\\n# Your manipulation logic here\\nwb.save('/path/to/output.xlsx')\\nprint('Saved')\\nEOF\\npython solution.py"}}
+    "arguments": {{"command": "cat <<'EOF' > solution.py\\nimport openpyxl\\n\\nwb = openpyxl.load_workbook('input.xlsx')\\nws = wb.active\\nfor row in range(2, ws.max_row + 1):\\n    # Put task-specific workbook edits here.\\n    pass\\nwb.save('output.xlsx')\\nprint('Saved output.xlsx')\\nEOF\\npython solution.py"}}
 }}
 
 ### Verify output file:
@@ -188,7 +64,7 @@ Action:
 Action:
 {{
     "name": "bash",
-    "arguments": {{"command": "ls -la /path/to/output.xlsx"}}
+    "arguments": {{"command": "ls -la output.xlsx"}}
 }}
 
 ### Signal task completion:
@@ -238,114 +114,69 @@ class CLISkillPreloadedAgent(BaseSpreadsheetAgent):
         self.timeout = timeout
         self.skills_dir = os.path.abspath(skills_dir if skills_dir is not None else SKILLS_DIR)
 
-        # Discover skills and load their full content at initialization.
-        # DynaMix may optionally enable task-conditioned skillbank selection via
-        # environment variables; vanilla Trace2Skill behavior remains unchanged
-        # when DYNAMIX_SKILLBANK_TOP_K is unset or <= 0.
-        metadata_list = discover_skills(self.skills_dir)
-        if not metadata_list:
-            raise ValueError(
-                f"No skills discovered in skills_dir: {self.skills_dir}"
-            )
-        self._all_skills: list[tuple[SkillMetadata, str]] = [
-            (meta, read_skill_content(meta)) for meta in metadata_list
-        ]
-        self._skills: list[tuple[SkillMetadata, str]] = list(self._all_skills)
-        self._active_skill_selection: list[dict] = []
-        self._skillbank_selector = None
         try:
             self._skillbank_top_k = int(os.getenv("DYNAMIX_SKILLBANK_TOP_K", "0") or "0")
         except ValueError:
             self._skillbank_top_k = 0
-        if self._skillbank_top_k > 0:
-            if SkillBankSelector is None:
-                raise RuntimeError("DYNAMIX_SKILLBANK_TOP_K was set but dynamix_trace2skill.skillbank is unavailable")
-            skillbank_root = os.getenv("DYNAMIX_SKILLBANK_ROOT", self.skills_dir)
-            self._skillbank_selector = SkillBankSelector.from_env(default_skillbank_root=skillbank_root)
+        if self._skillbank_top_k <= 0:
+            raise ValueError("DYNAMIX_SKILLBANK_TOP_K must be > 0 for nodebank retrieval")
+        self._active_skill_selection: list[dict] = []
+        self._dynamic_skillbank_content = ""
+        self._skillbank_selector = None
+        if SkillBankSelector is None:
+            raise RuntimeError("dynamix_trace2skill.skillbank is unavailable")
+        skillbank_root = os.getenv("DYNAMIX_SKILLBANK_ROOT", self.skills_dir)
+        self._skillbank_selector = SkillBankSelector.from_env(default_skillbank_root=skillbank_root)
 
     @property
     def name(self) -> str:
         return "cli_skill_preloaded_agent"
 
     def get_system_prompt(self) -> str:
-        """Legacy method - kept for backward compatibility."""
-        skills_section = render_preloaded_skills_section(self._skills, self.skills_dir)
-        return SPREADSHEET_SKILL_PRELOADED_CONTEXT.format(skills_section=skills_section)
+        """Legacy method - system_template is used for nodebank retrieval."""
+        return ""
 
     def get_system_template(self) -> str:
-        # The official v1 template has a single {skill_content} slot.  DynaMix
-        # skillbank selection concatenates the selected top-k SKILL.md files into
-        # that slot, so the rest of the Trace2Skill prompt/action protocol stays
-        # unchanged.
-        active_skills = self._skills or self._all_skills
-        if active_skills:
-            sections: list[str] = []
-            for index, (metadata, content) in enumerate(active_skills, start=1):
-                skill_dir = os.path.dirname(os.path.abspath(metadata.file_path))
-                sections.extend([
-                    f"## Preloaded Skill {index}: {metadata.name}",
-                    "",
-                    metadata.description,
-                    "",
-                    f"Skill directory: `{skill_dir}`",
-                    f"References directory: `{os.path.join(skill_dir, 'references')}`",
-                    f"Scripts directory: `{os.path.join(skill_dir, 'scripts')}`",
-                    "Use absolute paths under this skill directory if the skill tells you to inspect references or run helper scripts.",
-                    "",
-                    content,
-                    "",
-                ])
-            skill_content = "\n".join(sections).strip()
-            skill_dir = self.skills_dir
+        # The official v1 template has a single {skill_content} slot. Nodebank
+        # retrieval fills it with task-conditioned experience snippets.
+        if self._dynamic_skillbank_content:
+            skill_content = self._dynamic_skillbank_content.strip()
+            experience_root = os.getenv("DYNAMIX_SKILLBANK_ROOT", self.skills_dir)
         else:
-            skill_content = "(No skill loaded)"
-            skill_dir = self.skills_dir
+            skill_content = "(No retrieved experience loaded)"
+            experience_root = self.skills_dir
 
         return render_full_system_prompt(
             "cli_skill_preloaded_full_system_v1.txt",
             skill_content=skill_content,
-            skill_dir=skill_dir,
+            skill_dir=experience_root,
         )
 
     def _select_skills_for_context(self, context) -> None:
         if self._skillbank_top_k <= 0 or self._skillbank_selector is None:
-            self._skills = list(self._all_skills)
+            self._dynamic_skillbank_content = ""
             self._active_skill_selection = []
             return
-        query = "\n".join([
-            str(getattr(context, "instruction", "") or ""),
-            str(getattr(context, "instruction_type", "") or ""),
-            str(getattr(context, "answer_position", "") or ""),
-        ]).strip()
+        query = str(getattr(context, "instruction", "") or "").strip()
         selections = self._skillbank_selector.select(query, top_k=self._skillbank_top_k)
-        selected_pairs: list[tuple[SkillMetadata, str]] = []
         active_manifest: list[dict] = []
         for selection in selections:
             doc = selection.skill
-            # Concurrency-safe selection: do NOT copy or mutate shared
-            # skills_dir per query.  The skillbank is a run-level immutable root;
-            # each selected skill keeps its fixed absolute skill_dir so the agent
-            # can read references/ and scripts/ exactly as in Trace2Skill.
-            skill_path = os.path.abspath(doc.skill_path)
-            skill_dir = os.path.abspath(doc.skill_dir)
-            if not os.path.isfile(skill_path):
-                raise FileNotFoundError(f"selected SKILL.md does not exist: {skill_path}")
-            metadata = SkillMetadata(name=doc.name, description=doc.description, file_path=skill_path)
-            content = read_skill_content(metadata)
-            selected_pairs.append((metadata, content))
             active_manifest.append({
-                "skill_id": doc.skill_id,
+                "node_id": doc.node_id,
+                "item_id": doc.item_id,
                 "name": doc.name,
                 "score": selection.score,
-                "skill_path": skill_path,
-                "skill_dir": skill_dir,
-                "references_dir": os.path.join(skill_dir, "references"),
-                "scripts_dir": os.path.join(skill_dir, "scripts"),
+                "level": doc.level,
+                "support_mass": doc.support_mass,
+                "confidence": doc.confidence,
+                "source_community_id": doc.source_community_id,
+                "source_member_count": doc.source_member_count,
             })
-        self._skills = selected_pairs
+        self._dynamic_skillbank_content = selected_experience_to_system_content(selections) if selected_experience_to_system_content else ""
         self._active_skill_selection = active_manifest
         self._write_skill_selection_record(context=context, query=query, selected=active_manifest)
-        # Force ReActAgent/system prompt rebuild for this task's selected skills.
+        # Force ReActAgent/system prompt rebuild for this task's selected nodes.
         self._agent = None
 
     def _write_skill_selection_record(self, *, context, query: str, selected: list[dict]) -> None:
@@ -361,10 +192,8 @@ class CLISkillPreloadedAgent(BaseSpreadsheetAgent):
             "answer_position": str(getattr(context, "answer_position", "") or ""),
             "query": query,
             "top_k": self._skillbank_top_k,
-            "selected_skill_ids": [item["skill_id"] for item in selected],
-            "selected_skill_scores": [item["score"] for item in selected],
-            "selected_skill_dirs": [item["skill_dir"] for item in selected],
-            "selected_skill_paths": [item["skill_path"] for item in selected],
+            "selected_node_ids": [item["node_id"] for item in selected],
+            "selected_node_scores": [item["score"] for item in selected],
             "selected": selected,
         }
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -388,25 +217,21 @@ class CLISkillPreloadedAgent(BaseSpreadsheetAgent):
         ]
 
     def build_task_prompt(self, context) -> str:
-        """Build task prompt with absolute paths.
+        """Build task prompt with task-relative paths.
 
         Unlike CLISkillAgent, this does not include a skills_directory field
         since skill content is already embedded in the system prompt.
         """
-        working_dir = os.path.abspath(context.working_dir)
-        input_file = os.path.abspath(context.input_file)
-        output_file = os.path.abspath(context.output_file)
-
         return f"""Below is the spreadsheet manipulation question you need to solve:
 
 ### working_directory
-{working_dir}
+.
 
 ### instruction
 {context.instruction}
 
 ### spreadsheet_path
-{input_file}
+input.xlsx
 
 ### spreadsheet_content
 {context.spreadsheet_content}
@@ -418,14 +243,14 @@ class CLISkillPreloadedAgent(BaseSpreadsheetAgent):
 {context.answer_position}
 
 ### output_path
-{output_file}
+output.xlsx
 
 ---
-**REMINDER**: Write files ONLY in `{working_dir}`. Save output to exact path: `{output_file}`
+**REMINDER**: Your bash commands already run inside the current task directory. Read only `input.xlsx`, save the final workbook as `output.xlsx`, and do not search `/tmp` or copy files from other task directories. If answer_position is a range, update every required cell in that range and verify representative target cells before completion.
 ---
 
 Solve the question and save the modified spreadsheet to the exact output_path shown above."""
 
-    def get_available_skills(self) -> list[SkillMetadata]:
-        """Get list of discovered skills with their loaded content."""
-        return [meta for meta, _ in self._skills]
+    def get_available_skills(self) -> list:
+        """Nodebank retrieval does not expose local skill files."""
+        return []

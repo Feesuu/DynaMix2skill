@@ -83,7 +83,7 @@ def default_hierarchy_config(payload: dict[str, Any] | None = None) -> Projected
             "max_iter": 100,
             "tol": 1.0e-4,
             "min_covar": 1.0e-6,
-            "min_split_size": 16,
+            "min_split_size": 8,
             "min_effective_samples_per_component": 8,
             "abs_kmax": 64,
             "max_concurrent_candidates": 1,
@@ -149,9 +149,9 @@ async def build_tree_from_records(config: DynaMixRunConfig) -> dict[str, Any]:
         "item_count": len(state_payload.get("items", {})),
         "community_count": len(state_payload.get("communities", {})),
         "layer_count": len(result.layers),
-        "skill_count": skill_result.skill_count,
-        "skill_output_dir": skill_result.output_dir,
-        "skill_manifest": skill_result.manifest_path,
+        "node_count": skill_result.node_count,
+        "node_bank_dir": skill_result.output_dir,
+        "node_bank_manifest": skill_result.manifest_path,
         "skillbank_index": skillbank_index,
         "embedding_truncation_events": len(embedding_client.truncation_events),
         "layers": layers_payload,
@@ -244,17 +244,17 @@ async def build_dynamic_tree_from_records(config: DynaMixRunConfig) -> dict[str,
         (snap_dir / "hierarchy_state.json").write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
         skill_result = await export_skill_files(state, snap_dir, config=SkillExportConfig(output_dir_name=config.skill_output_dir_name))
         skillbank_index = _refresh_skillbank_index(skill_result.output_dir, config)
-        from dynamix_core.skill_export import affected_skill_paths
-        affected_paths = affected_skill_paths(update_result.changed_item_ids, skill_result.manifest_path)
+        from dynamix_core.skill_export import affected_node_refs
+        affected_refs = affected_node_refs(update_result.changed_item_ids, skill_result.manifest_path)
         update_summaries.append({
             "batch_index": batch_index,
             "inserted_item_ids": update_result.inserted_item_ids,
             "updated_community_ids": update_result.updated_community_ids,
             "changed_item_ids": update_result.changed_item_ids,
             "requires_skill_export": update_result.requires_skill_export,
-            "skill_manifest": skill_result.manifest_path,
+            "node_bank_manifest": skill_result.manifest_path,
             "skillbank_index": skillbank_index,
-            "affected_skill_paths": affected_paths,
+            "affected_node_refs": affected_refs,
         })
 
     analyst.save_prompt_token_report(out / "analysis" / "cluster_prompt_token_report.json")
@@ -270,9 +270,9 @@ async def build_dynamic_tree_from_records(config: DynaMixRunConfig) -> dict[str,
         "batch_count": len(update_summaries),
         "item_count": len(final_state.get("items", {})),
         "community_count": len(final_state.get("communities", {})),
-        "skill_count": final_skill.skill_count,
-        "skill_output_dir": final_skill.output_dir,
-        "skill_manifest": final_skill.manifest_path,
+        "node_count": final_skill.node_count,
+        "node_bank_dir": final_skill.output_dir,
+        "node_bank_manifest": final_skill.manifest_path,
         "skillbank_index": final_skillbank_index,
         "embedding_truncation_events": len(embedding_client.truncation_events),
         "updates": update_summaries,
@@ -345,10 +345,10 @@ async def _embed_records_for_build(
     return result.embedding_texts, result.embeddings
 
 def _refresh_skillbank_index(skillbank_root: str | Path, config: DynaMixRunConfig) -> str:
-    """Build or refresh the SKILL.md embedding index after every skill export.
+    """Build or refresh the nodebank embedding index after every export.
 
-    Dynamic updates can change one or more exported skills.  Rebuilding the
-    small JSON index is deterministic and avoids stale skillbank retrieval.
+    Dynamic updates can change one or more exported nodes. Rebuilding the small
+    JSON index is deterministic and avoids stale node retrieval.
     """
     root = Path(skillbank_root)
     index_path = root / ".dynamix_skillbank_index.json"

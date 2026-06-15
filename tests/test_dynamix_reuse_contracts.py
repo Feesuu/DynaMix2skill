@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import asyncio
+import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -59,7 +61,7 @@ def test_cluster_analyst_uses_all_members_not_member_cap():
 
 def test_default_hierarchy_config_is_real_not_tiny_smoke():
     cfg = default_hierarchy_config({})
-    assert cfg.gmm_bic.min_split_size == 16
+    assert cfg.gmm_bic.min_split_size == 8
     assert cfg.gmm_bic.min_effective_samples_per_component == 8
     assert cfg.gmm_bic.abs_kmax == 64
     assert cfg.gmm_bic.num_restarts == 5
@@ -210,56 +212,40 @@ def test_analyst_budget_defaults_to_summary_budget(tmp_path):
     assert payload["source"] == "hierarchy.summary_budget"
 
 
-def test_skill_export_respects_llm_placement_and_support_files(tmp_path):
+def test_nodebank_export_uses_only_name_trigger_content_for_embedding(tmp_path):
     from dynamix_core.skill_export import export_skill_files_from_payload
     payload = {
         "items": {
             "root": {
-                "item_id": "root", "level": 2, "kind": "experience_card", "text": "Root guidance", "support_mass": 10.0,
-                "generated_from_community_ids": ["c1"],
-                "metadata": {"name": "Root", "trigger": "Use for root guidance", "content": "Root guidance", "confidence": 0.9, "placement": {"target": "skill_md"}},
-            },
-            "ref": {
-                "item_id": "ref", "level": 1, "kind": "experience_card", "text": "Detailed edge case", "support_mass": 7.0,
+                "item_id": "root", "level": 1, "kind": "experience_card", "text": "Root guidance", "support_mass": 10.0,
                 "generated_from_community_ids": ["c0"],
-                "metadata": {"name": "Edge Details", "trigger": "Use for edge cases", "content": "Detailed edge case", "confidence": 0.8, "placement": {"target": "reference", "reference_kind": "edge_case"}},
+                "metadata": {
+                    "name": "Cross Sheet Lookup",
+                    "trigger": "When matching values across sheets.",
+                    "content": "Use lookup keys and verify target ranges.",
+                    "confidence": 0.9,
+                    "placement": {"target": "script"},
+                    "source_community_id": "c0",
+                    "source_member_count": 7,
+                    "analyst_mode": "raw_extractor",
+                },
             },
-            "script": {
-                "item_id": "script", "level": 1, "kind": "experience_card", "text": "Helper script note", "support_mass": 5.0,
-                "generated_from_community_ids": ["c0"],
-                "metadata": {"name": "Helper", "trigger": "Use for helper script", "content": "print('ok')", "confidence": 0.7, "placement": {"target": "script", "reference_kind": "procedure"}},
-            },
+            "raw": {"item_id": "raw", "level": 0, "kind": "trajectory", "text": "raw trace", "support_mass": 1.0, "metadata": {}},
+            "skip": {"item_id": "skip", "level": 1, "kind": "experience_card", "text": "skip", "support_mass": 1.0, "metadata": {"name": "Skip", "trigger": "skip", "content": "skip", "confidence": 0.5, "oversize_singleton": True}},
         },
-        "communities": {
-            "c1": {"community_id": "c1", "level": 1, "member_weights": {"ref": 1.0, "script": 1.0}, "posterior_member_weights": {"ref": 1.0, "script": 1.0}, "generated_item_ids": ["root"], "support_mass": 10.0},
-            "c0": {"community_id": "c0", "level": 0, "member_weights": {}, "posterior_member_weights": {}, "generated_item_ids": ["ref", "script"], "support_mass": 12.0},
-        },
+        "communities": {},
     }
     result = export_skill_files_from_payload(payload, tmp_path)
-    skill_dir = Path(result.skills[0].path).parent
-    assert (skill_dir / "SKILL.md").exists()
-    assert (skill_dir / "references" / "index.md").exists()
-    assert list((skill_dir / "references" / "edge-cases").glob("*.md"))
-    assert list((skill_dir / "scripts").glob("helper*.py"))
+    assert result.node_count == 1
     manifest = json.loads(Path(result.manifest_path).read_text())
-    assert manifest["placement_stats"]["reference"] >= 1
-    assert any(entry["node_id"] == "ref" and entry["material_kind"] == "reference" for entry in manifest["node_file_catalog"])
-    assert any(entry["node_id"] == "script" and entry["material_kind"] == "script" for entry in manifest["node_file_catalog"])
-
-
-def test_skill_install_copies_support_files(tmp_path):
-    from dynamix_trace2skill.skill_install import install_skill_for_trace2skill
-    source = tmp_path / "source_skill"
-    (source / "references").mkdir(parents=True)
-    (source / "scripts").mkdir()
-    (source / "SKILL.md").write_text("---\nname: test\ndescription: test\n---\n", encoding="utf-8")
-    (source / "references" / "index.md").write_text("# index\n", encoding="utf-8")
-    (source / "scripts" / "helper.py").write_text("print('ok')\n", encoding="utf-8")
-    manifest = install_skill_for_trace2skill(source, tmp_path / "installed")
-    canonical_dir = Path(manifest["canonical_skill_dir"])
-    assert (canonical_dir / "references" / "index.md").exists()
-    assert (canonical_dir / "scripts" / "helper.py").exists()
-    assert (tmp_path / "installed" / "xlsx" / "references" / "index.md").exists()
+    assert manifest["format"] == "dynamix_node_skill_bank_v1"
+    node = manifest["nodes"][0]
+    assert node["node_id"] == "root"
+    assert node["embedding_text"] == "name: Cross Sheet Lookup\ntrigger: When matching values across sheets.\ncontent: Use lookup keys and verify target ranges."
+    assert "placement" not in node
+    assert "level:" not in node["embedding_text"]
+    assert "support_mass" not in node["embedding_text"]
+    assert not (tmp_path / "skills" / "SKILL.md").exists()
 
 
 def test_cluster_prompt_uses_minimal_experience_schema():
@@ -288,25 +274,6 @@ def test_render_card_text_minimal_schema_only():
 
 
 
-def test_skill_export_names_skill_from_root_seed_name(tmp_path):
-    from dynamix_core.skill_export import export_skill_files_from_payload
-    payload = {
-        "items": {
-            "root": {
-                "item_id": "root", "level": 1, "kind": "experience_card", "text": "Lookup guidance", "support_mass": 3.0,
-                "generated_from_community_ids": ["c0"],
-                "metadata": {"name": "Cross Sheet Lookup", "trigger": "lookup tasks", "content": "Use lookup guidance.", "confidence": 0.9, "placement": {"target": "skill_md"}},
-            },
-        },
-        "communities": {"c0": {"community_id": "c0", "level": 0, "member_weights": {}, "posterior_member_weights": {}, "generated_item_ids": ["root"], "support_mass": 3.0}},
-    }
-    result = export_skill_files_from_payload(payload, tmp_path)
-    skill = result.skills[0]
-    assert skill.skill_id.startswith("skill_001_cross-sheet-lookup")
-    text = Path(skill.path).read_text(encoding="utf-8")
-    assert "name: \"Cross Sheet Lookup\"" in text
-
-
 def test_skill_export_rejects_old_alias_schema(tmp_path):
     from dynamix_core.skill_export import export_skill_files_from_payload
     payload = {
@@ -323,94 +290,257 @@ def test_skill_export_rejects_old_alias_schema(tmp_path):
         export_skill_files_from_payload(payload, tmp_path)
 
 
-def test_skillbank_selects_topk_by_embedding_without_copying_skill_folders(tmp_path):
+def test_nodebank_selector_selects_topk_nodes_without_skill_files(tmp_path):
     from dynamix_trace2skill.skillbank import SkillBankSelector
     bank = tmp_path / "bank"
-    (bank / "lookup" / "references").mkdir(parents=True)
-    (bank / "formatting").mkdir(parents=True)
-    (bank / "lookup" / "SKILL.md").write_text("---\nname: lookup skill\ndescription: vlookup and matching\n---\nUse lookup formulas and match keys.\n", encoding="utf-8")
-    (bank / "lookup" / "references" / "index.md").write_text("# lookup references\n", encoding="utf-8")
-    (bank / "formatting" / "SKILL.md").write_text("---\nname: formatting skill\ndescription: styles and colors\n---\nUse fonts, fills, and number formats.\n", encoding="utf-8")
+    bank.mkdir()
+    (bank / "node_bank_manifest.json").write_text(json.dumps({
+        "format": "dynamix_node_skill_bank_v1",
+        "nodes": [
+            {"node_id": "lookup", "item_id": "lookup", "name": "Lookup Keys", "trigger": "matching by key", "content": "Use lookup formulas and match keys.", "embedding_text": "name: Lookup Keys\ntrigger: matching by key\ncontent: Use lookup formulas and match keys.", "sha256": "a"},
+            {"node_id": "format", "item_id": "format", "name": "Format Cells", "trigger": "styling", "content": "Use fonts and fills.", "embedding_text": "name: Format Cells\ntrigger: styling\ncontent: Use fonts and fills.", "sha256": "b"},
+        ],
+    }), encoding="utf-8")
     selector = SkillBankSelector(skillbank_root=bank, base_url="mock://deterministic", model="mock-embed", cache_path=tmp_path / "index.json")
     selected = selector.select("need vlookup matching by key", top_k=1)
     assert len(selected) == 1
     assert "lookup" in selected[0].skill.name.lower()
-    assert Path(selected[0].skill.skill_dir) == bank / "lookup"
-    assert Path(selected[0].skill.skill_path) == bank / "lookup" / "SKILL.md"
-    assert (Path(selected[0].skill.skill_dir) / "references" / "index.md").exists()
-    assert not (bank / ".dynamix_selected_skills").exists()
-    assert not (bank / "selected_skills").exists()
+    assert not list(bank.rglob("SKILL.md"))
 
 
-def test_skillbank_selection_is_read_only_and_logs_selected_paths(tmp_path, monkeypatch):
+def test_spreadsheet_runner_validates_nodebank_not_skill_folders(tmp_path, monkeypatch):
+    from run_spreadsheetbench import build_arg_parser, validate_args
+
+    parser = build_arg_parser()
+    args = parser.parse_args([
+        "--data_path", str(tmp_path),
+        "--agent", "cli_skill_preloaded",
+        "--skills_dir", str(tmp_path),
+    ])
+
+    with pytest.raises(ValueError, match="DYNAMIX_SKILLBANK_TOP_K"):
+        validate_args(parser, args)
+
+    monkeypatch.setenv("DYNAMIX_SKILLBANK_TOP_K", "10")
+    with pytest.raises(ValueError, match="Node bank manifest not found"):
+        validate_args(parser, args)
+
+    (tmp_path / "node_bank_manifest.json").write_text(json.dumps({"format": "dynamix_node_skill_bank_v1", "nodes": []}), encoding="utf-8")
+    validate_args(parser, args)
+    assert not list(tmp_path.rglob("SKILL.md"))
+
+
+def test_nodebank_selection_injects_retrieved_experience_and_logs_nodes(tmp_path, monkeypatch):
     from spreadsheet_agent.agents.cli_skill_preloaded_agent import CLISkillPreloadedAgent
 
     class DummyClient:
         pass
 
     class DummySelector:
-        def __init__(self, skill_dir):
-            self.skill_dir = skill_dir
+        def __init__(self):
+            self.last_query = None
+
         def select(self, query, top_k=3):
-            from dynamix_trace2skill.skillbank import SkillDocument, SkillSelection
-            doc = SkillDocument(
-                skill_id="selected-skill",
-                name="Selected Skill",
-                description="desc",
-                skill_dir=str(self.skill_dir),
-                skill_path=str(self.skill_dir / "SKILL.md"),
-                content="Body",
-                full_text="Selected Skill\ndesc\nBody",
+            self.last_query = query
+            from dynamix_trace2skill.skillbank import SkillNodeDocument, SkillSelection
+            doc = SkillNodeDocument(
+                node_id="node-1",
+                item_id="node-1",
+                name="Lookup Keys",
+                trigger="When matching values by key.",
+                content="Use lookup formulas and verify the key range.",
+                embedding_text="name: Lookup Keys\ntrigger: When matching values by key.\ncontent: Use lookup formulas and verify the key range.",
+                prompt_text="",
                 sha256="abc",
             )
             return [SkillSelection(skill=doc, score=1.0)]
 
-    # Base skills_dir must still contain a Trace2Skill-compatible skill for constructor discovery.
     skills_dir = tmp_path / "skills_root"
-    (skills_dir / "xlsx").mkdir(parents=True)
-    (skills_dir / "xlsx" / "SKILL.md").write_text("---\nname: base\ndescription: base\n---\nbase\n", encoding="utf-8")
-
-    source_skill = tmp_path / "source_skill"
-    (source_skill / "references").mkdir(parents=True)
-    (source_skill / "scripts").mkdir()
-    (source_skill / "SKILL.md").write_text("---\nname: selected\ndescription: selected\n---\nRead references/index.md when needed.\n", encoding="utf-8")
-    (source_skill / "references" / "index.md").write_text("# reference index\n", encoding="utf-8")
-    (source_skill / "scripts" / "helper.py").write_text("print('ok')\n", encoding="utf-8")
+    skills_dir.mkdir()
+    bank = tmp_path / "bank"
+    bank.mkdir()
+    (bank / "node_bank_manifest.json").write_text(json.dumps({"format": "dynamix_node_skill_bank_v1", "nodes": []}), encoding="utf-8")
 
     selection_log = tmp_path / "raw" / "skill_selection_records.jsonl"
     monkeypatch.setenv("DYNAMIX_SKILLBANK_TOP_K", "1")
+    monkeypatch.setenv("DYNAMIX_SKILLBANK_ROOT", str(bank))
     monkeypatch.setenv("DYNAMIX_SKILL_SELECTION_LOG", str(selection_log))
     agent = CLISkillPreloadedAgent(DummyClient(), skills_dir=str(skills_dir), verbose=False)
-    agent._skillbank_selector = DummySelector(source_skill)
+    selector = DummySelector()
+    agent._skillbank_selector = selector
     class Context:
         instance_id = "task-1"
         instruction = "lookup values"
         instruction_type = "Cell-Level Manipulation"
         answer_position = "A1"
     agent._select_skills_for_context(Context())
+    assert selector.last_query == "lookup values"
     assert agent._active_skill_selection
     selected = agent._active_skill_selection[0]
-    assert selected["skill_dir"] == str(source_skill)
-    assert selected["skill_path"] == str(source_skill / "SKILL.md")
-    assert not (skills_dir / ".dynamix_selected_skills").exists()
+    assert selected["node_id"] == "node-1"
     prompt = agent.get_system_template()
-    assert str(source_skill) in prompt
-    assert str(source_skill / "references") in prompt
-    assert str(source_skill / "scripts") in prompt
+    assert "Retrieved Experience" in prompt
+    assert "Use lookup formulas" in prompt
+    assert "SKILL.md" not in prompt
     record = json.loads(selection_log.read_text(encoding="utf-8").splitlines()[0])
     assert record["instance_id"] == "task-1"
-    assert record["selected_skill_ids"] == ["selected-skill"]
-    assert record["selected_skill_dirs"] == [str(source_skill)]
+    assert record["query"] == "lookup values"
+    assert record["selected_node_ids"] == ["node-1"]
 
 
-def test_trace2skill_bash_can_read_absolute_skillbank_support_file(tmp_path):
+def test_cli_agents_expose_only_task_relative_io_paths(tmp_path, monkeypatch):
+    from spreadsheet_agent.agents.base import AgentContext
+    from spreadsheet_agent.agents.cli_only_agent import CLIOnlyAgent
+    from spreadsheet_agent.agents.cli_skill_preloaded_agent import CLISkillPreloadedAgent
+
+    class DummyClient:
+        pass
+
+    work_dir = tmp_path / "work" / "2768_1_2768_init"
+    work_dir.mkdir(parents=True)
+    context = AgentContext(
+        working_dir=str(work_dir),
+        input_file=str(work_dir / "input.xlsx"),
+        output_file=str(work_dir / "output.xlsx"),
+        instruction="fill formulas",
+        spreadsheet_content="('a', 'b')",
+        instruction_type="Cell-Level Manipulation",
+        answer_position="A1",
+        instance_id="2768",
+    )
+
+    bank = tmp_path / "bank"
+    bank.mkdir()
+    (bank / "node_bank_manifest.json").write_text(
+        json.dumps({"format": "dynamix_node_skill_bank_v1", "nodes": []}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DYNAMIX_SKILLBANK_TOP_K", "1")
+    monkeypatch.setenv("DYNAMIX_SKILLBANK_ROOT", str(bank))
+
+    agents = [
+        CLIOnlyAgent(DummyClient(), verbose=False),
+        CLISkillPreloadedAgent(DummyClient(), skills_dir=str(bank), verbose=False),
+    ]
+    for agent in agents:
+        prompt = agent.build_task_prompt(context)
+        assert "### working_directory\n.\n" in prompt
+        assert "### spreadsheet_path\ninput.xlsx\n" in prompt
+        assert "### output_path\noutput.xlsx\n" in prompt
+        assert "update every required cell in that range" in prompt
+        assert "verify representative target cells" in prompt
+        assert str(work_dir) not in prompt
+        assert str(context.input_file) not in prompt
+        assert str(context.output_file) not in prompt
+
+
+def test_spreadsheet_system_prompts_use_relative_io_examples():
+    from spreadsheet_agent.system_prompts import load_full_system_prompt
+
+    for filename in ("cli_only_full_system_v1.txt", "cli_skill_preloaded_full_system_v1.txt"):
+        prompt = load_full_system_prompt(filename)
+        assert "openpyxl.load_workbook('input.xlsx')" in prompt
+        assert "wb.save('output.xlsx')" in prompt
+        assert "Use `python -c` only for short read-only inspection" in prompt
+        assert "Do NOT put compound Python logic inside `python -c`" in prompt
+        assert "update every cell that the instruction requires within that range" in prompt
+        assert "verify representative target cells" in prompt
+        assert "cat <<'EOF' > solution.py" in prompt
+        assert "for row in range(2, ws.max_row + 1):" in prompt
+        assert "python solution.py" in prompt
+        assert "python -c \"import openpyxl; wb = openpyxl.load_workbook('input.xlsx'); ws = wb.active; wb.save('output.xlsx')\"" not in prompt
+        assert "/absolute/path/to/input.xlsx" not in prompt
+        assert "/path/to/input.xlsx" not in prompt
+        assert "Always use absolute paths" not in prompt
+
+
+def test_bash_tool_recovers_from_invalid_python_c_syntax(tmp_path):
     from spreadsheet_agent.tools import create_bash_tool
-    skill_dir = tmp_path / "skillbank" / "skill_a"
-    (skill_dir / "references").mkdir(parents=True)
-    target = skill_dir / "references" / "index.md"
-    target.write_text("# Support Index\nreadable content\n", encoding="utf-8")
-    work = tmp_path / "work"
-    work.mkdir()
-    bash = create_bash_tool(str(work), timeout=10)
-    output = bash.execute(command=f"cat {target}")
-    assert "readable content" in output
+
+    bash = create_bash_tool(str(tmp_path))
+    result = bash.execute(command="python -c \"import sys; for row in range(2): print(row)\"")
+    assert "SyntaxError" in result
+    assert "[Recovery hint]" in result
+    assert "solution.py" in result
+
+
+def test_bash_tool_recovers_from_solution_py_syntax_error(tmp_path):
+    from spreadsheet_agent.tools import create_bash_tool
+
+    (tmp_path / "solution.py").write_text("formula = f'=\"broken\\n", encoding="utf-8")
+    result = create_bash_tool(str(tmp_path)).execute(command="python solution.py")
+    assert "SyntaxError" in result
+    assert "[Recovery hint]" in result
+    assert "final computed values directly" in result
+
+
+def test_agent_runtime_env_uses_relative_io_names(tmp_path, monkeypatch):
+    from spreadsheet_agent.agents.base import AgentContext
+    from spreadsheet_agent.agents.cli_only_agent import CLIOnlyAgent
+
+    class DummyClient:
+        pass
+
+    work_dir = tmp_path / "work" / "task"
+    work_dir.mkdir(parents=True)
+    context = AgentContext(
+        working_dir=str(work_dir),
+        input_file=str(work_dir / "input.xlsx"),
+        output_file=str(work_dir / "output.xlsx"),
+        instruction="create output",
+    )
+    captured = {}
+
+    class DummyReactAgent:
+        def run(self, task_prompt):
+            captured["task_prompt"] = task_prompt
+            captured["input_file"] = os.environ["INPUT_FILE"]
+            captured["output_file"] = os.environ["OUTPUT_FILE"]
+            Path(context.output_file).write_text("placeholder", encoding="utf-8")
+            return SimpleNamespace(success=True, total_turns=1, final_answer="", error="")
+
+    agent = CLIOnlyAgent(DummyClient(), verbose=False)
+    monkeypatch.setattr(agent, "_ensure_agent", lambda working_dir: DummyReactAgent())
+    result = agent.run(context)
+    assert result["success"] is True
+    assert captured["input_file"] == "input.xlsx"
+    assert captured["output_file"] == "output.xlsx"
+    assert str(work_dir) not in captured["task_prompt"]
+
+
+def test_l1_singleton_community_is_summarized_by_analyst():
+    from dynamix_core.tree_builder import ProjectedGmmTreeBuilder, LayerClusteringResult
+
+    community = ExperienceCommunity(community_id="L1_C000", level=1, member_weights={"e1": 1.0})
+    clustering = LayerClusteringResult(
+        level=1,
+        input_item_ids=["e1"],
+        communities=[community],
+        member_item_ids_by_community={"L1_C000": ["e1"]},
+        stop_reason="",
+    )
+    member = ExperienceItem(
+        item_id="e1",
+        level=1,
+        kind=ITEM_KIND_EXPERIENCE_CARD,
+        text="lower-level experience",
+        embedding=[1.0],
+        metadata={"name": "Lower", "trigger": "lower", "content": "lower", "confidence": 0.9},
+    )
+    calls = []
+
+    def summary_fn(comm, members, layer):
+        calls.append((comm.community_id, [item.item_id for item in members]))
+        return [ExperienceItem(
+            item_id="e2",
+            level=2,
+            kind=ITEM_KIND_EXPERIENCE_CARD,
+            text="higher-level experience",
+            embedding=[1.0],
+            generated_from_community_ids=[comm.community_id],
+            metadata={"name": "Higher", "trigger": "higher", "content": "higher", "confidence": 0.9},
+        )]
+
+    generated = asyncio.run(ProjectedGmmTreeBuilder(default_hierarchy_config({}))._summarize_communities(clustering, items_by_id={"e1": member}, summary_fn=summary_fn))
+    assert calls == [("L1_C000", ["e1"])]
+    assert [item.item_id for item in generated] == ["e2"]
