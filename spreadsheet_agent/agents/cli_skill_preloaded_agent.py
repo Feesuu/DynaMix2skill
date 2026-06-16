@@ -157,7 +157,7 @@ class CLISkillPreloadedAgent(BaseSpreadsheetAgent):
             self._dynamic_skillbank_content = ""
             self._active_skill_selection = []
             return
-        query = str(getattr(context, "instruction", "") or "").strip()
+        query = self._build_skillbank_query(context)
         selections = self._skillbank_selector.select(query, top_k=self._skillbank_top_k)
         active_manifest: list[dict] = []
         for selection in selections:
@@ -178,6 +178,14 @@ class CLISkillPreloadedAgent(BaseSpreadsheetAgent):
         self._write_skill_selection_record(context=context, query=query, selected=active_manifest)
         # Force ReActAgent/system prompt rebuild for this task's selected nodes.
         self._agent = None
+
+    @staticmethod
+    def _build_skillbank_query(context) -> str:
+        instruction = str(getattr(context, "instruction", "") or "").strip()
+        instruction_type = str(getattr(context, "instruction_type", "") or "").strip()
+        if instruction_type:
+            return f"{instruction}\n\nTask type: {instruction_type}" if instruction else f"Task type: {instruction_type}"
+        return instruction
 
     def _write_skill_selection_record(self, *, context, query: str, selected: list[dict]) -> None:
         path = os.getenv("DYNAMIX_SKILL_SELECTION_LOG")

@@ -374,7 +374,8 @@ def test_nodebank_selection_injects_retrieved_experience_and_logs_nodes(tmp_path
         instruction_type = "Cell-Level Manipulation"
         answer_position = "A1"
     agent._select_skills_for_context(Context())
-    assert selector.last_query == "lookup values"
+    expected_query = "lookup values\n\nTask type: Cell-Level Manipulation"
+    assert selector.last_query == expected_query
     assert agent._active_skill_selection
     selected = agent._active_skill_selection[0]
     assert selected["node_id"] == "node-1"
@@ -384,7 +385,7 @@ def test_nodebank_selection_injects_retrieved_experience_and_logs_nodes(tmp_path
     assert "SKILL.md" not in prompt
     record = json.loads(selection_log.read_text(encoding="utf-8").splitlines()[0])
     assert record["instance_id"] == "task-1"
-    assert record["query"] == "lookup values"
+    assert record["query"] == expected_query
     assert record["selected_node_ids"] == ["node-1"]
 
 
