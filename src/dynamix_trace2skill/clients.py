@@ -5,6 +5,7 @@ import hashlib
 import json
 import sqlite3
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,19 +60,51 @@ class GenerationClient:
         self.config = config
         self._sem = asyncio.Semaphore(max(1, int(config.max_concurrency)))
         self._counter = 0
+        self._debug_lock = threading.Lock()
         if config.debug_dir:
             Path(config.debug_dir).mkdir(parents=True, exist_ok=True)
 
-    async def chat_text(self, messages: list[dict[str, str]], *, temperature: float | None = None, max_tokens: int | None = None, timeout: float | None = None, extra_body: dict | None = None) -> str:
+    async def chat_text(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        timeout: float | None = None,
+        extra_body: dict | None = None,
+        debug_metadata: dict[str, Any] | None = None,
+    ) -> str:
         async with self._sem:
+            body = self._request_extra_body(extra_body)
+            debug_path = self._start_debug(messages, temperature, max_tokens, timeout, body, debug_metadata)
             if self.config.base_url.startswith("mock://"):
-                return _mock_text(messages)
-            return await asyncio.to_thread(self._chat_text_sync, messages, temperature, max_tokens, timeout, extra_body)
+                content = _mock_text(messages)
+                self._finish_debug(debug_path, "succeeded", response=content)
+                return content
+            try:
+                content = await asyncio.to_thread(self._chat_text_sync, messages, temperature, max_tokens, timeout, body)
+            except Exception as exc:
+                self._finish_debug(debug_path, "failed", error=exc)
+                raise
+            self._finish_debug(debug_path, "succeeded", response=content)
+            return content
 
-    async def chat_json(self, messages: list[dict[str, str]], *, schema_name: str, timeout: float | None = None, retries: int = 2, extra_body: dict | None = None) -> dict[str, Any]:
+    async def chat_json(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        schema_name: str,
+        timeout: float | None = None,
+        retries: int = 2,
+        extra_body: dict | None = None,
+        debug_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         last_error: Exception | None = None
+        metadata = dict(debug_metadata or {})
+        metadata.setdefault("schema_name", schema_name)
         for attempt in range(max(1, retries + 1)):
-            text = await self.chat_text(messages, timeout=timeout, extra_body=extra_body)
+            attempt_metadata = {**metadata, "json_parse_attempt": attempt + 1}
+            text = await self.chat_text(messages, timeout=timeout, extra_body=extra_body, debug_metadata=attempt_metadata)
             try:
                 return _extract_json_object(text)
             except Exception as exc:
@@ -79,19 +112,12 @@ class GenerationClient:
                 messages = list(messages) + [{"role": "user", "content": f"Return valid JSON only for schema {schema_name}. Previous parse error: {exc}"}]
         raise ValueError(f"failed to parse JSON for {schema_name}: {last_error}")
 
-    def _chat_text_sync(self, messages: list[dict[str, str]], temperature: float | None, max_tokens: int | None, timeout: float | None, extra_body: dict | None) -> str:
+    def _chat_text_sync(self, messages: list[dict[str, str]], temperature: float | None, max_tokens: int | None, timeout: float | None, body: dict[str, Any]) -> str:
         try:
             from openai import OpenAI
         except ImportError:
             from .openai_compat import OpenAI
 
-        body: dict[str, Any] = dict(self.config.extra_body or {})
-        if extra_body:
-            body = _deep_merge(body, extra_body)
-        if self.config.thinking_mode is not None:
-            # Do not force disable thinking.  Keep this configurable, as required.
-            ctk = body.setdefault("chat_template_kwargs", {})
-            ctk.setdefault("enable_thinking", bool(self.config.thinking_mode))
         kwargs: dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
@@ -130,16 +156,65 @@ class GenerationClient:
         if response is None:
             raise RuntimeError("generation request failed without an exception")
         content = response.choices[0].message.content or ""
-        self._write_debug(messages, content)
         return content
 
-    def _write_debug(self, messages: list[dict[str, str]], content: str) -> None:
-        if not self.config.debug_dir:
-            return
-        self._counter += 1
-        path = Path(self.config.debug_dir) / f"generation_{self._counter:05d}.json"
-        path.write_text(json.dumps({"messages": messages, "response": content}, ensure_ascii=False, indent=2), encoding="utf-8")
+    def _request_extra_body(self, extra_body: dict | None) -> dict[str, Any]:
+        body: dict[str, Any] = dict(self.config.extra_body or {})
+        if extra_body:
+            body = _deep_merge(body, extra_body)
+        if self.config.thinking_mode is not None:
+            # Do not force disable thinking. Keep this configurable, as required.
+            ctk = body.setdefault("chat_template_kwargs", {})
+            ctk.setdefault("enable_thinking", bool(self.config.thinking_mode))
+        return body
 
+    def _start_debug(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float | None,
+        max_tokens: int | None,
+        timeout: float | None,
+        extra_body: dict[str, Any],
+        debug_metadata: dict[str, Any] | None,
+    ) -> Path | None:
+        if not self.config.debug_dir:
+            return None
+        with self._debug_lock:
+            self._counter += 1
+            path = Path(self.config.debug_dir) / f"generation_{self._counter:05d}.json"
+        payload = {
+            "status": "pending",
+            "metadata": dict(debug_metadata or {}),
+            "request": {
+                "model": self.config.model,
+                "base_url": self.config.base_url,
+                "temperature": self.config.temperature if temperature is None else temperature,
+                "max_tokens": max_tokens,
+                "timeout_seconds": timeout or self.config.timeout_seconds,
+                "extra_body": extra_body,
+            },
+            "messages": messages,
+        }
+        if not _safe_write_debug_json(path, payload):
+            return None
+        return path
+
+    def _finish_debug(self, path: Path | None, status: str, *, response: str | None = None, error: Exception | None = None) -> None:
+        if path is None:
+            return
+        payload = _safe_read_debug_json(path)
+        if payload is None:
+            payload = {}
+        payload["status"] = status
+        if response is not None:
+            payload["response"] = response
+        if error is not None:
+            payload["error"] = {
+                "type": type(error).__name__,
+                "message": str(error),
+                "status": _openai_status_code(error),
+            }
+        _safe_write_debug_json(path, payload)
 
 class EmbeddingClient:
     def __init__(self, config: EmbeddingConfig):
@@ -253,6 +328,35 @@ class EmbeddingClient:
     def close(self) -> None:
         if self._cache:
             self._cache.close()
+
+
+def _safe_read_debug_json(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        _debug_io_warning(path, "read", exc)
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _safe_write_debug_json(path: Path, payload: dict[str, Any]) -> bool:
+    try:
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        _debug_io_warning(path, "write", exc)
+        return False
+    return True
+
+
+def _debug_io_warning(path: Path, operation: str, exc: Exception) -> None:
+    print(
+        "[dynamix-generation-debug-warning] "
+        f"operation={operation} "
+        f"path={path} "
+        f"error={type(exc).__name__}: {exc}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 class _SqliteEmbeddingCache:

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from dynamix_trace2skill.clients import EmbeddingClient, EmbeddingConfig
+from dynamix_trace2skill.clients import EmbeddingClient, EmbeddingConfig, GenerationClient, GenerationConfig
 from dynamix_trace2skill.summary import ClusterAnalyst, ClusterAnalystConfig
 from dynamix_trace2skill.log_parser import parse_trace2skill_logs, _result_fields
 from dynamix_trace2skill.pipeline import default_hierarchy_config
@@ -39,6 +39,97 @@ def test_embedding_truncates_to_configured_32k_budget_with_tokenizer(tmp_path):
 
 async def async_embed(client, texts):
     return await client.embed_texts(texts)
+
+
+def test_generation_debug_is_written_before_failed_request(tmp_path, monkeypatch):
+    client = GenerationClient(GenerationConfig(base_url="http://example.invalid/v1", debug_dir=str(tmp_path)))
+
+    def fail_request(*args, **kwargs):
+        raise RuntimeError("simulated remote crash")
+
+    monkeypatch.setattr(client, "_chat_text_sync", fail_request)
+    with pytest.raises(RuntimeError, match="simulated remote crash"):
+        asyncio.run(client.chat_text([{"role": "user", "content": "hello"}], debug_metadata={"community_id": "C0"}))
+
+    debug_files = sorted(tmp_path.glob("generation_*.json"))
+    assert len(debug_files) == 1
+    payload = json.loads(debug_files[0].read_text())
+    assert payload["status"] == "failed"
+    assert payload["metadata"]["community_id"] == "C0"
+    assert payload["messages"][0]["content"] == "hello"
+    assert payload["error"]["type"] == "RuntimeError"
+
+
+def test_generation_debug_write_failure_does_not_block_generation(tmp_path, monkeypatch, capsys):
+    client = GenerationClient(GenerationConfig(base_url="mock://deterministic", debug_dir=str(tmp_path)))
+
+    def fail_write(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("dynamix_trace2skill.clients.Path.write_text", fail_write)
+    text = asyncio.run(client.chat_text([{"role": "user", "content": "Return only OK."}]))
+
+    assert text == "ACTION: TASK_COMPLETE"
+    assert "dynamix-generation-debug-warning" in capsys.readouterr().err
+
+
+def test_generation_debug_records_effective_timeout(tmp_path):
+    client = GenerationClient(GenerationConfig(base_url="mock://deterministic", debug_dir=str(tmp_path), timeout_seconds=600.0))
+    asyncio.run(client.chat_text([{"role": "user", "content": "Return only OK."}], timeout=12.5))
+
+    payload = json.loads(next(tmp_path.glob("generation_*.json")).read_text())
+    assert payload["request"]["timeout_seconds"] == 12.5
+
+
+def test_cluster_analyst_passes_generation_debug_metadata(tmp_path):
+    class DummyGeneration:
+        def __init__(self):
+            self.kwargs = None
+
+        async def chat_json(self, messages, *, schema_name, **kwargs):
+            self.kwargs = kwargs
+            return {
+                "cards": [{
+                    "name": "Specific lesson",
+                    "trigger": "When a task has this pattern.",
+                    "content": "Use the observed procedure.",
+                    "placement": {"target": "skill_md", "reference_kind": "procedure"},
+                    "confidence": 0.8,
+                }],
+            }
+
+    class DummyEmbedding:
+        async def embed_texts(self, texts, *, cache_namespace=None):
+            return [[1.0] for _ in texts]
+
+    generation = DummyGeneration()
+    analyst = ClusterAnalyst(
+        generation,
+        DummyEmbedding(),
+        ClusterAnalystConfig(
+            tokenizer_required=False,
+            allow_regex_tokenizer_fallback=True,
+            max_prompt_tokens=100000,
+            prompt_token_report_path=str(tmp_path / "tokens.json"),
+        ),
+    )
+    community = ExperienceCommunity(community_id="L0_C0", level=0, member_weights={"t0": 1.0}, success_count=1, outcome_mode="success")
+    member = ExperienceItem(
+        item_id="t0",
+        level=0,
+        kind=ITEM_KIND_TRAJECTORY,
+        text="trace",
+        embedding=[1.0],
+        metadata={"analysis_bundle": "short evidence", "task_id": "13-1", "success": True},
+    )
+    asyncio.run(analyst.summarize(community, [member]))
+
+    metadata = generation.kwargs["debug_metadata"]
+    assert metadata["community_id"] == "L0_C0"
+    assert metadata["analyst_mode"] == "raw_extractor"
+    assert metadata["prompt_token_event"]["prompt_tokens"] > 0
+    assert metadata["members"][0]["task_id"] == "13-1"
+    assert metadata["members"][0]["success"] is True
 
 
 def test_embedding_raises_when_truncation_disabled(tmp_path):

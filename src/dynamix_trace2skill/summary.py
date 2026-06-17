@@ -67,13 +67,20 @@ class ClusterAnalyst:
         analyst_mode = _infer_analyst_mode(community, members, self.config)
         system_prompt = self._system_prompt(analyst_mode)
         prompt = self._build_prompt(community, members, analyst_mode)
-        self._preflight_prompt_budget(community, system_prompt, prompt, len(members))
+        token_event = self._preflight_prompt_budget(community, system_prompt, prompt, len(members))
         payload = await self.generation.chat_json(
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
             schema_name="MinimalClusterExperienceCards",
+            debug_metadata=self._generation_debug_metadata(
+                community,
+                members,
+                analyst_mode,
+                "MinimalClusterExperienceCards",
+                token_event,
+            ),
         )
         cards_payload = _extract_cards_payload(payload)
         llm_returned_card_count = len(cards_payload)
@@ -153,13 +160,20 @@ class ClusterAnalyst:
         analyst_mode = _infer_analyst_mode(community, members, self.config)
         system_prompt = self._dynamic_system_prompt(analyst_mode)
         prompt = self._build_dynamic_update_prompt(community, members, previous_generated_experiences, analyst_mode)
-        self._preflight_prompt_budget(community, system_prompt, prompt, len(members))
+        token_event = self._preflight_prompt_budget(community, system_prompt, prompt, len(members))
         payload = await self.generation.chat_json(
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
             schema_name="DynamicExperienceCardPatchSet",
+            debug_metadata=self._generation_debug_metadata(
+                community,
+                members,
+                analyst_mode,
+                "DynamicExperienceCardPatchSet",
+                token_event,
+            ),
         )
         previous_by_id = {str(card.get("item_id")): dict(card) for card in previous_generated_experiences if card.get("item_id")}
         if analyst_mode == "experience_abstractor":
@@ -372,9 +386,9 @@ Omit unchanged old cards. Do not delete old cards. Do not output support_mass.
 Return valid JSON only.
 """
 
-    def _preflight_prompt_budget(self, community: ExperienceCommunity, system_prompt: str, user_prompt: str, member_count: int) -> None:
+    def _preflight_prompt_budget(self, community: ExperienceCommunity, system_prompt: str, user_prompt: str, member_count: int) -> dict[str, Any] | None:
         if self.config.max_prompt_tokens is None or int(self.config.max_prompt_tokens) <= 0:
-            return
+            return None
         text = system_prompt + "\n" + user_prompt
         try:
             tokenizer = get_tokenizer(self.config.tokenizer_model, allow_regex_fallback=self.config.allow_regex_tokenizer_fallback)
@@ -405,11 +419,39 @@ Return valid JSON only.
                 f"prompt_tokens={token_count}, max_prompt_tokens={self.config.max_prompt_tokens}. "
                 "The hierarchy summary_budget/token counts must force a finer split before analyst invocation."
             )
+        return event
 
     def save_prompt_token_report(self, path: str | Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"events": self.config.token_report}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _generation_debug_metadata(
+        self,
+        community: ExperienceCommunity,
+        members: Sequence[ExperienceItem],
+        analyst_mode: str,
+        schema_name: str,
+        token_event: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        return {
+            "schema_name": schema_name,
+            "community_id": community.community_id,
+            "level": community.level,
+            "analyst_mode": analyst_mode,
+            "member_count": len(members),
+            "member_item_ids": [item.item_id for item in members],
+            "community": {
+                "support_mass": community.support_mass,
+                "outcome_mode": community.outcome_mode,
+                "success_count": community.success_count,
+                "failure_count": community.failure_count,
+                "clustering_method": community.clustering_method,
+                "metadata": dict(community.metadata or {}),
+            },
+            "prompt_token_event": dict(token_event or {}),
+            "members": [_member_debug_metadata(item) for item in members],
+        }
 
     def _build_prompt(self, community: ExperienceCommunity, members: Sequence[ExperienceItem], analyst_mode: str) -> str:
         member_payloads = []
@@ -734,6 +776,26 @@ def _enforce_dynamic_patch_cardinality(
 def _is_diagnostic_community(community: ExperienceCommunity) -> bool:
     metadata = dict(community.metadata or {})
     return bool(metadata.get("llm_summary_skipped") or metadata.get("oversize_singleton"))
+
+
+def _member_debug_metadata(item: ExperienceItem) -> dict[str, Any]:
+    metadata = dict(item.metadata or {})
+    record = metadata.get("record") if isinstance(metadata.get("record"), dict) else {}
+    return {
+        "item_id": item.item_id,
+        "level": item.level,
+        "kind": item.kind,
+        "support_mass": item.support_mass,
+        "success": metadata.get("success", record.get("success")),
+        "task_id": metadata.get("task_id", record.get("task_id")),
+        "trajectory_id": metadata.get("trajectory_id", record.get("trajectory_id")),
+        "instruction_type": metadata.get("instruction_type", record.get("instruction_type")),
+        "source_community_id": metadata.get("source_community_id"),
+        "name": metadata.get("name"),
+        "confidence": metadata.get("confidence"),
+        "analysis_token_count": metadata.get("analysis_token_count"),
+    }
+
 
 def _normalize_placement(value: dict[str, Any], *, name: str) -> dict[str, Any]:
     target = str(value.get("target", "")).strip().lower()
