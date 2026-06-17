@@ -10,10 +10,16 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
+import tempfile
 from collections import defaultdict
+from pathlib import Path
 
 from tqdm import tqdm
 
@@ -36,7 +42,118 @@ def compare_workbooks(gt_path, output_path, instruction_type, answer_position):
     return local_compare_workbooks(gt_path, output_path, answer_position)
 
 
-def evaluate(data_path, output_dir, start_idx=0, end_idx=None, verbose=False):
+def _soffice_executable() -> str:
+    soffice = shutil.which("soffice")
+    if not soffice:
+        raise RuntimeError("LibreOffice executable `soffice` not found on PATH")
+    return soffice
+
+
+def _safe_instance_dir_name(instance_id: str) -> str:
+    raw = str(instance_id)
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("._-")
+    if not safe:
+        safe = "instance"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
+    return f"{safe[:80]}_{digest}"
+
+
+def _ensure_within(parent: Path, child: Path) -> None:
+    try:
+        child.relative_to(parent)
+    except ValueError as exc:
+        raise RuntimeError(f"path escapes recalc audit root: {child}") from exc
+
+
+def _preflight_libreoffice(timeout_seconds: int = 30) -> str:
+    soffice = _soffice_executable()
+    try:
+        proc = subprocess.run(
+            [soffice, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"LibreOffice preflight timed out after {timeout_seconds}s") from exc
+    if proc.returncode != 0:
+        raise RuntimeError(f"LibreOffice preflight failed with exit {proc.returncode}: {proc.stdout.strip()}")
+    return soffice
+
+
+def _recalculate_workbook(
+    input_path: str,
+    recalc_dir: str,
+    instance_id: str,
+    *,
+    soffice: str | None = None,
+    timeout_seconds: int = 180,
+) -> str:
+    """Recalculate a workbook via LibreOffice and return the copied output path."""
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(input_path)
+
+    soffice = soffice or _soffice_executable()
+    input_file = Path(input_path).resolve()
+    recalc_root = Path(recalc_dir)
+    recalc_root.mkdir(parents=True, exist_ok=True)
+    recalc_root = recalc_root.resolve()
+    try:
+        input_file.relative_to(recalc_root)
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError(
+            f"recalc_dir must not contain source workbook; recalc_dir={recalc_root}, source={input_file}"
+        )
+
+    instance_root = recalc_root / _safe_instance_dir_name(instance_id)
+    instance_root.mkdir(parents=True, exist_ok=True)
+    if instance_root.is_symlink():
+        raise RuntimeError(f"refusing symlinked recalc instance directory: {instance_root}")
+    instance_root = instance_root.resolve()
+    _ensure_within(recalc_root, instance_root)
+
+    out_dir = Path(tempfile.mkdtemp(prefix="recalc_", dir=str(instance_root))).resolve()
+    _ensure_within(recalc_root, out_dir)
+    output_file = out_dir / input_file.name
+
+    with tempfile.TemporaryDirectory(prefix="dynamix_recalc_") as tmp:
+        profile = Path(tmp) / "profile"
+        cmd = [
+            soffice,
+            f"-env:UserInstallation=file://{profile}",
+            "--headless",
+            "--invisible",
+            "--norestore",
+            "--nodefault",
+            "--nolockcheck",
+            "--nofirststartwizard",
+            "--convert-to",
+            "xlsx",
+            "--outdir",
+            str(out_dir),
+            str(input_file),
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"LibreOffice recalc timed out after {timeout_seconds}s for {input_file}") from exc
+    if proc.returncode != 0:
+        raise RuntimeError(f"LibreOffice recalc failed with exit {proc.returncode}: {proc.stdout.strip()}")
+    if not output_file.exists():
+        raise RuntimeError(f"LibreOffice did not produce recalculated workbook: {output_file}; output={proc.stdout.strip()}")
+    return str(output_file)
+
+
+def evaluate(data_path, output_dir, start_idx=0, end_idx=None, verbose=False, recalc_dir=None):
     """
     Evaluate outputs against ground truth using official SpreadsheetBench logic.
 
@@ -49,12 +166,17 @@ def evaluate(data_path, output_dir, start_idx=0, end_idx=None, verbose=False):
         end_idx = len(dataset)
     dataset = dataset[start_idx:end_idx]
 
-    print(f"Evaluating {len(dataset)} instances using official SpreadsheetBench evaluation...")
+    if recalc_dir is None:
+        recalc_dir = os.path.join(output_dir, "eval_artifacts", "libreoffice_recalculated_outputs")
+    soffice = _preflight_libreoffice()
+    print(f"Evaluating {len(dataset)} instances using official SpreadsheetBench evaluation with LibreOffice recalc...")
+    print(f"LibreOffice executable: {soffice}")
 
     results = []
     total_test_cases = 0
     passed_test_cases = 0
     fully_correct = 0
+    raw_passed_test_cases = 0
 
     # Track by instruction type (like official eval)
     type_results = defaultdict(lambda: {"soft": [], "hard": []})
@@ -134,18 +256,44 @@ def evaluate(data_path, output_dir, start_idx=0, end_idx=None, verbose=False):
 
             total_test_cases += 1
 
-            # Use official SpreadsheetBench comparison function
+            raw_result = False
+            raw_msg = ""
             try:
-                result, msg = compare_workbooks(
+                raw_result, raw_msg = compare_workbooks(
                     gt_path, output_path, instruction_type, answer_position
                 )
             except Exception as e:
+                raw_msg = str(e)
+
+            if raw_result:
+                raw_passed_test_cases += 1
+
+            recalculated_output_path = ""
+            recalc_error = ""
+            try:
+                recalculated_output_path = _recalculate_workbook(output_path, recalc_dir, instance_id, soffice=soffice)
+                result, msg = compare_workbooks(
+                    gt_path, recalculated_output_path, instruction_type, answer_position
+                )
+            except FileNotFoundError as e:
                 result = False
-                msg = str(e)
+                recalc_error = f"Output file not found for LibreOffice recalc: {e}"
+                msg = raw_msg or recalc_error
+            except Exception as e:
+                result = False
+                recalc_error = f"LibreOffice recalc/eval failed: {e}"
+                msg = recalc_error
 
             test_case_results.append({
                 "gt_file": gt_file,
                 "output_file": output_file,
+                "output_path": output_path,
+                "recalculated_output_path": recalculated_output_path,
+                "evaluation_mode": "libreoffice_recalc",
+                "raw_evaluation_mode": "audit_only_no_recalc",
+                "raw_passed": raw_result,
+                "raw_message": raw_msg,
+                "recalc_error": recalc_error,
                 "passed": result,
                 "message": msg,
             })
@@ -204,9 +352,14 @@ def evaluate(data_path, output_dir, start_idx=0, end_idx=None, verbose=False):
         "total_test_cases": total_test_cases,
         "passed_test_cases": passed_test_cases,
         "test_case_accuracy": passed_test_cases / total_test_cases if total_test_cases > 0 else 0,
+        "raw_passed_test_cases": raw_passed_test_cases,
+        "raw_test_case_accuracy": raw_passed_test_cases / total_test_cases if total_test_cases > 0 else 0,
+        "raw_evaluation_mode": "audit_only_no_recalc",
         "avg_soft_score": avg_soft_score,
         "avg_hard_score": avg_hard_score,
         "by_instruction_type": type_metrics,
+        "evaluation_mode": "libreoffice_recalc",
+        "recalculated_output_dir": recalc_dir,
     }
 
     return {
@@ -236,6 +389,12 @@ def main():
         type=str,
         default=None,
         help="Path to save evaluation results JSON (default: output_dir/eval_official_results.json)",
+    )
+    parser.add_argument(
+        "--recalc_dir",
+        type=str,
+        default=None,
+        help="Directory for LibreOffice-recalculated workbook audit copies",
     )
     parser.add_argument(
         "--start_idx",
@@ -274,6 +433,7 @@ def main():
         start_idx=args.start_idx,
         end_idx=args.end_idx,
         verbose=args.verbose,
+        recalc_dir=args.recalc_dir,
     )
 
     # Print summary
@@ -298,8 +458,12 @@ def _print_summary(summary: dict, label: str = "") -> None:
     print(f"Total Test Cases:       {summary['total_test_cases']}")
     print(f"Passed Test Cases:      {summary['passed_test_cases']}")
     print(f"Test Case Accuracy:     {summary['test_case_accuracy']*100:.1f}%")
+    print(f"Raw Audit Test Accuracy: {summary.get('raw_test_case_accuracy', 0)*100:.1f}% (audit-only, not official)")
     print(f"Avg Soft Score:         {summary['avg_soft_score']*100:.1f}%")
     print(f"Avg Hard Score:         {summary['avg_hard_score']*100:.1f}%")
+    print(f"Evaluation Mode:        {summary.get('evaluation_mode', 'unknown')}")
+    if summary.get("recalculated_output_dir"):
+        print(f"Recalculated Outputs:   {summary['recalculated_output_dir']}")
 
     if summary["by_instruction_type"]:
         print("-" * 60)
@@ -335,6 +499,7 @@ def _run_repeat_evaluation(args) -> None:
             start_idx=args.start_idx,
             end_idx=args.end_idx,
             verbose=args.verbose,
+            recalc_dir=os.path.join(args.recalc_dir, seed_name) if args.recalc_dir else None,
         )
         all_seed_results[seed_name] = result
         per_seed_file = os.path.join(seed_dir.path, "eval_official_results.json")
