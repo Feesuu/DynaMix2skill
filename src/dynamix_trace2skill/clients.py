@@ -4,6 +4,8 @@ import asyncio
 import hashlib
 import json
 import sqlite3
+import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,7 @@ class GenerationConfig:
     thinking_mode: bool | None = True
     extra_body: dict[str, Any] = field(default_factory=dict)
     debug_dir: str | None = None
+    retry_wait_seconds: tuple[float, ...] = (2.0, 5.0, 15.0)
 
 
 @dataclass
@@ -99,7 +102,33 @@ class GenerationClient:
         if body:
             kwargs["extra_body"] = body
         client = OpenAI(api_key=self.config.api_key, base_url=self.config.base_url, timeout=timeout or self.config.timeout_seconds)
-        response = client.chat.completions.create(**kwargs)
+        response = None
+        wait_schedule = (0.0, *tuple(float(x) for x in self.config.retry_wait_seconds))
+        for attempt, wait_seconds in enumerate(wait_schedule):
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            try:
+                response = client.chat.completions.create(**kwargs)
+                break
+            except Exception as exc:
+                retryable = _is_retryable_openai_error(exc)
+                if attempt >= len(wait_schedule) - 1 or not retryable:
+                    raise
+                next_wait = wait_schedule[attempt + 1]
+                status = _openai_status_code(exc)
+                print(
+                    "[dynamix-generation-retry] "
+                    f"attempt={attempt + 1}/{len(wait_schedule)} "
+                    f"next_wait_seconds={next_wait:g} "
+                    f"error={type(exc).__name__} "
+                    f"status={status if status is not None else 'unknown'} "
+                    f"base_url={self.config.base_url} "
+                    f"model={self.config.model}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        if response is None:
+            raise RuntimeError("generation request failed without an exception")
         content = response.choices[0].message.content or ""
         self._write_debug(messages, content)
         return content
@@ -309,6 +338,33 @@ def re_sub_fence(text: str) -> str:
     if lines and lines[-1].startswith("```"):
         lines = lines[:-1]
     return "\n".join(lines).strip()
+
+
+def _is_retryable_openai_error(exc: Exception) -> bool:
+    status_code = _openai_status_code(exc)
+    if status_code is not None:
+        try:
+            code = int(status_code)
+        except (TypeError, ValueError):
+            return True
+        if code == 400:
+            return False
+        return code == 408 or code == 409 or code == 429 or code >= 500
+    return True
+
+
+def _openai_status_code(exc: Exception) -> Any:
+    status_code = getattr(exc, "status_code", None)
+    if status_code is not None:
+        return status_code
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code is not None:
+        return status_code
+    status_code = getattr(exc, "status", None)
+    if status_code is not None:
+        return status_code
+    return getattr(exc, "code", None)
 
 
 def _deep_merge(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
