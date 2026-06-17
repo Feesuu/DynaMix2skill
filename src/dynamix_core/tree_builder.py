@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable, Iterable, Sequence
 
 import numpy as np
@@ -61,6 +61,7 @@ class LayerClusteringResult:
     communities: list[ExperienceCommunity]
     member_item_ids_by_community: dict[str, list[str]]
     stop_reason: str
+    excluded_input_item_ids: list[str] = field(default_factory=list)
     projection_dim: int = 0
     explained_variance_ratio: float = 0.0
     pca_spectrum: list[float] = field(default_factory=list)
@@ -147,6 +148,8 @@ class ProjectedGmmTreeBuilder:
             "bic_margin": clustering.bic_margin,
             "projection_dim": clustering.projection_dim,
             "routing_model": clustering.routing_model.to_dict() if clustering.routing_model else None,
+            "budget_refinement": clustering.summary_budget,
+            "excluded_input_item_ids": list(clustering.excluded_input_item_ids),
             "summary_budget_contract": {
                 "token_budget_source": "config.summary_budget",
                 "note": "Upstream items should provide token-count metadata if over-budget splitting is required before summary_fn.",
@@ -158,6 +161,7 @@ class ProjectedGmmTreeBuilder:
             generated_items=generated,
             stop_reason="split",
             metadata=metadata,
+            excluded_input_item_ids=clustering.excluded_input_item_ids,
         )
         return LayerBuildResult(
             clustering=clustering,
@@ -183,24 +187,54 @@ class ProjectedGmmTreeBuilder:
         token_budget = self.config.summary_budget.effective_token_budget
         total_prompt_tokens = sum(token_counts.values())
 
-        if n_items < self.config.gmm_bic.min_split_size and not (
+        budget_refinement_enabled = (
             self.config.budget_refinement.enabled
             and level == self.config.budget_refinement.apply_to_level
             and total_prompt_tokens > token_budget
-        ):
+        )
+
+        if n_items < self.config.gmm_bic.min_split_size and not budget_refinement_enabled:
             return _stopped(level, input_ids, "too_small")
 
-        if (
-            self.config.budget_refinement.enabled
-            and level == self.config.budget_refinement.apply_to_level
-            and total_prompt_tokens > token_budget
-        ):
-            return await self._cluster_budget_refined_flat_l0(
-                ordered,
+        if n_items < 2 and budget_refinement_enabled:
+            success_count, failure_count, outcome_mode = _outcome_counts(ordered)
+            coarse = ExperienceCommunity(
+                community_id=f"L{level}_C0",
                 level=level,
+                member_weights={item_id: 1.0 for item_id in input_ids},
+                posterior_member_weights={item_id: 1.0 for item_id in input_ids},
+                clustering_method="weighted_gmm_bic_single_refined",
+                support_mass=_support_mass(items_by_id, {item_id: 1.0 for item_id in input_ids}),
+                outcome_mode=outcome_mode,
+                success_count=success_count,
+                failure_count=failure_count,
+                metadata={"component_index": 0, "budget_refinement_coarse_root": True, "too_few_items_for_pca": True},
+            )
+            refined = await self._refine_overbudget_coarse_communities(
+                [coarse],
+                {coarse.community_id: input_ids},
+                level=level,
+                input_ids=input_ids,
                 items_by_id=items_by_id,
                 token_counts=token_counts,
                 token_budget=token_budget,
+            )
+            return LayerClusteringResult(
+                level=level,
+                input_item_ids=input_ids,
+                communities=list(refined["communities"]),
+                member_item_ids_by_community=dict(refined["member_item_ids_by_community"]),
+                stop_reason="" if refined["communities"] else "budget_refinement_no_active_communities",
+                excluded_input_item_ids=list(refined["excluded_input_item_ids"]),
+                chosen_k=1,
+                tested_k=[1],
+                summary_budget={
+                    "effective_token_budget": int(token_budget),
+                    "bic_selected_k": 1,
+                    "coarse_selected_k": 1,
+                    "budget_enforced": bool(refined["summary_budget"].get("refinement_routing_tree") or refined["excluded_input_item_ids"]),
+                    **refined["summary_budget"],
+                },
             )
 
         embeddings = normalize_rows(np.asarray([item.embedding for item in ordered], dtype=float))
@@ -217,16 +251,53 @@ class ProjectedGmmTreeBuilder:
             max_concurrent_restarts=self.config.gmm_bic.max_concurrent_restarts,
         )
         if selection.chosen.k <= 1:
+            if budget_refinement_enabled:
+                coarse = ExperienceCommunity(
+                    community_id=f"L{level}_C0",
+                    level=level,
+                    member_weights={item_id: 1.0 for item_id in input_ids},
+                    posterior_member_weights={item_id: 1.0 for item_id in input_ids},
+                    clustering_method="weighted_gmm_bic_single_refined",
+                    support_mass=_support_mass(items_by_id, {item_id: 1.0 for item_id in input_ids}),
+                    outcome_mode=_outcome_counts(ordered)[2],
+                    success_count=_outcome_counts(ordered)[0],
+                    failure_count=_outcome_counts(ordered)[1],
+                    metadata={
+                        "component_index": 0,
+                        "chosen_k": int(selection.chosen.k),
+                        "bic": float(selection.chosen.bic),
+                        "log_likelihood": float(selection.chosen.log_likelihood),
+                        "budget_refinement_coarse_root": True,
+                    },
+                )
+                refined = await self._refine_overbudget_coarse_communities(
+                    [coarse],
+                    {coarse.community_id: input_ids},
+                    level=level,
+                    input_ids=input_ids,
+                    items_by_id=items_by_id,
+                    token_counts=token_counts,
+                    token_budget=token_budget,
+                )
+                return _clustering_from_refinement(
+                    level=level,
+                    input_ids=input_ids,
+                    projection=projection,
+                    selection=selection,
+                    fit=selection.chosen,
+                    routing_model=None,
+                    refined=refined,
+                )
             return _stopped_from_selection(level, input_ids, "bic_selected_one", projection, selection)
 
-        fit, parts, budget_info = _select_budget_compatible_fit(
-            selection,
+        fit = selection.chosen
+        parts = _candidate_layer_parts(
+            fit,
             level=level,
             input_ids=input_ids,
             items_by_id=items_by_id,
             token_counts=token_counts,
             soft_config=self.config.soft_membership,
-            token_budget=token_budget,
         )
         if parts is None:
             return _stopped_from_selection(level, input_ids, "membership_collapsed", projection, selection)
@@ -249,12 +320,22 @@ class ProjectedGmmTreeBuilder:
             total_effective_count=float(sum(fit.component_masses[index] for index in active_components)),
             soft_assignment=self.config.soft_membership.__dict__,
         )
+        refined = await self._refine_overbudget_coarse_communities(
+            communities,
+            member_ids_by_community,
+            level=level,
+            input_ids=input_ids,
+            items_by_id=items_by_id,
+            token_counts=token_counts,
+            token_budget=token_budget,
+        )
         return LayerClusteringResult(
             level=level,
             input_item_ids=input_ids,
-            communities=communities,
-            member_item_ids_by_community=member_ids_by_community,
-            stop_reason="",
+            communities=refined["communities"],
+            member_item_ids_by_community=refined["member_item_ids_by_community"],
+            stop_reason="" if refined["communities"] else "budget_refinement_no_active_communities",
+            excluded_input_item_ids=refined["excluded_input_item_ids"],
             projection_dim=int(projection.dim),
             explained_variance_ratio=float(projection.explained_variance_ratio),
             pca_spectrum=list(projection.spectrum),
@@ -264,41 +345,146 @@ class ProjectedGmmTreeBuilder:
             log_likelihood_by_k={str(candidate.k): float(candidate.log_likelihood) for candidate in selection.candidates},
             bic_margin=float(selection.bic_margin),
             routing_model=routing_model,
-            summary_budget=budget_info,
+            summary_budget={
+                "effective_token_budget": int(token_budget),
+                "bic_selected_k": int(selection.chosen.k),
+                "coarse_selected_k": int(fit.k),
+                "budget_enforced": bool(refined["summary_budget"].get("refinement_routing_tree") or refined["excluded_input_item_ids"]),
+                **refined["summary_budget"],
+            },
         )
 
-    async def _cluster_budget_refined_flat_l0(
+    async def _refine_overbudget_coarse_communities(
         self,
-        ordered: list[ExperienceItem],
+        communities: list[ExperienceCommunity],
+        member_ids_by_community: dict[str, list[str]],
+        *,
+        level: int,
+        input_ids: list[str],
+        items_by_id: dict[str, ExperienceItem],
+        token_counts: dict[str, int],
+        token_budget: int,
+    ) -> dict[str, Any]:
+        if not (self.config.budget_refinement.enabled and level == self.config.budget_refinement.apply_to_level):
+            return {
+                "communities": communities,
+                "member_item_ids_by_community": member_ids_by_community,
+                "excluded_input_item_ids": [],
+                "summary_budget": {
+                    "budget_refinement_mode": "disabled",
+                    "excluded_oversize_singletons": [],
+                    "refinement_routing_tree": None,
+                },
+            }
+
+        final_communities: list[ExperienceCommunity] = []
+        final_members: dict[str, list[str]] = {}
+        excluded: dict[str, dict[str, Any]] = {}
+        refined_roots: dict[str, Any] = {}
+        refined_nodes: dict[str, Any] = {}
+        split_events: list[dict[str, Any]] = []
+
+        for community in communities:
+            member_ids = list(member_ids_by_community.get(community.community_id, []))
+            prompt_tokens = _selected_prompt_token_cost(token_counts, member_ids)
+            if prompt_tokens <= token_budget:
+                final_communities.append(community)
+                final_members[community.community_id] = member_ids
+                continue
+
+            result = await self._refine_one_coarse_community(
+                community,
+                member_ids,
+                level=level,
+                items_by_id=items_by_id,
+                token_counts=token_counts,
+                token_budget=token_budget,
+            )
+            final_communities.extend(result["communities"])
+            final_members.update(result["member_item_ids_by_community"])
+            for item_id, payload in result["excluded"].items():
+                excluded[item_id] = payload
+            if result["root_node_id"]:
+                refined_roots[community.community_id] = result["root_node_id"]
+            refined_nodes.update(result["routing_nodes"])
+            split_events.extend(result["split_events"])
+
+        excluded_ids = set(excluded)
+        if excluded_ids:
+            cleaned_communities: list[ExperienceCommunity] = []
+            cleaned_members: dict[str, list[str]] = {}
+            for community in final_communities:
+                member_weights = {iid: weight for iid, weight in community.member_weights.items() if iid not in excluded_ids}
+                posterior_weights = {iid: weight for iid, weight in community.posterior_member_weights.items() if iid not in excluded_ids}
+                if not member_weights:
+                    continue
+                member_ids = [iid for iid in final_members.get(community.community_id, []) if iid in member_weights]
+                cleaned_communities.append(replace(
+                    community,
+                    member_weights=member_weights,
+                    posterior_member_weights=posterior_weights or dict(member_weights),
+                    support_mass=_support_mass(items_by_id, member_weights),
+                ))
+                cleaned_members[community.community_id] = member_ids
+            final_communities = cleaned_communities
+            final_members = cleaned_members
+
+        if not final_communities:
+            return {
+                "communities": [],
+                "member_item_ids_by_community": {},
+                "excluded_input_item_ids": sorted(excluded),
+                "summary_budget": {
+                    "budget_refinement_mode": "coarse_then_refine",
+                    "effective_token_budget": int(token_budget),
+                    "excluded_oversize_singletons": [excluded[item_id] for item_id in sorted(excluded)],
+                    "refinement_routing_tree": {
+                        "kind": "coarse_refinement_routing_tree",
+                        "coarse_roots": refined_roots,
+                        "nodes": refined_nodes,
+                    } if refined_nodes else None,
+                    "split_events": split_events,
+                },
+            }
+
+        return {
+            "communities": final_communities,
+            "member_item_ids_by_community": final_members,
+            "excluded_input_item_ids": sorted(excluded),
+            "summary_budget": {
+                "budget_refinement_mode": "coarse_then_refine",
+                "effective_token_budget": int(token_budget),
+                "excluded_oversize_singletons": [excluded[item_id] for item_id in sorted(excluded)],
+                "refinement_routing_tree": {
+                    "kind": "coarse_refinement_routing_tree",
+                    "coarse_roots": refined_roots,
+                    "nodes": refined_nodes,
+                } if refined_nodes else None,
+                "split_events": split_events,
+            },
+        }
+
+    async def _refine_one_coarse_community(
+        self,
+        community: ExperienceCommunity,
+        member_ids: list[str],
         *,
         level: int,
         items_by_id: dict[str, ExperienceItem],
         token_counts: dict[str, int],
         token_budget: int,
-    ) -> LayerClusteringResult:
-        """Refine over-budget raw communities into flat, analyst-feasible L0 leaves.
-
-        Internal refinement nodes are not committed as semantic hierarchy nodes.
-        They are only a budget-feasibility work queue.  The returned communities
-        are all at ``level`` and are the only communities that will be passed to
-        the cluster analyst.
-        """
-        input_ids = [item.item_id for item in ordered]
-        queue: list[dict[str, Any]] = [
-            {
-                "node_id": f"L{level}_R0",
-                "item_ids": input_ids,
-                "path_weights": {item_id: 1.0 for item_id in input_ids},
-                "depth": 0,
-            }
-        ]
+    ) -> dict[str, Any]:
+        root_node_id = f"{community.community_id}_R0"
+        queue: list[dict[str, Any]] = [{
+            "node_id": root_node_id,
+            "item_ids": member_ids,
+            "path_weights": {iid: float(community.member_weights.get(iid, 1.0)) for iid in member_ids},
+            "depth": 0,
+        }]
         final_specs: list[dict[str, Any]] = []
-        skipped: list[dict[str, Any]] = []
-        skipped_oversize_item_ids: set[str] = set()
+        excluded: dict[str, dict[str, Any]] = {}
+        routing_nodes: dict[str, Any] = {}
         split_events: list[dict[str, Any]] = []
-        tested_k: set[int] = set()
-        bic_by_k: dict[str, float] = {}
-        log_likelihood_by_k: dict[str, float] = {}
         node_serial = 1
 
         while queue:
@@ -306,47 +492,34 @@ class ProjectedGmmTreeBuilder:
             node_item_ids = list(node["item_ids"])
             node_token_cost = _selected_prompt_token_cost(token_counts, node_item_ids)
             if node_token_cost <= token_budget:
-                final_specs.append(
-                    {
-                        "source_node_id": node["node_id"],
-                        "item_ids": node_item_ids,
-                        "member_weights": dict(node["path_weights"]),
-                        "token_cost": int(node_token_cost),
-                        "refinement_depth": int(node["depth"]),
-                    }
-                )
+                final_specs.append({
+                    "source_node_id": node["node_id"],
+                    "item_ids": node_item_ids,
+                    "member_weights": dict(node["path_weights"]),
+                    "token_cost": int(node_token_cost),
+                    "refinement_depth": int(node["depth"]),
+                })
                 continue
 
             if len(node_item_ids) <= 1:
-                llm_summary_skipped = bool(self.config.budget_refinement.skip_oversize_singleton)
                 item_id = node_item_ids[0] if node_item_ids else ""
-                if item_id and item_id in skipped_oversize_item_ids:
-                    continue
                 if item_id:
-                    skipped_oversize_item_ids.add(item_id)
-                skipped.append(
-                    {
+                    excluded[item_id] = {
+                        "item_id": item_id,
+                        "source_community_id": community.community_id,
                         "node_id": node["node_id"],
-                        "item_ids": node_item_ids,
                         "token_cost": int(node_token_cost),
                         "budget": int(token_budget),
-                        "stop_reason": "oversize_singleton",
-                        "llm_summary_skipped": llm_summary_skipped,
+                        "reason": "oversize_singleton",
                     }
-                )
-                # Keep a diagnostic community so layer coverage remains explicit,
-                # but do not generate a fallback ExperienceCard for it.
-                final_specs.append(
-                    {
-                        "source_node_id": node["node_id"],
-                        "item_ids": node_item_ids,
-                        "member_weights": dict(node["path_weights"]),
-                        "token_cost": int(node_token_cost),
-                        "refinement_depth": int(node["depth"]),
-                        "oversize_singleton": True,
-                        "llm_summary_skipped": llm_summary_skipped,
-                    }
-                )
+                routing_nodes[node["node_id"]] = {
+                    "node_id": node["node_id"],
+                    "kind": "excluded_oversize_singleton",
+                    "item_ids": node_item_ids,
+                    "excluded_item_id": item_id,
+                    "token_cost": int(node_token_cost),
+                    "budget": int(token_budget),
+                }
                 continue
 
             local_items = [items_by_id[item_id] for item_id in node_item_ids]
@@ -359,115 +532,81 @@ class ProjectedGmmTreeBuilder:
                 token_budget=token_budget,
                 serial_start=node_serial,
             )
-            tested_k.update(split.get("tested_k", []))
-            bic_by_k.update(split.get("bic_by_k", {}))
-            log_likelihood_by_k.update(split.get("log_likelihood_by_k", {}))
-
             if not split.get("accepted"):
-                split = await self._deterministic_budget_split(
-                    local_items,
-                    node=node,
-                    level=level,
-                    token_counts=token_counts,
-                    parent_token_cost=node_token_cost,
-                    token_budget=token_budget,
-                    serial_start=node_serial,
-                )
-
-            if not split.get("accepted"):
-                skipped.append(
-                    {
+                for item_id in node_item_ids:
+                    excluded[item_id] = {
+                        "item_id": item_id,
+                        "source_community_id": community.community_id,
                         "node_id": node["node_id"],
-                        "item_ids": node_item_ids,
                         "token_cost": int(node_token_cost),
                         "budget": int(token_budget),
-                        "stop_reason": "oversize_unsplittable",
-                        "last_rejection": split,
+                        "reason": "oversize_unsplittable",
                     }
-                )
+                routing_nodes[node["node_id"]] = {
+                    "node_id": node["node_id"],
+                    "kind": "excluded_unsplittable",
+                    "item_ids": node_item_ids,
+                    "token_cost": int(node_token_cost),
+                    "budget": int(token_budget),
+                    "last_rejection": split,
+                }
                 continue
 
             children = list(split["children"])
-            split_events.append({key: value for key, value in split.items() if key != "children"})
+            routing_node = dict(split["routing_node"])
+            routing_node["source_community_id"] = community.community_id
+            routing_nodes[node["node_id"]] = routing_node
+            split_events.append({key: value for key, value in split.items() if key not in {"children", "routing_node"}})
             node_serial += len(children)
             queue.extend(children)
 
-        if not final_specs:
-            return LayerClusteringResult(
-                level=level,
-                input_item_ids=input_ids,
-                communities=[],
-                member_item_ids_by_community={},
-                stop_reason="budget_refinement_no_feasible_communities",
-                summary_budget={
-                    "mode": "flat_l0_budget_refinement",
-                    "effective_token_budget": int(token_budget),
-                    "input_prompt_tokens": int(_selected_prompt_token_cost(token_counts, input_ids)),
-                    "skipped": skipped,
-                    "split_events": split_events,
-                },
-            )
-
-        communities: list[ExperienceCommunity] = []
-        member_ids_by_community: dict[str, list[str]] = {}
+        final_communities: list[ExperienceCommunity] = []
+        final_members: dict[str, list[str]] = {}
         for index, spec in enumerate(final_specs):
-            community_id = f"L{level}_C{index:03d}"
-            member_ids = [item_id for item_id in input_ids if item_id in set(spec["item_ids"])]
-            member_weights = {item_id: float(spec["member_weights"].get(item_id, 1.0)) for item_id in member_ids}
-            success_count, failure_count, outcome_mode = _outcome_counts([items_by_id[item_id] for item_id in member_ids])
-            is_oversize_singleton = bool(spec.get("oversize_singleton"))
-            llm_summary_skipped = bool(spec.get("llm_summary_skipped"))
-            communities.append(
-                ExperienceCommunity(
-                    community_id=community_id,
-                    level=level,
-                    member_weights=member_weights,
-                    posterior_member_weights=dict(member_weights),
-                    clustering_method="budget_refined_weighted_gmm_bic",
-                    support_mass=_support_mass(items_by_id, member_weights),
-                    outcome_mode=outcome_mode,
-                    success_count=success_count,
-                    failure_count=failure_count,
-                    metadata={
-                        "source_refinement_node_id": spec["source_node_id"],
-                        "refinement_depth": int(spec["refinement_depth"]),
-                        "prompt_token_cost": int(spec["token_cost"]),
-                        "budget": int(token_budget),
-                        "split_reason": "budget_refinement_oversize_singleton" if is_oversize_singleton else "budget_refinement_leaf",
-                        "oversize_singleton": is_oversize_singleton,
-                        "llm_summary_skipped": llm_summary_skipped,
-                    },
-                )
-            )
-            member_ids_by_community[community_id] = member_ids
+            community_id = f"{community.community_id}_R{index:03d}"
+            member_ids_for_leaf = [item_id for item_id in member_ids if item_id in set(spec["item_ids"])]
+            member_weights = {item_id: float(spec["member_weights"].get(item_id, 1.0)) for item_id in member_ids_for_leaf if item_id not in excluded}
+            if not member_weights:
+                continue
+            success_count, failure_count, outcome_mode = _outcome_counts([items_by_id[item_id] for item_id in member_weights])
+            routing_nodes[spec["source_node_id"]] = {
+                "node_id": spec["source_node_id"],
+                "kind": "leaf",
+                "community_id": community_id,
+                "source_community_id": community.community_id,
+                "token_cost": int(spec["token_cost"]),
+                "refinement_depth": int(spec["refinement_depth"]),
+            }
+            final_communities.append(ExperienceCommunity(
+                community_id=community_id,
+                level=level,
+                member_weights=member_weights,
+                posterior_member_weights=dict(member_weights),
+                clustering_method="budget_refined_weighted_gmm_bic_leaf",
+                support_mass=_support_mass(items_by_id, member_weights),
+                outcome_mode=outcome_mode,
+                success_count=success_count,
+                failure_count=failure_count,
+                metadata={
+                    **dict(community.metadata or {}),
+                    "refined_from_community_id": community.community_id,
+                    "source_refinement_node_id": spec["source_node_id"],
+                    "refinement_depth": int(spec["refinement_depth"]),
+                    "prompt_token_cost": int(spec["token_cost"]),
+                    "budget": int(token_budget),
+                    "split_reason": "budget_refinement_leaf",
+                },
+            ))
+            final_members[community_id] = list(member_weights)
 
-        return LayerClusteringResult(
-            level=level,
-            input_item_ids=input_ids,
-            communities=communities,
-            member_item_ids_by_community=member_ids_by_community,
-            stop_reason="",
-            chosen_k=len(communities),
-            tested_k=sorted(tested_k),
-            bic_by_k=bic_by_k,
-            log_likelihood_by_k=log_likelihood_by_k,
-            bic_margin=0.0,
-            routing_model=None,
-            summary_budget={
-                "mode": "flat_l0_budget_refinement",
-                "effective_token_budget": int(token_budget),
-                "input_prompt_tokens": int(_selected_prompt_token_cost(token_counts, input_ids)),
-                "final_community_count": len(communities),
-                "skipped_count": len(skipped),
-                "oversize_singleton_skipped_count": sum(1 for spec in final_specs if spec.get("llm_summary_skipped")),
-                "oversize_singleton_fallback_count": 0,
-                "skipped": skipped,
-                "split_events": split_events,
-                "soft_assignment": self.config.soft_membership.__dict__,
-                "budget_refinement": self.config.budget_refinement.__dict__,
-                "note": "Internal over-budget raw communities were refined and flattened back to this layer; oversized singleton leaves are retained as diagnostic communities only and do not generate ExperienceCards.",
-            },
-        )
+        return {
+            "root_node_id": root_node_id if routing_nodes else "",
+            "communities": final_communities,
+            "member_item_ids_by_community": final_members,
+            "excluded": excluded,
+            "routing_nodes": routing_nodes,
+            "split_events": split_events,
+        }
 
     async def _budget_refinement_gmm_split(
         self,
@@ -558,17 +697,24 @@ class ProjectedGmmTreeBuilder:
         selected = min(progressive, key=lambda cand: (cand["fit"].bic, cand["fit"].k))
         fit = selected["fit"]
         children: list[dict[str, Any]] = []
+        child_node_ids: list[str] = []
+        active_components: list[int] = []
         for child_index, (child_id, member_weights) in enumerate(selected["child_member_weights"].items()):
             member_ids = [item_id for item_id in local_ids if item_id in member_weights]
+            child_node_id = f"{node['node_id']}_R{serial_start + child_index}"
+            component = int(child_id.rsplit("C", 1)[1])
+            child_node_ids.append(child_node_id)
+            active_components.append(component)
             children.append(
                 {
-                    "node_id": f"L{level}_R{serial_start + child_index}",
+                    "node_id": child_node_id,
                     "source_gmm_child_id": child_id,
                     "item_ids": member_ids,
                     "path_weights": dict(member_weights),
                     "depth": int(node["depth"]) + 1,
                 }
             )
+        safe_active = active_components or list(range(int(fit.k)))
         return {
             "accepted": True,
             "split_reason": "budget_forced_gmm_bic_progress",
@@ -585,73 +731,21 @@ class ProjectedGmmTreeBuilder:
             "tested_k": tested,
             "bic_by_k": bic_by_k,
             "log_likelihood_by_k": ll_by_k,
-            "children": children,
-        }
-
-    async def _deterministic_budget_split(
-        self,
-        local_items: list[ExperienceItem],
-        *,
-        node: dict[str, Any],
-        level: int,
-        token_counts: dict[str, int],
-        parent_token_cost: int,
-        token_budget: int,
-        serial_start: int,
-    ) -> dict[str, Any]:
-        if len(local_items) < 2:
-            return {"accepted": False, "reason": "too_few_items_for_deterministic_split"}
-        local_ids = [item.item_id for item in local_items]
-        embeddings = normalize_rows(np.asarray([item.embedding for item in local_items], dtype=float))
-        projection = await local_pca_project_async(embeddings, self.config.projection)
-        if projection.projected.shape[1] >= 1:
-            scores = projection.projected[:, 0]
-        else:
-            scores = np.zeros(len(local_items), dtype=float)
-        ordered_ids = [item_id for _, item_id in sorted(zip(scores.tolist(), local_ids), key=lambda pair: (pair[0], pair[1]))]
-        if len(ordered_ids) < 2:
-            return {"accepted": False, "reason": "deterministic_order_too_small"}
-        best_index = 1
-        best_max = float("inf")
-        total = _selected_prompt_token_cost(token_counts, ordered_ids)
-        running = 0
-        for index in range(1, len(ordered_ids)):
-            running += int(token_counts.get(ordered_ids[index - 1], 1))
-            left = running
-            right = total - running
-            largest = max(left, right)
-            if largest < best_max:
-                best_max = float(largest)
-                best_index = index
-        left_ids = ordered_ids[:best_index]
-        right_ids = ordered_ids[best_index:]
-        if not left_ids or not right_ids or max(_selected_prompt_token_cost(token_counts, left_ids), _selected_prompt_token_cost(token_counts, right_ids)) >= parent_token_cost:
-            return {"accepted": False, "reason": "deterministic_split_no_token_progress"}
-        path_weights = dict(node["path_weights"])
-        children = [
-            {
-                "node_id": f"L{level}_R{serial_start}",
-                "item_ids": left_ids,
-                "path_weights": {item_id: float(path_weights.get(item_id, 1.0)) for item_id in left_ids},
-                "depth": int(node["depth"]) + 1,
-            },
-            {
-                "node_id": f"L{level}_R{serial_start + 1}",
-                "item_ids": right_ids,
-                "path_weights": {item_id: float(path_weights.get(item_id, 1.0)) for item_id in right_ids},
-                "depth": int(node["depth"]) + 1,
-            },
-        ]
-        return {
-            "accepted": True,
-            "split_reason": "budget_forced_pca_token_balanced_binary",
-            "statistical_split": False,
-            "node_id": node["node_id"],
-            "parent_prompt_tokens": int(parent_token_cost),
-            "budget": int(token_budget),
-            "child_prompt_tokens": {
-                children[0]["node_id"]: int(_selected_prompt_token_cost(token_counts, left_ids)),
-                children[1]["node_id"]: int(_selected_prompt_token_cost(token_counts, right_ids)),
+            "routing_node": {
+                "node_id": node["node_id"],
+                "kind": "gmm_split",
+                "level": int(level),
+                "pca_mean": projection.mean.astype(float).tolist(),
+                "pca_components": projection.components.astype(float).tolist(),
+                "pi": _renormalized_pi(fit.pi, safe_active),
+                "means": fit.means[safe_active].astype(float).tolist(),
+                "variances": fit.variances[safe_active].astype(float).tolist(),
+                "covariance_type": self.config.gmm_bic.covariance_type,
+                "child_node_ids": child_node_ids,
+                "component_indices": [int(index) for index in safe_active],
+                "soft_assignment": self.config.soft_membership.__dict__,
+                "selected_k": int(fit.k),
+                "selected_bic": float(fit.bic),
             },
             "children": children,
         }
@@ -677,87 +771,6 @@ class ProjectedGmmTreeBuilder:
 
 
 ExperienceHierarchyTreeBuilder = ProjectedGmmTreeBuilder
-
-
-def _select_budget_compatible_fit(
-    selection: GmmBicSelection,
-    *,
-    level: int,
-    input_ids: list[str],
-    items_by_id: dict[str, ExperienceItem],
-    token_counts: dict[str, int],
-    soft_config: SoftMembershipConfig,
-    token_budget: int,
-) -> tuple[GmmCandidateFit, dict[str, Any] | None, dict[str, Any]]:
-    """Choose a candidate that is both BIC-valid and summary-budget valid.
-
-    The summary budget is enforced before calling ``summary_fn``.  If the BIC
-    optimum produces an over-budget community, we select the best higher-K
-    valid GMM candidate whose selected communities all fit the budget.  This is
-    a flat, routing-consistent split: the final committed communities still have
-    a single saved PCA/GMM routing model, so dynamic fixed-K routing remains
-    well-defined.  We never truncate member text to satisfy the budget.
-    """
-    token_budget = int(token_budget)
-    if token_budget < 1:
-        raise ValueError("summary token budget must be positive")
-
-    evaluated: list[tuple[GmmCandidateFit, dict[str, Any], dict[str, Any]]] = []
-    for candidate in selection.candidates:
-        if not candidate.valid or candidate.k <= 1:
-            continue
-        parts = _candidate_layer_parts(
-            candidate,
-            level=level,
-            input_ids=input_ids,
-            items_by_id=items_by_id,
-            token_counts=token_counts,
-            soft_config=soft_config,
-        )
-        if parts is None:
-            continue
-        token_masses = parts["community_token_masses"]
-        max_token_mass = max(token_masses.values()) if token_masses else 0.0
-        info = {
-            "effective_token_budget": token_budget,
-            "bic_selected_k": int(selection.chosen.k),
-            "candidate_k": int(candidate.k),
-            "max_community_token_mass": float(max_token_mass),
-            "community_token_masses": {cid: float(value) for cid, value in token_masses.items()},
-            "over_budget": bool(max_token_mass > token_budget),
-        }
-        evaluated.append((candidate, parts, info))
-
-    if not evaluated:
-        return selection.chosen, None, {
-            "effective_token_budget": token_budget,
-            "bic_selected_k": int(selection.chosen.k),
-            "budget_enforced": False,
-            "reason": "no_valid_nontrivial_candidate",
-        }
-
-    # Keep the BIC winner if it already satisfies the summary budget.
-    for candidate, parts, info in evaluated:
-        if candidate.k == selection.chosen.k and not info["over_budget"]:
-            info.update({"budget_enforced": True, "budget_override": False, "selected_k": int(candidate.k)})
-            return candidate, parts, info
-
-    # Otherwise split by choosing the best budget-valid candidate with K at
-    # least as large as the BIC optimum.  This prevents summary-time truncation.
-    valid_budget = [triple for triple in evaluated if not triple[2]["over_budget"] and triple[0].k >= selection.chosen.k]
-    if not valid_budget:
-        valid_budget = [triple for triple in evaluated if not triple[2]["over_budget"]]
-    if valid_budget:
-        candidate, parts, info = min(valid_budget, key=lambda triple: (triple[0].bic, triple[0].k))
-        info.update({"budget_enforced": True, "budget_override": candidate.k != selection.chosen.k, "selected_k": int(candidate.k)})
-        return candidate, parts, info
-
-    worst = max((triple[2]["max_community_token_mass"] for triple in evaluated), default=0.0)
-    raise ValueError(
-        "no valid GMM candidate satisfies summary_budget.effective_token_budget; "
-        f"budget={token_budget}, max_candidate_community_tokens={worst:.3f}. "
-        "Increase gmm_bic.abs_kmax / lower min_child constraints, or reduce upstream item token sizes."
-    )
 
 
 def _candidate_layer_parts(
@@ -832,6 +845,36 @@ def _candidate_layer_parts(
         "active_components": active_components,
         "community_token_masses": community_token_masses,
     }
+
+
+def _clustering_from_refinement(
+    *,
+    level: int,
+    input_ids: list[str],
+    projection: ProjectionResult,
+    selection: GmmBicSelection,
+    fit: GmmCandidateFit,
+    routing_model: LayerRoutingModel | None,
+    refined: dict[str, Any],
+) -> LayerClusteringResult:
+    return LayerClusteringResult(
+        level=level,
+        input_item_ids=input_ids,
+        communities=list(refined["communities"]),
+        member_item_ids_by_community=dict(refined["member_item_ids_by_community"]),
+        stop_reason="" if refined["communities"] else "budget_refinement_no_active_communities",
+        excluded_input_item_ids=list(refined["excluded_input_item_ids"]),
+        projection_dim=int(projection.dim),
+        explained_variance_ratio=float(projection.explained_variance_ratio),
+        pca_spectrum=list(projection.spectrum),
+        chosen_k=int(fit.k),
+        tested_k=[candidate.k for candidate in selection.candidates],
+        bic_by_k={str(candidate.k): float(candidate.bic) for candidate in selection.candidates},
+        log_likelihood_by_k={str(candidate.k): float(candidate.log_likelihood) for candidate in selection.candidates},
+        bic_margin=float(selection.bic_margin),
+        routing_model=routing_model,
+        summary_budget=dict(refined["summary_budget"]),
+    )
 
 
 def _item_token_count(item: ExperienceItem, keys: Sequence[str]) -> int:

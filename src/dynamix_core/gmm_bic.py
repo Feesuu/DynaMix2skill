@@ -623,19 +623,21 @@ def _select_membership_indices(row: np.ndarray, config: SoftMembershipConfig) ->
         return np.asarray(selected, dtype=int)
 
     if config.recursive_assignment == "cumulative_mass":
-        # Cumulative assignment means exactly: select components in descending
-        # posterior order until the accumulated posterior mass reaches the
-        # configured coverage.  Do not apply min_membership_weight or top-r gates
-        # here; otherwise coverage can silently remain below the target.
-        selected: list[int] = []
-        mass = 0.0
-        for index in order:
+        # Select enough high-posterior components to cover the requested mass,
+        # but do not pull in low-confidence tail components just to reach the
+        # target.  The max-gap gate keeps cumulative assignment as "near-tie"
+        # soft membership rather than noisy long-tail coverage.
+        selected: list[int] = [int(order[0])]
+        mass = float(row[order[0]])
+        for index in order[1:]:
             weight = float(row[index])
+            if best - weight > config.max_membership_gap:
+                break
             selected.append(int(index))
             mass += weight
             if mass >= config.cumulative_mass_coverage:
                 break
-        return np.asarray(selected or [int(order[0])], dtype=int)
+        return np.asarray(selected, dtype=int)
 
     raise ValueError(f"unsupported recursive_assignment={config.recursive_assignment!r}")
 

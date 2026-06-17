@@ -35,10 +35,10 @@ class GmmBicConfig:
     max_iter: int = 100
     tol: float = 1.0e-4
     min_covar: float = 1.0e-6
-    min_split_size: int = 8
+    min_split_size: int = 4
     # Used only to upper-bound searched K: kmax <= floor(total_weight / this value).
     # It is not a hard candidate-validity constraint.
-    min_effective_samples_per_component: int = 8
+    min_effective_samples_per_component: int = 4
     abs_kmax: int = 64
     max_concurrent_candidates: int = 1
     max_concurrent_restarts: int = 1
@@ -72,10 +72,10 @@ class GmmBicConfig:
 class SoftMembershipConfig:
     save_soft_edges: bool = True
     top_r_memberships: int = 2
-    recursive_assignment: str = "top_r_threshold"
+    recursive_assignment: str = "cumulative_mass"
     min_membership_weight: float = 0.05
     max_membership_gap: float = 0.25
-    cumulative_mass_coverage: float = 0.95
+    cumulative_mass_coverage: float = 0.90
 
     def validate(self) -> None:
         allowed = {"primary_argmax", "top_r_threshold", "cumulative_mass"}
@@ -140,18 +140,18 @@ class SummaryBudgetConfig:
 
 @dataclass(frozen=True)
 class BudgetRefinementConfig:
-    """Flat L0 budget-refinement policy for over-long raw communities.
+    """GMM-BIC budget-refinement policy for over-long raw communities.
 
-    This is not a semantic hierarchy.  It repeatedly refines an over-budget raw
-    community into smaller raw communities and flattens the feasible leaves back
-    into the same layer before LLM analysis.
+    This is not a semantic hierarchy.  It first keeps the normal coarse GMM-BIC
+    layer split, then recursively refines only over-budget raw communities with
+    local GMM-BIC splits and flattens feasible leaves back into the same layer.
     """
 
     enabled: bool = True
     apply_to_level: int = 0
     selection_policy: str = "bic_best_with_token_progress"
     min_token_reduction_fraction: float = 0.10
-    fallback: str = "pca_token_balanced_binary"
+    fallback: str = "gmm_bic_recursive"
     flatten_refinement_leaves_to_l0: bool = True
     skip_oversize_singleton: bool = True
 
@@ -162,8 +162,8 @@ class BudgetRefinementConfig:
             raise ValueError("budget_refinement.selection_policy must be 'bic_best_with_token_progress'")
         if not (0.0 <= self.min_token_reduction_fraction < 1.0):
             raise ValueError("budget_refinement.min_token_reduction_fraction must be in [0, 1)")
-        if self.fallback != "pca_token_balanced_binary":
-            raise ValueError("budget_refinement.fallback must be 'pca_token_balanced_binary'")
+        if self.fallback != "gmm_bic_recursive":
+            raise ValueError("budget_refinement.fallback must be 'gmm_bic_recursive'")
         if not self.flatten_refinement_leaves_to_l0:
             raise ValueError("budget_refinement.flatten_refinement_leaves_to_l0 must be true")
 
@@ -180,11 +180,11 @@ class DynamicUpdateConfig:
     """
 
     mode: str = "fixed_k_online_em"
-    assignment: str = "top_r_threshold"
+    assignment: str = "cumulative_mass"
     top_r: int = 2
     min_membership_weight: float = 0.05
     max_membership_gap: float = 0.25
-    cumulative_mass_coverage: float = 0.95
+    cumulative_mass_coverage: float = 0.90
     update_routing_model: bool = True
     clear_stale_after_propagation: bool = True
     confidence_metadata_key: str = "confidence"

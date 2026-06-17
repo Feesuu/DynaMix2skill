@@ -305,6 +305,10 @@ class ExperienceHierarchyState:
             for item in batch:
                 self._items[item.item_id] = item
             self._mark_layer_stale(0, "new_trajectory_items")
+            if 0 in self._layers:
+                layer = self._layers[0]
+                inserted_ids = [item.item_id for item in batch]
+                self._layers[0] = replace(layer, input_item_ids=_uniq([*layer.input_item_ids, *inserted_ids]))
             self._index = None
 
     async def commit_layer(
@@ -315,11 +319,20 @@ class ExperienceHierarchyState:
         generated_items: Iterable[ExperienceItem],
         stop_reason: str = "",
         metadata: dict[str, Any] | None = None,
+        excluded_input_item_ids: Iterable[str] = (),
     ) -> None:
         community_batch = [copy.deepcopy(community) for community in communities]
         item_batch = [copy.deepcopy(item) for item in generated_items]
+        excluded_batch = _uniq(excluded_input_item_ids)
         async with self._lock:
-            self._commit_layer_unlocked(level=level, communities=community_batch, generated_items=item_batch, stop_reason=stop_reason, metadata=metadata)
+            self._commit_layer_unlocked(
+                level=level,
+                communities=community_batch,
+                generated_items=item_batch,
+                stop_reason=stop_reason,
+                metadata=metadata,
+                excluded_input_item_ids=excluded_batch,
+            )
 
     async def build_dynamic_prompt_payload(self, community: ExperienceCommunity) -> dict[str, Any]:
         community = copy.deepcopy(community)
@@ -331,15 +344,34 @@ class ExperienceHierarchyState:
                     raise ValueError(f"community {community.community_id!r} member {item_id!r} has wrong level")
             old = self._communities.get(community.community_id)
             previous_ids = list(old.generated_item_ids if old else [])
+            member_items = [self._items[iid] for iid in community.member_weights]
+            is_raw_l0 = community.level == 0 and any(item.kind == ITEM_KIND_TRAJECTORY for item in member_items)
+            if is_raw_l0:
+                patch_contract = {
+                    "analyst_mode": "raw_extractor",
+                    "dynamic_summary_fn": "For this L0 raw trajectory community, return update patches for changed old cards and add patches for genuinely new independent cards.",
+                    "allowed_patch_operations": ["update", "add"],
+                    "update": "Use operation='update' only when revising an item_id from previous_generated_experiences.",
+                    "add": "Use operation='add' only for a newly discovered independent reusable lesson in this raw trajectory community.",
+                    "confidence": "Each update/add patch must include metadata['confidence']; unchanged old cards keep their stored confidence.",
+                }
+            else:
+                patch_contract = {
+                    "analyst_mode": "experience_abstractor",
+                    "dynamic_summary_fn": "For this L1+ ExperienceCard community, return update patches only for existing previous_generated_experiences.",
+                    "allowed_patch_operations": ["update"],
+                    "update": "Each patch must use operation='update' and an item_id copied from previous_generated_experiences.",
+                    "forbidden": "Do not use operation='add' for L1+ dynamic abstraction updates.",
+                    "confidence": "Each update patch must include metadata['confidence']; unchanged old cards keep their stored confidence.",
+                }
             return {
                 "contract": {
-                    "dynamic_summary_fn": "Return update/add ExperienceCardPatch objects only for changed or new cards.",
-                    "confidence": "Each update/add patch must include metadata['confidence']; unchanged old cards keep their stored confidence.",
+                    **patch_contract,
                     "support_mass": "Do not set support_mass in patches. The state redistributes source community support_mass across active cards by normalized confidence.",
                     "concurrency": "External LLM concurrency must be controlled outside this state object.",
                 },
                 "proposed_community": community.to_dict(),
-                "member_items": [self._items[iid].to_dict(include_embedding=False) for iid in community.member_weights],
+                "member_items": [item.to_dict(include_embedding=False) for item in member_items],
                 "previous_generated_experiences": [self._items[iid].to_dict(include_embedding=False) for iid in previous_ids if iid in self._items],
             }
 
@@ -403,6 +435,13 @@ class ExperienceHierarchyState:
     async def item_objects_at_level(self, level: int) -> list[ExperienceItem]:
         async with self._lock:
             return [copy.deepcopy(item) for item in self._items.values() if item.level == level]
+
+    async def layer_input_item_ids(self, level: int) -> list[str]:
+        async with self._lock:
+            layer = self._layers.get(level)
+            if layer is None:
+                return [item_id for item_id, item in self._items.items() if item.level == level]
+            return list(layer.input_item_ids)
 
     async def community_objects_at_level(self, level: int) -> list[ExperienceCommunity]:
         async with self._lock:
@@ -522,9 +561,25 @@ class ExperienceHierarchyState:
         pending = {iid for iid in self._pending_reroute_item_ids if iid in items}
         return items, communities, layers, pending
 
-    def _commit_layer_unlocked(self, *, level: int, communities: list[ExperienceCommunity], generated_items: list[ExperienceItem], stop_reason: str, metadata: dict[str, Any] | None) -> None:
+    def _commit_layer_unlocked(
+        self,
+        *,
+        level: int,
+        communities: list[ExperienceCommunity],
+        generated_items: list[ExperienceItem],
+        stop_reason: str,
+        metadata: dict[str, Any] | None,
+        excluded_input_item_ids: list[str] | None = None,
+    ) -> None:
         new_items, new_communities, new_layers, new_pending = self._clear_from_level_unlocked(level)
-        input_item_ids = [iid for iid, item in new_items.items() if item.level == level]
+        all_input_item_ids = [iid for iid, item in new_items.items() if item.level == level]
+        excluded = set(_uniq(excluded_input_item_ids or []))
+        for item_id in excluded:
+            if item_id not in new_items:
+                raise ValueError(f"excluded input item {item_id!r} is missing")
+            if new_items[item_id].level != level:
+                raise ValueError(f"excluded input item {item_id!r} is not at level {level}")
+        input_item_ids = [iid for iid in all_input_item_ids if iid not in excluded]
         if not input_item_ids:
             raise ValueError(f"no input items at level {level}")
         if not communities:
@@ -543,6 +598,8 @@ class ExperienceHierarchyState:
             if community.level != level:
                 raise ValueError("community level mismatch")
             for item_id in community.member_weights:
+                if item_id in excluded:
+                    raise ValueError(f"community {community.community_id!r} includes excluded input item {item_id!r}")
                 if item_id not in new_items:
                     raise ValueError(f"community {community.community_id!r} references missing item {item_id!r}")
                 if new_items[item_id].level != level:
@@ -583,13 +640,16 @@ class ExperienceHierarchyState:
         for cid, ids in generated_by_community.items():
             if ids:
                 _redistribute_generated_support_mass(new_items, new_communities[cid], ids)
+        layer_metadata = copy.deepcopy(metadata or {})
+        if excluded:
+            layer_metadata["excluded_input_item_ids"] = sorted(excluded)
         new_layers[level] = ExperienceLayer(
             level=level,
             input_item_ids=input_item_ids,
             community_ids=community_ids,
             generated_item_ids=generated_ids,
             stop_reason=stop_reason,
-            metadata=copy.deepcopy(metadata or {}),
+            metadata=layer_metadata,
         )
         result = _validate_maps(new_items, new_communities, new_layers, pending_reroute_item_ids=new_pending, strict_layers=True)
         if not result["ok"]:
@@ -682,15 +742,23 @@ class ExperienceHierarchyState:
         existing_ids = list(community.generated_item_ids)
         updates: dict[str, ExperienceCardPatch] = {}
         adds: list[ExperienceCardPatch] = []
+        add_ids: set[str] = set()
         for patch in patches:
             if patch.operation == "update":
                 if patch.item_id not in existing_ids:
                     raise KeyError(f"update patch references non-generated card {patch.item_id!r}")
+                if patch.item_id in updates:
+                    raise ValueError(f"duplicate update patch item_id={patch.item_id!r}")
                 updates[patch.item_id] = patch
-            else:
-                if patch.item_id in self._items:
+            elif patch.operation == "add":
+                if community.level > 0:
+                    raise ValueError("add patches are allowed only for L0 raw trajectory communities")
+                if patch.item_id in self._items or patch.item_id in add_ids:
                     raise ValueError(f"add patch duplicates existing item_id={patch.item_id!r}")
+                add_ids.add(patch.item_id)
                 adds.append(patch)
+            else:
+                raise ValueError(f"unsupported patch operation={patch.operation!r}")
 
         updated_ids: list[str] = []
         added_ids: list[str] = []
@@ -722,6 +790,9 @@ class ExperienceHierarchyState:
             existing_ids.append(item.item_id)
             added_ids.append(item.item_id)
             reroute_ids.append(item.item_id)
+        if added_ids and (community.level + 1) in self._layers:
+            target_layer = self._layers[community.level + 1]
+            self._layers[community.level + 1] = replace(target_layer, input_item_ids=_uniq([*target_layer.input_item_ids, *added_ids]))
 
         # Redistribute source community support_mass across all active generated cards.
         active_ids = [iid for iid in existing_ids if iid in self._items]

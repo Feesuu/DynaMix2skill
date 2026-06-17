@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from dynamix_core import GmmBicConfig, ProjectedGmmDynamicTreeConfig, ProjectionConfig, SoftMembershipConfig, SummaryBudgetConfig
-from dynamix_core.data_structures import ExperienceCardPatch, ExperienceItem, ITEM_KIND_TRAJECTORY
+from dynamix_core.data_structures import ExperienceItem, ITEM_KIND_TRAJECTORY
 from dynamix_core.skill_export import SkillExportConfig, export_skill_files
 from dynamix_core.tree_builder import ProjectedGmmTreeBuilder
 from dynamix_core.update import ExperienceHierarchyDynamicUpdater
@@ -83,8 +83,8 @@ def default_hierarchy_config(payload: dict[str, Any] | None = None) -> Projected
             "max_iter": 100,
             "tol": 1.0e-4,
             "min_covar": 1.0e-6,
-            "min_split_size": 8,
-            "min_effective_samples_per_component": 8,
+            "min_split_size": 4,
+            "min_effective_samples_per_component": 4,
             "abs_kmax": 64,
             "max_concurrent_candidates": 1,
             "max_concurrent_restarts": 1,
@@ -99,7 +99,7 @@ def default_hierarchy_config(payload: dict[str, Any] | None = None) -> Projected
             "apply_to_level": 0,
             "selection_policy": "bic_best_with_token_progress",
             "min_token_reduction_fraction": 0.10,
-            "fallback": "pca_token_balanced_binary",
+            "fallback": "gmm_bic_recursive",
             "flatten_refinement_leaves_to_l0": True,
             "skip_oversize_singleton": True,
         }),
@@ -165,9 +165,9 @@ async def build_dynamic_tree_from_records(config: DynaMixRunConfig) -> dict[str,
     """Formal dynamic-update scenario using the fixed-K core updater.
 
     Initial records build a normal static hierarchy.  Later records are inserted
-    in batches, routed to existing communities, summarized through update/add
-    patches, propagated upward, and each snapshot is exported.  The updater does
-    not create new clusters or change K online.
+    in batches and routed to existing communities. L0 raw trajectory communities
+    may add independent cards, while L1+ ExperienceCard communities are updated
+    in place. The updater does not create new clusters or change K online.
     """
     out = Path(config.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -205,34 +205,9 @@ async def build_dynamic_tree_from_records(config: DynaMixRunConfig) -> dict[str,
     update_summaries = []
 
     async def dynamic_summary_fn(context):
-        # Summarize the updated community and edit the existing generated card
-        # when one exists.  This is still fixed-K dynamic v1, but it avoids
-        # unbounded add-only growth: unchanged cards are simply omitted, and
-        # update/add patches carry fresh text, embedding, and confidence.
         member_items = [ExperienceItem(**_item_payload_to_constructor_payload(payload)) for payload in context.member_items]
-        cards = await analyst.summarize(context.community, member_items, None)
         previous = list(getattr(context, "previous_generated_experiences", []) or [])
-        previous = sorted(
-            previous,
-            key=lambda payload: float((payload.get("metadata") or {}).get("confidence", 0.0)),
-            reverse=True,
-        )
-        patches = []
-        for index, card in enumerate(cards):
-            if index < len(previous) and previous[index].get("item_id"):
-                operation = "update"
-                item_id = str(previous[index]["item_id"])
-            else:
-                operation = "add"
-                item_id = f"{card.item_id}_u{len(update_summaries)+1}_{index+1}"
-            patches.append(ExperienceCardPatch(
-                operation=operation,
-                item_id=item_id,
-                text=card.text,
-                embedding=card.embedding,
-                metadata=card.metadata,
-            ))
-        return patches
+        return await analyst.summarize_dynamic_update(context.community, member_items, previous)
 
     batch_size = max(1, int(dyn.update_batch_size))
     for batch_index, start in enumerate(range(0, len(remaining), batch_size), start=1):

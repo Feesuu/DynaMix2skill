@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
-from dynamix_core.data_structures import ExperienceCommunity, ExperienceItem, ITEM_KIND_EXPERIENCE_CARD, ITEM_KIND_TRAJECTORY
+from dynamix_core.data_structures import ExperienceCardPatch, ExperienceCommunity, ExperienceItem, ITEM_KIND_EXPERIENCE_CARD, ITEM_KIND_TRAJECTORY
 from .clients import EmbeddingClient, GenerationClient
 from .tokenization import get_tokenizer, TokenizerUnavailable
 
@@ -142,6 +142,139 @@ class ClusterAnalyst:
             )
         return items
 
+    async def summarize_dynamic_update(
+        self,
+        community: ExperienceCommunity,
+        members: Sequence[ExperienceItem],
+        previous_generated_experiences: Sequence[dict[str, Any]],
+    ) -> list[ExperienceCardPatch]:
+        if _is_diagnostic_community(community):
+            return []
+        analyst_mode = _infer_analyst_mode(community, members, self.config)
+        system_prompt = self._dynamic_system_prompt(analyst_mode)
+        prompt = self._build_dynamic_update_prompt(community, members, previous_generated_experiences, analyst_mode)
+        self._preflight_prompt_budget(community, system_prompt, prompt, len(members))
+        payload = await self.generation.chat_json(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            schema_name="DynamicExperienceCardPatchSet",
+        )
+        previous_by_id = {str(card.get("item_id")): dict(card) for card in previous_generated_experiences if card.get("item_id")}
+        if analyst_mode == "experience_abstractor":
+            updates_payload, extra_patches_truncated = _extract_dynamic_update_only_payload(payload)
+            new_cards_payload: list[dict[str, Any]] = []
+        else:
+            updates_payload, new_cards_payload = _extract_dynamic_patch_payload(payload)
+            extra_patches_truncated = 0
+        updates_payload, new_cards_payload, extra_patches_truncated = _enforce_dynamic_patch_cardinality(
+            updates_payload,
+            new_cards_payload,
+            analyst_mode,
+            self.config,
+            extra_patches_truncated=extra_patches_truncated,
+        )
+        patches: list[ExperienceCardPatch] = []
+        rendered_texts: list[str] = []
+        patch_specs: list[tuple[str, str, dict[str, Any], str]] = []
+
+        seen_updates: set[str] = set()
+        for update in updates_payload:
+            item_id = _required_string(update, "item_id")
+            if item_id not in previous_by_id:
+                raise ValueError(f"dynamic update referenced unknown previous ExperienceCard item_id={item_id!r}")
+            if item_id in seen_updates:
+                raise ValueError(f"dynamic update referenced duplicate ExperienceCard item_id={item_id!r}")
+            seen_updates.add(item_id)
+            normalized = self._normalize_dynamic_card(update)
+            rendered = _render_card_text(normalized)
+            rendered_texts.append(rendered)
+            patch_specs.append(("update", item_id, normalized, rendered))
+
+        for index, card in enumerate(new_cards_payload, start=1):
+            normalized = self._normalize_dynamic_card(card)
+            rendered = _render_card_text(normalized)
+            item_id = f"E{community.level + 1}_D{_short_hash(community.community_id + ':' + str(community.version) + ':' + str(index) + ':' + rendered)}"
+            rendered_texts.append(rendered)
+            patch_specs.append(("add", item_id, normalized, rendered))
+
+        if not patch_specs:
+            return []
+
+        embeddings = await self.embedding.embed_texts(rendered_texts, cache_namespace="experience_card")
+        for (operation, item_id, normalized, rendered), embedding in zip(patch_specs, embeddings):
+            patches.append(ExperienceCardPatch(
+                operation="update" if operation == "update" else "add",
+                item_id=item_id,
+                text=rendered,
+                embedding=embedding,
+                metadata=self._dynamic_card_metadata(
+                    normalized,
+                    community,
+                    members,
+                    analyst_mode,
+                    operation,
+                    extra_patches_truncated=extra_patches_truncated,
+                ),
+            ))
+        return patches
+
+    def _normalize_dynamic_card(
+        self,
+        card: dict[str, Any],
+    ) -> dict[str, Any]:
+        name = _required_string(card, "name")
+        trigger = _required_string(card, "trigger")
+        content = _required_string(card, "content")
+        confidence = max(float(card.get("confidence", 0.5)), self.config.confidence_floor)
+        placement = _normalize_placement(_required_mapping(card, "placement"), name=name)
+        return {
+            "name": name,
+            "trigger": trigger,
+            "content": content,
+            "confidence": confidence,
+            "placement": placement,
+            "analysis_token_count": _safe_token_count(
+                _render_card_text({"name": name, "trigger": trigger, "content": content}),
+                self.config.tokenizer_model,
+                self.config.allow_regex_tokenizer_fallback,
+            ),
+        }
+
+    def _dynamic_card_metadata(
+        self,
+        normalized: dict[str, Any],
+        community: ExperienceCommunity,
+        members: Sequence[ExperienceItem],
+        analyst_mode: str,
+        operation: str,
+        *,
+        extra_patches_truncated: int = 0,
+    ) -> dict[str, Any]:
+        return {
+            "name": normalized["name"],
+            "trigger": normalized["trigger"],
+            "content": normalized["content"],
+            "confidence": normalized["confidence"],
+            "placement": normalized["placement"],
+            "source_community_id": community.community_id,
+            "source_member_count": len(members),
+            "source_outcome_mode": community.outcome_mode,
+            "cluster_level_analyst": True,
+            "minimal_experience_schema": True,
+            "dynamic_experience_patch_schema": True,
+            "dynamic_patch_operation": operation,
+            "analyst_mode": analyst_mode,
+            "higher_level_single_card_enforced": analyst_mode == "experience_abstractor",
+            "higher_level_extra_cards_truncated": int(extra_patches_truncated),
+            "trace2skill_prompt_style_adapted": True,
+            "trace2skill_template_inheritance": True,
+            "iterative_rca_loop": False,
+            "member_truncation_applied": False,
+            "analysis_token_count": normalized["analysis_token_count"],
+        }
+
     def _system_prompt(self, analyst_mode: str) -> str:
         if analyst_mode == "raw_extractor":
             mission = "Analyze one raw trajectory cluster and produce one or more reusable ExperienceCards."
@@ -185,6 +318,58 @@ Return one JSON object with a top-level cards list. For higher-level abstraction
 - confidence: float in (0, 1].
 
 Do not output support_mass. Do not output extra structured fields such as shared_patterns, success_motifs, anti_patterns, or patch_hints. Put the useful guidance in content. Do not duplicate semantically identical cards.
+"""
+
+    def _dynamic_system_prompt(self, analyst_mode: str) -> str:
+        if analyst_mode == "experience_abstractor":
+            mission = "Update an existing higher-level ExperienceCard abstraction after its lower-level members changed."
+            rewrite_policy = """- The input members are lower-level ExperienceCards, not raw trajectories.
+- Your job is to revise existing higher-level abstractions by explicit item_id.
+- Do not create new cards at this level. If the old abstraction remains valid, improve its name, trigger, content, placement, or confidence.
+- If the community is somewhat mixed, write the broadest valid update and lower the confidence."""
+            output_policy = """Return one JSON object with exactly one top-level field:
+- updates: a list of revised existing cards. Each update must include item_id, name, trigger, content, placement, confidence.
+
+Every updates[].item_id must be copied exactly from previous_generated_experiences."""
+        else:
+            mission = "Update the reusable ExperienceCards for one raw trajectory cluster after new trajectories were inserted."
+            rewrite_policy = """- If the updated cluster contains successful trajectories, distill reusable success lessons.
+- If the updated cluster contains failed trajectories, distill reusable failure-prevention lessons.
+- If the updated cluster is mixed, analyze success and failure evidence together.
+- Use updates only for revising the same old card by explicit item_id.
+- Use new_cards for newly discovered independent raw-cluster lessons."""
+            output_policy = """Return one JSON object with exactly these top-level fields:
+- updates: a list of revised existing cards. Each update must include item_id and may only use an item_id from previous_generated_experiences.
+- new_cards: a list of newly discovered independent cards. New cards must not include item_id."""
+        return f"""
+# Role
+You are an expert Trace2Skill-style AI agent trajectory analyst for spreadsheet manipulation tasks.
+
+# Mission
+{mission}
+
+# Trace2Skill template inheritance
+You must follow the evidence discipline of the Trace2Skill success/error analysis prompts below, but adapt their evidence unit to the updated community.
+
+<adapted_success_system_template>
+{self._templates.get('success_system_llm', '')}
+</adapted_success_system_template>
+
+<adapted_error_system_template>
+{self._templates.get('error_system_llm', '')}
+</adapted_error_system_template>
+
+# Dynamic community rewrite
+{rewrite_policy}
+- v1 does not run Trace2Skill's iterative minimal-fix verifier loop, so do not claim verified root causes.
+
+# Dynamic output schema
+{output_policy}
+
+Do not match cards by list position. Do not overwrite an old card just because a revised card was generated.
+Use updates only when you are revising the same reusable experience already represented by that exact old item_id.
+Omit unchanged old cards. Do not delete old cards. Do not output support_mass.
+Return valid JSON only.
 """
 
     def _preflight_prompt_budget(self, community: ExperienceCommunity, system_prompt: str, user_prompt: str, member_count: int) -> None:
@@ -280,6 +465,134 @@ Do not output support_mass. Do not output extra structured fields such as shared
             ]
         }, ensure_ascii=False, indent=2)
 
+    def _build_dynamic_update_prompt(
+        self,
+        community: ExperienceCommunity,
+        members: Sequence[ExperienceItem],
+        previous_generated_experiences: Sequence[dict[str, Any]],
+        analyst_mode: str,
+    ) -> str:
+        member_payloads = []
+        for item in members:
+            member_payloads.append({
+                "item_id": item.item_id,
+                "membership_weight": community.member_weights.get(item.item_id),
+                "success": item.metadata.get("success"),
+                "analysis_bundle": item.metadata.get("analysis_bundle", item.text),
+            })
+        previous_payloads = []
+        for card in previous_generated_experiences:
+            metadata = dict(card.get("metadata", {}) or {})
+            previous_payloads.append({
+                "item_id": card.get("item_id"),
+                "name": metadata.get("name"),
+                "trigger": metadata.get("trigger"),
+                "content": metadata.get("content"),
+                "confidence": metadata.get("confidence"),
+                "support_mass": card.get("support_mass"),
+                "text": card.get("text"),
+            })
+        higher_level = analyst_mode == "experience_abstractor"
+        if higher_level:
+            instruction = (
+                "Analyze the updated higher-level community after dynamic insertion. "
+                "Revise existing ExperienceCards only by explicit previous item_id."
+            )
+            dynamic_patch_policy = {
+                "updates": "Only revise old cards by explicitly naming a previous item_id.",
+                "unchanged": "Omit unchanged previous cards.",
+                "forbidden": "Never infer update targets from output order or confidence rank.",
+            }
+            hard_constraints = [
+                "Use all provided members. Do not ignore later members or silently truncate the cluster.",
+                "Do not output support_mass.",
+                "Every updates[].item_id must be copied exactly from previous_generated_experiences.",
+                "Return a top-level JSON object with only updates.",
+                "Each update must contain item_id, name, trigger, content, placement, confidence.",
+                "Do not copy absolute paths, output_path, xlsx filenames, raw long code blocks, XML/tool tags, or debug logs into reusable guidance.",
+                "Never mention ground truth, gold answers, hidden labels, or verifier internals as something the target agent can access.",
+                "Return valid JSON only.",
+            ]
+            output_schema = {
+                "updates": [
+                    {
+                        "item_id": "string: must equal one previous_generated_experiences item_id",
+                        "name": "string",
+                        "trigger": "string",
+                        "content": "string",
+                        "placement": {
+                            "target": "skill_md | reference | script",
+                            "reference_kind": "procedure | example | edge_case | note"
+                        },
+                        "confidence": "float in (0,1]"
+                    }
+                ],
+            }
+        else:
+            instruction = (
+                "Analyze the updated raw trajectory community after dynamic insertion. "
+                "Output explicit old-card updates by item_id and independent new cards separately."
+            )
+            dynamic_patch_policy = {
+                "updates": "Only revise old cards by explicitly naming a previous item_id.",
+                "new_cards": "Every newly discovered independent lesson goes here and receives a new item_id automatically.",
+                "unchanged": "Omit unchanged previous cards.",
+                "forbidden": "Never infer update targets from output order or confidence rank.",
+            }
+            hard_constraints = [
+                "Use all provided members. Do not ignore later members or silently truncate the cluster.",
+                "Do not output support_mass.",
+                "Do not output item_id inside new_cards.",
+                "Every updates[].item_id must be copied exactly from previous_generated_experiences.",
+                "Return a top-level JSON object with only updates and new_cards.",
+                "Each updated or new card must contain name, trigger, content, placement, confidence.",
+                "Do not copy absolute paths, output_path, xlsx filenames, raw long code blocks, XML/tool tags, or debug logs into reusable guidance.",
+                "Never mention ground truth, gold answers, hidden labels, or verifier internals as something the target agent can access.",
+                "Return valid JSON only.",
+            ]
+            output_schema = {
+                "updates": [
+                    {
+                        "item_id": "string: must equal one previous_generated_experiences item_id",
+                        "name": "string",
+                        "trigger": "string",
+                        "content": "string",
+                        "placement": {
+                            "target": "skill_md | reference | script",
+                            "reference_kind": "procedure | example | edge_case | note"
+                        },
+                        "confidence": "float in (0,1]"
+                    }
+                ],
+                "new_cards": [
+                    {
+                        "name": "string",
+                        "trigger": "string",
+                        "content": "string",
+                        "placement": {
+                            "target": "skill_md | reference | script",
+                            "reference_kind": "procedure | example | edge_case | note"
+                        },
+                        "confidence": "float in (0,1]"
+                    }
+                ],
+            }
+        return json.dumps({
+            "instruction": instruction,
+            "analyst_mode": analyst_mode,
+            "dynamic_patch_policy": dynamic_patch_policy,
+            "template_user_prompt_adaptation": {
+                "success_user_template": self._templates.get("success_user_llm", ""),
+                "error_user_template": self._templates.get("error_user_llm", ""),
+                "replace_agent_log_with": "cluster_member_analysis_bundles",
+            },
+            "hard_constraints": hard_constraints,
+            "community": community.to_dict(),
+            "members": member_payloads,
+            "previous_generated_experiences": previous_payloads,
+            "output_schema": output_schema,
+        }, ensure_ascii=False, indent=2)
+
 
 
 def _infer_analyst_mode(community: ExperienceCommunity, members: Sequence[ExperienceItem], config: ClusterAnalystConfig) -> str:
@@ -345,6 +658,77 @@ def _extract_cards_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
             raise ValueError(f"cards[{index}] must be an object")
         result.append(dict(card))
     return result
+
+
+def _extract_dynamic_patch_payload(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if "updates" not in payload and "new_cards" not in payload:
+        # Backward-compatible LLM/mock shapes are safe only as additions. They
+        # must never be position-matched onto existing cards.
+        return [], _extract_cards_payload(payload)
+    updates = payload.get("updates", [])
+    new_cards = payload.get("new_cards", [])
+    if not isinstance(updates, list):
+        raise ValueError("dynamic ExperienceCard output field 'updates' must be a list")
+    if not isinstance(new_cards, list):
+        raise ValueError("dynamic ExperienceCard output field 'new_cards' must be a list")
+    update_items: list[dict[str, Any]] = []
+    for index, card in enumerate(updates, start=1):
+        if not isinstance(card, dict):
+            raise ValueError(f"updates[{index}] must be an object")
+        update_items.append(dict(card))
+    new_items: list[dict[str, Any]] = []
+    for index, card in enumerate(new_cards, start=1):
+        if not isinstance(card, dict):
+            raise ValueError(f"new_cards[{index}] must be an object")
+        if "item_id" in card:
+            raise ValueError("new_cards must not include item_id; item ids are assigned by DynaMix")
+        new_items.append(dict(card))
+    return update_items, new_items
+
+
+def _extract_dynamic_update_only_payload(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+    unexpected_fields = sorted(set(payload) - {"updates"})
+    if unexpected_fields:
+        joined = ", ".join(repr(field) for field in unexpected_fields)
+        raise ValueError(f"L1+ dynamic ExperienceCard output must include only 'updates'; unexpected field(s): {joined}")
+    if "updates" not in payload:
+        raise ValueError("L1+ dynamic ExperienceCard output must include an 'updates' list")
+    updates = payload["updates"]
+    if not isinstance(updates, list):
+        raise ValueError("dynamic ExperienceCard output field 'updates' must be a list")
+    update_items: list[dict[str, Any]] = []
+    for index, card in enumerate(updates, start=1):
+        if not isinstance(card, dict):
+            raise ValueError(f"updates[{index}] must be an object")
+        update_items.append(dict(card))
+    return update_items, 0
+
+
+def _enforce_dynamic_patch_cardinality(
+    updates: list[dict[str, Any]],
+    new_cards: list[dict[str, Any]],
+    analyst_mode: str,
+    config: ClusterAnalystConfig,
+    *,
+    extra_patches_truncated: int = 0,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    if analyst_mode == "raw_extractor":
+        return updates, new_cards, extra_patches_truncated
+    extra_patches_truncated += len(new_cards)
+    new_cards = []
+    limit = max(1, int(config.max_cards_higher))
+    total = len(updates) + len(new_cards)
+    if total <= limit:
+        return updates, new_cards, extra_patches_truncated
+    if not config.truncate_higher_level_extra_cards:
+        raise ValueError(
+            f"higher-level dynamic ExperienceCard update must return at most {limit} patch(es), got {total}"
+        )
+    kept_updates = updates[:limit]
+    remaining = max(0, limit - len(kept_updates))
+    kept_new_cards = new_cards[:remaining]
+    kept_total = len(kept_updates) + len(kept_new_cards)
+    return kept_updates, kept_new_cards, extra_patches_truncated + total - kept_total
 
 
 def _is_diagnostic_community(community: ExperienceCommunity) -> bool:

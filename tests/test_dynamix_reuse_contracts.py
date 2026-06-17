@@ -60,11 +60,21 @@ def test_cluster_analyst_uses_all_members_not_member_cap():
 
 
 def test_default_hierarchy_config_is_real_not_tiny_smoke():
+    from dynamix_core.config import ProjectedGmmDynamicTreeConfig
+
     cfg = default_hierarchy_config({})
-    assert cfg.gmm_bic.min_split_size == 8
-    assert cfg.gmm_bic.min_effective_samples_per_component == 8
+    assert cfg.gmm_bic.min_split_size == 4
+    assert cfg.gmm_bic.min_effective_samples_per_component == 4
     assert cfg.gmm_bic.abs_kmax == 64
     assert cfg.gmm_bic.num_restarts == 5
+    assert cfg.soft_membership.recursive_assignment == "cumulative_mass"
+    assert cfg.soft_membership.cumulative_mass_coverage == pytest.approx(0.90)
+    assert cfg.dynamic_update.assignment == "cumulative_mass"
+    assert cfg.dynamic_update.cumulative_mass_coverage == pytest.approx(0.90)
+    assert cfg.budget_refinement.fallback == "gmm_bic_recursive"
+    direct_cfg = ProjectedGmmDynamicTreeConfig.from_mapping({})
+    assert direct_cfg.soft_membership.recursive_assignment == "cumulative_mass"
+    assert direct_cfg.soft_membership.cumulative_mass_coverage == pytest.approx(0.90)
 
 
 def test_log_parser_recurses_and_loads_multiple_result_shapes(tmp_path):
@@ -134,7 +144,7 @@ def test_cluster_prompt_preflight_fails_when_over_budget():
         )
 
 
-def test_budget_refinement_retains_oversize_singleton_as_diagnostic_community():
+def test_budget_refinement_excludes_oversize_singleton_from_active_layer():
     from dynamix_core.tree_builder import ProjectedGmmTreeBuilder
 
     cfg = default_hierarchy_config({
@@ -144,7 +154,7 @@ def test_budget_refinement_retains_oversize_singleton_as_diagnostic_community():
             "apply_to_level": 0,
             "selection_policy": "bic_best_with_token_progress",
             "min_token_reduction_fraction": 0.10,
-            "fallback": "pca_token_balanced_binary",
+            "fallback": "gmm_bic_recursive",
             "flatten_refinement_leaves_to_l0": True,
             "skip_oversize_singleton": True,
         },
@@ -158,15 +168,14 @@ def test_budget_refinement_retains_oversize_singleton_as_diagnostic_community():
         metadata={"analysis_token_count": 10, "analysis_bundle": "oversize bundle"},
     )
     clustering = asyncio.run(ProjectedGmmTreeBuilder(cfg).cluster_layer([item], level=0))
-    assert not clustering.should_stop
-    assert len(clustering.communities) == 1
-    community = clustering.communities[0]
-    assert community.member_weights == {"too_long": 1.0}
-    assert community.metadata["oversize_singleton"] is True
-    assert community.metadata["llm_summary_skipped"] is True
-    assert clustering.summary_budget["oversize_singleton_skipped_count"] == 1
-    assert clustering.summary_budget["oversize_singleton_fallback_count"] == 0
-    assert "do not generate ExperienceCards" in clustering.summary_budget["note"]
+    assert clustering.should_stop
+    assert clustering.stop_reason == "budget_refinement_no_active_communities"
+    assert clustering.communities == []
+    assert clustering.excluded_input_item_ids == ["too_long"]
+    skipped = clustering.summary_budget["excluded_oversize_singletons"]
+    assert len(skipped) == 1
+    assert skipped[0]["item_id"] == "too_long"
+    assert skipped[0]["reason"] == "oversize_singleton"
 
 
 def test_cluster_analyst_skips_diagnostic_oversize_singleton():
@@ -188,6 +197,120 @@ def test_cluster_analyst_skips_diagnostic_oversize_singleton():
     cards = asyncio.run(analyst.summarize(community, [member]))
     assert cards == []
     assert analyst.config.token_report == []
+
+
+def test_refinement_routing_masks_excluded_child_and_uses_next_active_leaf():
+    from dynamix_core.config import SoftMembershipConfig
+    from dynamix_core.update import _route_through_refinement_tree
+
+    item = ExperienceItem(
+        item_id="new_t",
+        level=0,
+        kind=ITEM_KIND_TRAJECTORY,
+        text="new trace",
+        embedding=[0.0],
+    )
+    tree = {
+        "coarse_roots": {"L0_C0": "root"},
+        "nodes": {
+            "root": {
+                "node_id": "root",
+                "kind": "gmm_split",
+                "pca_mean": [0.0],
+                "pca_components": [[1.0]],
+                "pi": [0.99, 0.01],
+                "means": [[0.0], [10.0]],
+                "variances": [[1.0], [1.0]],
+                "child_node_ids": ["excluded", "active_leaf"],
+            },
+            "excluded": {"node_id": "excluded", "kind": "excluded_oversize_singleton"},
+            "active_leaf": {"node_id": "active_leaf", "kind": "leaf", "community_id": "L0_C0_R000"},
+        },
+    }
+    selected = _route_through_refinement_tree(
+        item=item,
+        coarse_community_id="L0_C0",
+        coarse_weight=1.0,
+        tree=tree,
+        soft_config=SoftMembershipConfig(recursive_assignment="cumulative_mass", cumulative_mass_coverage=0.9),
+        selected_only=True,
+    )
+    posterior = _route_through_refinement_tree(
+        item=item,
+        coarse_community_id="L0_C0",
+        coarse_weight=1.0,
+        tree=tree,
+        soft_config=SoftMembershipConfig(recursive_assignment="cumulative_mass", cumulative_mass_coverage=0.9),
+        selected_only=False,
+    )
+    assert selected == {"L0_C0_R000": pytest.approx(1.0)}
+    assert posterior == {"L0_C0_R000": pytest.approx(1.0)}
+
+
+def test_dynamic_route_masks_removed_coarse_community_and_uses_next_active_cluster():
+    from dynamix_core.data_structures import ExperienceHierarchyState
+    from dynamix_core.update import ExperienceHierarchyDynamicUpdater
+
+    async def run_case():
+        state = ExperienceHierarchyState()
+        await state.initialize_trajectory_items([
+            ExperienceItem(item_id="old_t", level=0, kind=ITEM_KIND_TRAJECTORY, text="old", embedding=[10.0]),
+        ])
+        await state.commit_layer(
+            level=0,
+            communities=[ExperienceCommunity(community_id="L0_C1", level=0, member_weights={"old_t": 1.0})],
+            generated_items=[
+                ExperienceItem(
+                    item_id="card",
+                    level=1,
+                    kind=ITEM_KIND_EXPERIENCE_CARD,
+                    text="card",
+                    embedding=[10.0],
+                    generated_from_community_ids=["L0_C1"],
+                    metadata={"name": "Card", "trigger": "active", "content": "active", "confidence": 1.0},
+                )
+            ],
+            metadata={
+                "routing_model": {
+                    "routing_model_kind": "fixed_k_pca_gmm",
+                    "level": 0,
+                    "community_ids": ["L0_C0", "L0_C1"],
+                    "pca_mean": [0.0],
+                    "pca_components": [[1.0]],
+                    "pi": [0.99, 0.01],
+                    "means": [[0.0], [10.0]],
+                    "variances": [[1.0], [1.0]],
+                    "soft_assignment": {},
+                }
+            },
+        )
+        await state.insert_trajectory_items([
+            ExperienceItem(item_id="new_t", level=0, kind=ITEM_KIND_TRAJECTORY, text="new", embedding=[0.0]),
+        ])
+        updater = ExperienceHierarchyDynamicUpdater(default_hierarchy_config({}))
+        return await updater.route_existing_items(state, level=0, item_ids=["new_t"])
+
+    routing = asyncio.run(run_case())
+    assert routing.selected_assignments == {"new_t": {"L0_C1": pytest.approx(1.0)}}
+    assert routing.posterior_assignments == {"new_t": {"L0_C1": pytest.approx(1.0)}}
+
+
+def test_routing_model_refresh_coarsens_refined_leaf_posterior_only_to_active_roots():
+    from dynamix_core.update import _coarsen_posterior_for_routing_model
+
+    tree = {
+        "coarse_roots": {"L0_C0": "root0", "L0_C1": "root1"},
+        "nodes": {
+            "root0": {"node_id": "root0", "kind": "leaf", "community_id": "L0_C0_R000"},
+            "root1": {"node_id": "root1", "kind": "excluded_oversize_singleton"},
+        },
+    }
+    posterior = _coarsen_posterior_for_routing_model(
+        {"L0_C0_R000": 0.7, "L0_C1_R000": 0.2, "L0_C2": 0.1},
+        child_ids=["L0_C0", "L0_C1"],
+        refinement_tree=tree,
+    )
+    assert posterior == {"L0_C0": pytest.approx(0.7)}
 
 
 def test_adapted_trace2skill_templates_remove_obvious_single_trajectory_phrase():
@@ -271,6 +394,528 @@ def test_render_card_text_minimal_schema_only():
     assert "## Content" in text
     assert "Shared patterns" not in text
     assert "Success motifs" not in text
+
+
+def test_dynamic_analyst_adds_new_cards_without_position_matching_old_cards():
+    from dynamix_trace2skill.summary import ClusterAnalyst, ClusterAnalystConfig
+
+    class DummyGeneration:
+        def __init__(self):
+            self.messages = None
+
+        async def chat_json(self, messages, *, schema_name, **kwargs):
+            self.messages = messages
+            return {
+                "new_cards": [{
+                    "name": "New lesson",
+                    "trigger": "When a newly inserted trace shows a distinct procedure.",
+                    "content": "Treat this as an independent reusable experience.",
+                    "placement": {"target": "skill_md", "reference_kind": "procedure"},
+                    "confidence": 0.7,
+                }],
+            }
+
+    class DummyEmbedding:
+        async def embed_texts(self, texts, *, cache_namespace=None):
+            return [[float(index + 1)] for index, _ in enumerate(texts)]
+
+    generation = DummyGeneration()
+    analyst = ClusterAnalyst(
+        generation,
+        DummyEmbedding(),
+        ClusterAnalystConfig(tokenizer_required=False, allow_regex_tokenizer_fallback=True),
+    )
+    community = ExperienceCommunity(community_id="C0", level=0, member_weights={"t0": 1.0})
+    member = ExperienceItem(
+        item_id="t0",
+        level=0,
+        kind=ITEM_KIND_TRAJECTORY,
+        text="trace",
+        embedding=[1.0],
+        metadata={"analysis_bundle": "new trajectory evidence"},
+    )
+    previous = [{
+        "item_id": "old_high_conf",
+        "level": 1,
+        "kind": ITEM_KIND_EXPERIENCE_CARD,
+        "text": "old card",
+        "support_mass": 1.0,
+        "metadata": {"name": "Old", "trigger": "old", "content": "old", "confidence": 0.99},
+    }]
+
+    patches = asyncio.run(analyst.summarize_dynamic_update(community, [member], previous))
+
+    assert len(patches) == 1
+    assert patches[0].operation == "add"
+    assert patches[0].item_id != "old_high_conf"
+    assert patches[0].metadata["dynamic_patch_operation"] == "add"
+    prompt = generation.messages[1]["content"]
+    assert "old_high_conf" in prompt
+    assert "new_cards" in prompt
+    assert "Never infer update targets from output order or confidence rank" in prompt
+
+
+def test_dynamic_analyst_updates_only_explicit_previous_card_ids():
+    from dynamix_trace2skill.summary import ClusterAnalyst, ClusterAnalystConfig
+
+    class DummyGeneration:
+        async def chat_json(self, messages, *, schema_name, **kwargs):
+            return {
+                "updates": [{
+                    "item_id": "old_low_conf",
+                    "name": "Revised old lesson",
+                    "trigger": "When the same old lesson needs a confidence/content revision.",
+                    "content": "Revise the old reusable experience by explicit id only.",
+                    "placement": {"target": "skill_md", "reference_kind": "procedure"},
+                    "confidence": 0.8,
+                }],
+                "new_cards": [],
+            }
+
+    class DummyEmbedding:
+        async def embed_texts(self, texts, *, cache_namespace=None):
+            return [[2.0] for _ in texts]
+
+    analyst = ClusterAnalyst(
+        DummyGeneration(),
+        DummyEmbedding(),
+        ClusterAnalystConfig(tokenizer_required=False, allow_regex_tokenizer_fallback=True),
+    )
+    community = ExperienceCommunity(community_id="C0", level=0, member_weights={"t0": 1.0})
+    member = ExperienceItem(item_id="t0", level=0, kind=ITEM_KIND_TRAJECTORY, text="trace", embedding=[1.0])
+    previous = [
+        {"item_id": "old_high_conf", "metadata": {"name": "High", "trigger": "h", "content": "h", "confidence": 0.99}},
+        {"item_id": "old_low_conf", "metadata": {"name": "Low", "trigger": "l", "content": "l", "confidence": 0.1}},
+    ]
+
+    patches = asyncio.run(analyst.summarize_dynamic_update(community, [member], previous))
+
+    assert len(patches) == 1
+    assert patches[0].operation == "update"
+    assert patches[0].item_id == "old_low_conf"
+    assert patches[0].metadata["confidence"] == 0.8
+    assert patches[0].metadata["dynamic_patch_operation"] == "update"
+
+
+def test_dynamic_analyst_higher_level_prompt_is_updates_only_and_rejects_legacy_card_output():
+    from dynamix_trace2skill.summary import ClusterAnalyst, ClusterAnalystConfig
+
+    class DummyGeneration:
+        def __init__(self, payload):
+            self.messages = None
+            self.payload = payload
+
+        async def chat_json(self, messages, *, schema_name, **kwargs):
+            self.messages = messages
+            return self.payload
+
+    class DummyEmbedding:
+        async def embed_texts(self, texts, *, cache_namespace=None):
+            return [[1.0] for _ in texts]
+
+    legacy_card = {
+        "name": "New high-level abstraction",
+        "trigger": "When lower-level cards suggest another abstraction.",
+        "content": "This legacy-shaped output should not be accepted for L1+ dynamic updates.",
+        "placement": {"target": "skill_md", "reference_kind": "procedure"},
+        "confidence": 0.7,
+    }
+    community = ExperienceCommunity(community_id="L1_C0", level=1, member_weights={"e1": 1.0})
+    member = ExperienceItem(
+        item_id="e1",
+        level=1,
+        kind=ITEM_KIND_EXPERIENCE_CARD,
+        text="lower card",
+        embedding=[1.0],
+        metadata={"name": "Lower", "trigger": "lower", "content": "lower", "confidence": 0.8},
+    )
+    previous = [{
+        "item_id": "old_l2",
+        "metadata": {"name": "Old L2", "trigger": "old", "content": "old", "confidence": 0.9},
+    }]
+
+    for payload in ({"new_cards": [legacy_card]}, {"cards": [legacy_card]}, legacy_card):
+        generation = DummyGeneration(payload)
+        analyst = ClusterAnalyst(
+            generation,
+            DummyEmbedding(),
+            ClusterAnalystConfig(tokenizer_required=False, allow_regex_tokenizer_fallback=True),
+        )
+
+        with pytest.raises(ValueError, match="only 'updates'"):
+            asyncio.run(analyst.summarize_dynamic_update(community, [member], previous))
+
+        prompt = generation.messages[1]["content"]
+        assert "new_cards" not in prompt
+        assert "Return a top-level JSON object with only updates." in prompt
+        system_prompt = generation.messages[0]["content"]
+        assert "new_cards" not in system_prompt
+        assert "top-level cards list" not in system_prompt
+
+
+def test_dynamic_analyst_higher_level_accepts_explicit_updates():
+    from dynamix_trace2skill.summary import ClusterAnalyst, ClusterAnalystConfig
+
+    class DummyGeneration:
+        async def chat_json(self, messages, *, schema_name, **kwargs):
+            return {
+                "updates": [{
+                    "item_id": "old_l2",
+                    "name": "Updated high-level abstraction",
+                    "trigger": "When lower-level cards share a clearer high-level pattern.",
+                    "content": "Revise the existing higher-level abstraction by explicit item_id.",
+                    "placement": {"target": "skill_md", "reference_kind": "procedure"},
+                    "confidence": 0.75,
+                }],
+            }
+
+    class DummyEmbedding:
+        async def embed_texts(self, texts, *, cache_namespace=None):
+            return [[3.0] for _ in texts]
+
+    analyst = ClusterAnalyst(
+        DummyGeneration(),
+        DummyEmbedding(),
+        ClusterAnalystConfig(tokenizer_required=False, allow_regex_tokenizer_fallback=True),
+    )
+    community = ExperienceCommunity(community_id="L1_C0", level=1, member_weights={"e1": 1.0})
+    member = ExperienceItem(
+        item_id="e1",
+        level=1,
+        kind=ITEM_KIND_EXPERIENCE_CARD,
+        text="lower card",
+        embedding=[1.0],
+        metadata={"name": "Lower", "trigger": "lower", "content": "lower", "confidence": 0.8},
+    )
+    previous = [{
+        "item_id": "old_l2",
+        "metadata": {"name": "Old L2", "trigger": "old", "content": "old", "confidence": 0.9},
+    }]
+
+    patches = asyncio.run(analyst.summarize_dynamic_update(community, [member], previous))
+
+    assert len(patches) == 1
+    assert patches[0].operation == "update"
+    assert patches[0].item_id == "old_l2"
+    assert patches[0].metadata["dynamic_patch_operation"] == "update"
+    assert patches[0].metadata["higher_level_single_card_enforced"] is True
+
+
+def test_dynamic_analyst_rejects_invalid_patch_ids():
+    from dynamix_trace2skill.summary import ClusterAnalyst, ClusterAnalystConfig
+
+    class DummyEmbedding:
+        async def embed_texts(self, texts, *, cache_namespace=None):
+            return [[1.0] for _ in texts]
+
+    async def run_payload(payload):
+        class DummyGeneration:
+            async def chat_json(self, messages, *, schema_name, **kwargs):
+                return payload
+
+        analyst = ClusterAnalyst(
+            DummyGeneration(),
+            DummyEmbedding(),
+            ClusterAnalystConfig(tokenizer_required=False, allow_regex_tokenizer_fallback=True),
+        )
+        community = ExperienceCommunity(community_id="C0", level=0, member_weights={"t0": 1.0})
+        member = ExperienceItem(item_id="t0", level=0, kind=ITEM_KIND_TRAJECTORY, text="trace", embedding=[1.0])
+        previous = [{"item_id": "old_a", "metadata": {"name": "Old", "trigger": "old", "content": "old", "confidence": 0.9}}]
+        return await analyst.summarize_dynamic_update(community, [member], previous)
+
+    valid_card = {
+        "name": "Card",
+        "trigger": "trigger",
+        "content": "content",
+        "placement": {"target": "skill_md", "reference_kind": "procedure"},
+        "confidence": 0.8,
+    }
+    with pytest.raises(ValueError, match="unknown previous ExperienceCard"):
+        asyncio.run(run_payload({"updates": [{"item_id": "missing", **valid_card}], "new_cards": []}))
+    with pytest.raises(ValueError, match="duplicate ExperienceCard"):
+        asyncio.run(run_payload({"updates": [{"item_id": "old_a", **valid_card}, {"item_id": "old_a", **valid_card}], "new_cards": []}))
+    with pytest.raises(ValueError, match="new_cards must not include item_id"):
+        asyncio.run(run_payload({"updates": [], "new_cards": [{"item_id": "illegal", **valid_card}]}))
+
+
+def test_dynamic_state_reallocates_support_mass_after_update_and_add():
+    from dynamix_core.data_structures import ExperienceCardPatch, ExperienceHierarchyState
+
+    async def run_case():
+        state = ExperienceHierarchyState()
+        await state.initialize_trajectory_items([
+            ExperienceItem(item_id="t0", level=0, kind=ITEM_KIND_TRAJECTORY, text="trace 0", embedding=[1.0]),
+            ExperienceItem(item_id="t1", level=0, kind=ITEM_KIND_TRAJECTORY, text="trace 1", embedding=[2.0]),
+        ])
+        community = ExperienceCommunity(community_id="C0", level=0, member_weights={"t0": 1.0, "t1": 1.0})
+        await state.commit_layer(
+            level=0,
+            communities=[community],
+            generated_items=[
+                ExperienceItem(
+                    item_id="old_a",
+                    level=1,
+                    kind=ITEM_KIND_EXPERIENCE_CARD,
+                    text="old a",
+                    embedding=[1.0],
+                    generated_from_community_ids=["C0"],
+                    metadata={"name": "Old A", "trigger": "a", "content": "a", "confidence": 0.8},
+                ),
+                ExperienceItem(
+                    item_id="old_b",
+                    level=1,
+                    kind=ITEM_KIND_EXPERIENCE_CARD,
+                    text="old b",
+                    embedding=[2.0],
+                    generated_from_community_ids=["C0"],
+                    metadata={"name": "Old B", "trigger": "b", "content": "b", "confidence": 0.2},
+                ),
+            ],
+            stop_reason="split",
+        )
+        result = await state.apply_experience_card_patches(
+            source_community_id="C0",
+            patches=[
+                ExperienceCardPatch(
+                    operation="update",
+                    item_id="old_a",
+                    text="updated old a",
+                    embedding=[3.0],
+                    metadata={"name": "Old A revised", "trigger": "a", "content": "a2", "confidence": 0.5},
+                ),
+                ExperienceCardPatch(
+                    operation="add",
+                    item_id="new_c",
+                    text="new c",
+                    embedding=[4.0],
+                    metadata={"name": "New C", "trigger": "c", "content": "c", "confidence": 0.5},
+                ),
+            ],
+        )
+        items = {item.item_id: item for item in await state.item_objects(["old_a", "old_b", "new_c"])}
+        return result, items
+
+    result, items = asyncio.run(run_case())
+
+    assert result.updated_item_ids == ["old_a"]
+    assert result.added_item_ids == ["new_c"]
+    assert result.requires_reroute_item_ids == ["new_c", "old_a"]
+    assert items["old_a"].support_mass == pytest.approx(2.0 * 0.5 / 1.2)
+    assert items["old_b"].support_mass == pytest.approx(2.0 * 0.2 / 1.2)
+    assert items["new_c"].support_mass == pytest.approx(2.0 * 0.5 / 1.2)
+
+
+def test_dynamic_l0_add_updates_existing_next_layer_inputs():
+    from dynamix_core.data_structures import ExperienceCardPatch, ExperienceHierarchyState
+
+    async def run_case():
+        state = ExperienceHierarchyState()
+        await state.initialize_trajectory_items([
+            ExperienceItem(item_id="t0", level=0, kind=ITEM_KIND_TRAJECTORY, text="trace", embedding=[1.0]),
+        ])
+        await state.commit_layer(
+            level=0,
+            communities=[ExperienceCommunity(community_id="C0", level=0, member_weights={"t0": 1.0})],
+            generated_items=[
+                ExperienceItem(
+                    item_id="old_l1",
+                    level=1,
+                    kind=ITEM_KIND_EXPERIENCE_CARD,
+                    text="old l1",
+                    embedding=[1.0],
+                    generated_from_community_ids=["C0"],
+                    metadata={"name": "Old L1", "trigger": "old", "content": "old", "confidence": 1.0},
+                )
+            ],
+            stop_reason="split",
+        )
+        await state.commit_layer(
+            level=1,
+            communities=[ExperienceCommunity(community_id="L1_C0", level=1, member_weights={"old_l1": 1.0})],
+            generated_items=[
+                ExperienceItem(
+                    item_id="old_l2",
+                    level=2,
+                    kind=ITEM_KIND_EXPERIENCE_CARD,
+                    text="old l2",
+                    embedding=[2.0],
+                    generated_from_community_ids=["L1_C0"],
+                    metadata={"name": "Old L2", "trigger": "old", "content": "old", "confidence": 1.0},
+                )
+            ],
+            stop_reason="split",
+        )
+        before = await state.layer_input_item_ids(1)
+        await state.apply_experience_card_patches(
+            source_community_id="C0",
+            patches=[
+                ExperienceCardPatch(
+                    operation="add",
+                    item_id="new_l1",
+                    text="new l1",
+                    embedding=[3.0],
+                    metadata={"name": "New L1", "trigger": "new", "content": "new", "confidence": 1.0},
+                )
+            ],
+        )
+        after = await state.layer_input_item_ids(1)
+        return before, after
+
+    before, after = asyncio.run(run_case())
+    assert before == ["old_l1"]
+    assert after == ["old_l1", "new_l1"]
+
+
+def test_dynamic_state_rejects_l1_plus_add_patch():
+    from dynamix_core.data_structures import ExperienceCardPatch, ExperienceHierarchyState
+
+    async def run_case():
+        state = ExperienceHierarchyState()
+        await state.initialize_trajectory_items([
+            ExperienceItem(item_id="t0", level=0, kind=ITEM_KIND_TRAJECTORY, text="trace", embedding=[1.0]),
+        ])
+        await state.commit_layer(
+            level=0,
+            communities=[ExperienceCommunity(community_id="C0", level=0, member_weights={"t0": 1.0})],
+            generated_items=[
+                ExperienceItem(
+                    item_id="old_l1",
+                    level=1,
+                    kind=ITEM_KIND_EXPERIENCE_CARD,
+                    text="old l1",
+                    embedding=[1.0],
+                    generated_from_community_ids=["C0"],
+                    metadata={"name": "Old L1", "trigger": "old", "content": "old", "confidence": 1.0},
+                )
+            ],
+            stop_reason="split",
+        )
+        await state.commit_layer(
+            level=1,
+            communities=[ExperienceCommunity(community_id="L1_C0", level=1, member_weights={"old_l1": 1.0})],
+            generated_items=[
+                ExperienceItem(
+                    item_id="old_l2",
+                    level=2,
+                    kind=ITEM_KIND_EXPERIENCE_CARD,
+                    text="old l2",
+                    embedding=[2.0],
+                    generated_from_community_ids=["L1_C0"],
+                    metadata={"name": "Old L2", "trigger": "old", "content": "old", "confidence": 1.0},
+                )
+            ],
+            stop_reason="split",
+        )
+        return await state.apply_experience_card_patches(
+            source_community_id="L1_C0",
+            patches=[
+                ExperienceCardPatch(
+                    operation="add",
+                    item_id="illegal_l2",
+                    text="illegal",
+                    embedding=[3.0],
+                    metadata={"name": "Illegal", "trigger": "illegal", "content": "illegal", "confidence": 1.0},
+                )
+            ],
+        )
+
+    with pytest.raises(ValueError, match="allowed only for L0"):
+        asyncio.run(run_case())
+
+
+def test_dynamic_state_rejects_duplicate_patch_item_ids():
+    from dynamix_core.data_structures import ExperienceCardPatch, ExperienceHierarchyState
+
+    async def run_case(patches):
+        state = ExperienceHierarchyState()
+        await state.initialize_trajectory_items([
+            ExperienceItem(item_id="t0", level=0, kind=ITEM_KIND_TRAJECTORY, text="trace", embedding=[1.0]),
+        ])
+        await state.commit_layer(
+            level=0,
+            communities=[ExperienceCommunity(community_id="C0", level=0, member_weights={"t0": 1.0})],
+            generated_items=[
+                ExperienceItem(
+                    item_id="old_a",
+                    level=1,
+                    kind=ITEM_KIND_EXPERIENCE_CARD,
+                    text="old",
+                    embedding=[1.0],
+                    generated_from_community_ids=["C0"],
+                    metadata={"name": "Old", "trigger": "old", "content": "old", "confidence": 0.9},
+                )
+            ],
+            stop_reason="split",
+        )
+        return await state.apply_experience_card_patches(source_community_id="C0", patches=patches)
+
+    with pytest.raises(ValueError, match="duplicate update patch"):
+        asyncio.run(run_case([
+            ExperienceCardPatch(operation="update", item_id="old_a", text="u1", embedding=[2.0], metadata={"name": "U1", "trigger": "u", "content": "u", "confidence": 0.8}),
+            ExperienceCardPatch(operation="update", item_id="old_a", text="u2", embedding=[3.0], metadata={"name": "U2", "trigger": "u", "content": "u", "confidence": 0.7}),
+        ]))
+    with pytest.raises(ValueError, match="add patch duplicates"):
+        asyncio.run(run_case([
+            ExperienceCardPatch(operation="add", item_id="new_a", text="a1", embedding=[2.0], metadata={"name": "A1", "trigger": "a", "content": "a", "confidence": 0.8}),
+            ExperienceCardPatch(operation="add", item_id="new_a", text="a2", embedding=[3.0], metadata={"name": "A2", "trigger": "a", "content": "a", "confidence": 0.7}),
+        ]))
+
+
+def test_dynamic_prompt_payload_contract_distinguishes_l0_and_l1_plus():
+    from dynamix_core.data_structures import ExperienceHierarchyState
+
+    async def run_case():
+        state = ExperienceHierarchyState()
+        await state.initialize_trajectory_items([
+            ExperienceItem(item_id="t0", level=0, kind=ITEM_KIND_TRAJECTORY, text="trace", embedding=[1.0]),
+        ])
+        await state.commit_layer(
+            level=0,
+            communities=[ExperienceCommunity(community_id="L0_C0", level=0, member_weights={"t0": 1.0})],
+            generated_items=[
+                ExperienceItem(
+                    item_id="e1",
+                    level=1,
+                    kind=ITEM_KIND_EXPERIENCE_CARD,
+                    text="lower card",
+                    embedding=[1.0],
+                    generated_from_community_ids=["L0_C0"],
+                    metadata={"name": "Lower", "trigger": "lower", "content": "lower", "confidence": 0.8},
+                )
+            ],
+            stop_reason="split",
+        )
+        await state.commit_layer(
+            level=1,
+            communities=[ExperienceCommunity(community_id="L1_C0", level=1, member_weights={"e1": 1.0})],
+            generated_items=[
+                ExperienceItem(
+                    item_id="e2",
+                    level=2,
+                    kind=ITEM_KIND_EXPERIENCE_CARD,
+                    text="higher card",
+                    embedding=[2.0],
+                    generated_from_community_ids=["L1_C0"],
+                    metadata={"name": "Higher", "trigger": "higher", "content": "higher", "confidence": 0.9},
+                )
+            ],
+            stop_reason="split",
+        )
+        l0_payload = await state.build_dynamic_prompt_payload((await state.community_objects(["L0_C0"]))[0])
+        l1_payload = await state.build_dynamic_prompt_payload((await state.community_objects(["L1_C0"]))[0])
+        return l0_payload, l1_payload
+
+    l0_payload, l1_payload = asyncio.run(run_case())
+
+    assert l0_payload["contract"]["analyst_mode"] == "raw_extractor"
+    assert l0_payload["contract"]["allowed_patch_operations"] == ["update", "add"]
+    assert "add patches" in l0_payload["contract"]["dynamic_summary_fn"]
+
+    assert l1_payload["contract"]["analyst_mode"] == "experience_abstractor"
+    assert l1_payload["contract"]["allowed_patch_operations"] == ["update"]
+    assert "update patches only" in l1_payload["contract"]["dynamic_summary_fn"]
+    assert "update/add" not in l1_payload["contract"]["dynamic_summary_fn"]
+    assert "update/add" not in l1_payload["contract"]["confidence"]
 
 
 
