@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import sqlite3
 import sys
 import threading
@@ -59,7 +60,7 @@ class GenerationClient:
     def __init__(self, config: GenerationConfig):
         self.config = config
         self._sem = asyncio.Semaphore(max(1, int(config.max_concurrency)))
-        self._counter = 0
+        self._counter = _existing_debug_max_index(config.debug_dir)
         self._debug_lock = threading.Lock()
         if config.debug_dir:
             Path(config.debug_dir).mkdir(parents=True, exist_ok=True)
@@ -76,7 +77,11 @@ class GenerationClient:
     ) -> str:
         async with self._sem:
             body = self._request_extra_body(extra_body)
-            debug_path = self._start_debug(messages, temperature, max_tokens, timeout, body, debug_metadata)
+            debug_payload = self._debug_payload(messages, temperature, max_tokens, timeout, body, debug_metadata)
+            cached = self._reuse_succeeded_debug_response(debug_payload)
+            if cached is not None:
+                return cached
+            debug_path = self._start_debug(debug_payload)
             if self.config.base_url.startswith("mock://"):
                 content = _mock_text(messages)
                 self._finish_debug(debug_path, "succeeded", response=content)
@@ -168,7 +173,7 @@ class GenerationClient:
             ctk.setdefault("enable_thinking", bool(self.config.thinking_mode))
         return body
 
-    def _start_debug(
+    def _debug_payload(
         self,
         messages: list[dict[str, str]],
         temperature: float | None,
@@ -176,13 +181,8 @@ class GenerationClient:
         timeout: float | None,
         extra_body: dict[str, Any],
         debug_metadata: dict[str, Any] | None,
-    ) -> Path | None:
-        if not self.config.debug_dir:
-            return None
-        with self._debug_lock:
-            self._counter += 1
-            path = Path(self.config.debug_dir) / f"generation_{self._counter:05d}.json"
-        payload = {
+    ) -> dict[str, Any]:
+        return {
             "status": "pending",
             "metadata": dict(debug_metadata or {}),
             "request": {
@@ -195,9 +195,46 @@ class GenerationClient:
             },
             "messages": messages,
         }
-        if not _safe_write_debug_json(path, payload):
+
+    def _reuse_succeeded_debug_response(self, payload: dict[str, Any]) -> str | None:
+        if not self.config.debug_dir:
             return None
-        return path
+        debug_dir = Path(self.config.debug_dir)
+        if not debug_dir.exists():
+            return None
+        expected = {
+            "metadata": payload.get("metadata", {}),
+            "request": payload.get("request", {}),
+            "messages": payload.get("messages", []),
+        }
+        for path in sorted(debug_dir.glob("generation_*.json")):
+            cached = _safe_read_debug_json(path)
+            if not cached or cached.get("status") != "succeeded":
+                continue
+            if "response" not in cached:
+                continue
+            actual = {
+                "metadata": cached.get("metadata", {}),
+                "request": cached.get("request", {}),
+                "messages": cached.get("messages", []),
+            }
+            if actual == expected:
+                return str(cached.get("response") or "")
+        return None
+
+    def _start_debug(self, payload: dict[str, Any]) -> Path | None:
+        if not self.config.debug_dir:
+            return None
+        while True:
+            with self._debug_lock:
+                self._counter += 1
+                path = Path(self.config.debug_dir) / f"generation_{self._counter:05d}.json"
+            created = _safe_write_debug_json_exclusive(path, payload)
+            if created is True:
+                return path
+            if created is False:
+                continue
+            return None
 
     def _finish_debug(self, path: Path | None, status: str, *, response: str | None = None, error: Exception | None = None) -> None:
         if path is None:
@@ -339,12 +376,45 @@ def _safe_read_debug_json(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _existing_debug_max_index(debug_dir: str | None) -> int:
+    if not debug_dir:
+        return 0
+    path = Path(debug_dir)
+    if not path.exists():
+        return 0
+    max_index = 0
+    for debug_file in path.glob("generation_*.json"):
+        stem = debug_file.stem
+        try:
+            max_index = max(max_index, int(stem.removeprefix("generation_")))
+        except ValueError:
+            continue
+    return max_index
+
+
 def _safe_write_debug_json(path: Path, payload: dict[str, Any]) -> bool:
     try:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as exc:
         _debug_io_warning(path, "write", exc)
         return False
+    return True
+
+
+def _safe_write_debug_json_exclusive(path: Path, payload: dict[str, Any]) -> bool | None:
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        return False
+    except Exception as exc:
+        _debug_io_warning(path, "exclusive_create", exc)
+        return None
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        _debug_io_warning(path, "exclusive_write", exc)
+        return None
     return True
 
 

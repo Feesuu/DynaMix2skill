@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import multiprocessing as mp
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +40,23 @@ def test_embedding_truncates_to_configured_32k_budget_with_tokenizer(tmp_path):
 
 async def async_embed(client, texts):
     return await client.embed_texts(texts)
+
+
+def _generation_debug_process_worker(debug_dir: str, label: str, barrier) -> None:
+    client = GenerationClient(
+        GenerationConfig(
+            base_url="mock://deterministic",
+            debug_dir=debug_dir,
+            thinking_mode=False,
+        )
+    )
+    barrier.wait()
+    asyncio.run(
+        client.chat_text(
+            [{"role": "user", "content": f"Return only OK from {label}."}],
+            debug_metadata={"worker": label},
+        )
+    )
 
 
 def test_generation_debug_is_written_before_failed_request(tmp_path, monkeypatch):
@@ -79,6 +97,82 @@ def test_generation_debug_records_effective_timeout(tmp_path):
 
     payload = json.loads(next(tmp_path.glob("generation_*.json")).read_text())
     assert payload["request"]["timeout_seconds"] == 12.5
+
+
+def test_generation_debug_reuses_succeeded_response_and_continues_numbering(tmp_path, monkeypatch):
+    messages = [{"role": "user", "content": "summarize C0"}]
+    cached_payload = {
+        "status": "succeeded",
+        "metadata": {"community_id": "C0"},
+        "request": {
+            "model": "Qwen3.5-9B",
+            "base_url": "http://example.invalid/v1",
+            "temperature": 0.6,
+            "max_tokens": None,
+            "timeout_seconds": 600.0,
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        },
+        "messages": messages,
+        "response": "{\"cards\": []}",
+    }
+    (tmp_path / "generation_00007.json").write_text(json.dumps(cached_payload), encoding="utf-8")
+    client = GenerationClient(
+        GenerationConfig(
+            base_url="http://example.invalid/v1",
+            debug_dir=str(tmp_path),
+            thinking_mode=False,
+        )
+    )
+
+    def fail_if_called(*args, **kwargs):
+        raise RuntimeError("remote should not be called for cached generation")
+
+    monkeypatch.setattr(client, "_chat_text_sync", fail_if_called)
+    text = asyncio.run(client.chat_text(messages, debug_metadata={"community_id": "C0"}))
+    assert text == "{\"cards\": []}"
+    assert not (tmp_path / "generation_00008.json").exists()
+
+    monkeypatch.setattr(client, "_chat_text_sync", lambda *args, **kwargs: "fresh")
+    fresh = asyncio.run(client.chat_text([{"role": "user", "content": "summarize C1"}], debug_metadata={"community_id": "C1"}))
+    assert fresh == "fresh"
+    fresh_payload = json.loads((tmp_path / "generation_00008.json").read_text())
+    assert fresh_payload["status"] == "succeeded"
+    assert fresh_payload["metadata"]["community_id"] == "C1"
+
+
+def test_generation_debug_numbering_is_cross_process_safe(tmp_path):
+    (tmp_path / "generation_00007.json").write_text(
+        json.dumps({"status": "succeeded", "metadata": {"seed": True}, "request": {}, "messages": [], "response": "cached"}),
+        encoding="utf-8",
+    )
+    ctx = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context()
+    barrier = ctx.Barrier(2, timeout=10)
+    processes = [
+        ctx.Process(target=_generation_debug_process_worker, args=(str(tmp_path), f"p{index}", barrier))
+        for index in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=20)
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+
+    assert [process.exitcode for process in processes] == [0, 0]
+    payloads = {
+        path.name: json.loads(path.read_text())
+        for path in sorted(tmp_path.glob("generation_*.json"))
+    }
+    assert "generation_00008.json" in payloads
+    assert "generation_00009.json" in payloads
+    workers = sorted(
+        payload["metadata"].get("worker")
+        for name, payload in payloads.items()
+        if name in {"generation_00008.json", "generation_00009.json"}
+    )
+    assert workers == ["p0", "p1"]
 
 
 def test_cluster_analyst_passes_generation_debug_metadata(tmp_path):
