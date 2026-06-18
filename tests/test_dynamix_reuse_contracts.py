@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import importlib.util
 import multiprocessing as mp
 import os
 from pathlib import Path
@@ -12,8 +13,17 @@ import pytest
 from dynamix_trace2skill.clients import EmbeddingClient, EmbeddingConfig, GenerationClient, GenerationConfig
 from dynamix_trace2skill.summary import ClusterAnalyst, ClusterAnalystConfig
 from dynamix_trace2skill.log_parser import parse_trace2skill_logs, _result_fields
-from dynamix_trace2skill.pipeline import default_hierarchy_config
+from dynamix_trace2skill.pipeline import DynaMixRunConfig, default_hierarchy_config
 from dynamix_core.data_structures import ExperienceCommunity, ExperienceItem, ITEM_KIND_EXPERIENCE_CARD, ITEM_KIND_TRAJECTORY
+
+
+def _load_experiment_runner_module():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "run_dynamix_trace2skill_experiment.py"
+    spec = importlib.util.spec_from_file_location("run_dynamix_trace2skill_experiment", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_embedding_truncates_to_configured_32k_budget_with_tokenizer(tmp_path):
@@ -249,7 +259,7 @@ def test_default_hierarchy_config_is_real_not_tiny_smoke():
 
     cfg = default_hierarchy_config({})
     assert cfg.gmm_bic.min_split_size == 4
-    assert cfg.gmm_bic.min_effective_samples_per_component == 4
+    assert cfg.gmm_bic.min_effective_samples_per_component == 2
     assert cfg.gmm_bic.abs_kmax == 64
     assert cfg.gmm_bic.num_restarts == 5
     assert cfg.soft_membership.recursive_assignment == "cumulative_mass"
@@ -260,6 +270,51 @@ def test_default_hierarchy_config_is_real_not_tiny_smoke():
     direct_cfg = ProjectedGmmDynamicTreeConfig.from_mapping({})
     assert direct_cfg.soft_membership.recursive_assignment == "cumulative_mass"
     assert direct_cfg.soft_membership.cumulative_mass_coverage == pytest.approx(0.90)
+
+
+def test_default_dynamic_protocol_is_train200_sixty_forty_batches():
+    cfg = DynaMixRunConfig(output_dir="out", records_path="records.json")
+    assert cfg.dynamic.initial_count == 120
+    assert cfg.dynamic.update_batch_size == 8
+    assert cfg.dynamic.update_batch_count == 10
+    assert cfg.dynamic.initial_count + cfg.dynamic.update_batch_size * cfg.dynamic.update_batch_count == 200
+
+
+def test_experiment_runner_tree_resume_requires_matching_fingerprint(tmp_path):
+    runner = _load_experiment_runner_module()
+    marker = tmp_path / "04_build_tree.done"
+    output = tmp_path / "summary.json"
+    output.write_text("{}", encoding="utf-8")
+    marker.write_text(json.dumps({"fingerprint": {"scenario": "dynamic_update"}}), encoding="utf-8")
+
+    assert runner.stage_done(marker, [output], fingerprint={"scenario": "dynamic_update"})
+    assert not runner.stage_done(marker, [output], fingerprint={"scenario": "static_build"})
+    marker.write_text(json.dumps({"stage": "04_build_tree"}), encoding="utf-8")
+    assert not runner.stage_done(marker, [output], fingerprint={"scenario": "dynamic_update"})
+
+
+def test_experiment_runner_rejects_wrong_tree_summary_before_heldout():
+    runner = _load_experiment_runner_module()
+    args = SimpleNamespace(
+        tree_scenario="dynamic_update",
+        dynamic_initial_count=120,
+        dynamic_update_batch_size=8,
+        dynamic_update_batch_count=10,
+    )
+    runner.validate_tree_summary_for_heldout(
+        {"scenario": "dynamic_update", "record_count": 200, "initial_count": 120, "updated_count": 80, "batch_count": 10},
+        args,
+    )
+    with pytest.raises(RuntimeError, match="scenario mismatch"):
+        runner.validate_tree_summary_for_heldout(
+            {"scenario": "static_build", "record_count": 200},
+            args,
+        )
+    with pytest.raises(RuntimeError, match="dynamic summary mismatch"):
+        runner.validate_tree_summary_for_heldout(
+            {"scenario": "dynamic_update", "record_count": 200, "initial_count": 160, "updated_count": 40, "batch_count": 4},
+            args,
+        )
 
 
 def test_log_parser_recurses_and_loads_multiple_result_shapes(tmp_path):
@@ -363,6 +418,56 @@ def test_budget_refinement_excludes_oversize_singleton_from_active_layer():
     assert skipped[0]["reason"] == "oversize_singleton"
 
 
+def test_budget_refinement_falls_back_to_token_packing_when_gmm_cannot_split():
+    from dynamix_core.tree_builder import ProjectedGmmTreeBuilder
+
+    cfg = default_hierarchy_config({
+        "summary_budget": {"max_model_tokens": 100, "budget_ratio": 0.5},
+        "gmm_bic": {"min_split_size": 99, "min_effective_samples_per_component": 2},
+    })
+    items = [
+        ExperienceItem(item_id="a", level=0, kind=ITEM_KIND_TRAJECTORY, text="a", embedding=[1.0, 0.0], metadata={"analysis_token_count": 30}),
+        ExperienceItem(item_id="b", level=0, kind=ITEM_KIND_TRAJECTORY, text="b", embedding=[0.9, 0.1], metadata={"analysis_token_count": 20}),
+        ExperienceItem(item_id="c", level=0, kind=ITEM_KIND_TRAJECTORY, text="c", embedding=[0.0, 1.0], metadata={"analysis_token_count": 20}),
+        ExperienceItem(item_id="d", level=0, kind=ITEM_KIND_TRAJECTORY, text="d", embedding=[0.1, 0.9], metadata={"analysis_token_count": 10}),
+    ]
+    clustering = asyncio.run(ProjectedGmmTreeBuilder(cfg).cluster_layer(items, level=0))
+    assert clustering.excluded_input_item_ids == []
+    assert len(clustering.communities) == 2
+    assert sorted(sum(community.member_weights.values()) for community in clustering.communities) == [2.0, 2.0]
+    assert {community.metadata["fallback_kind"] for community in clustering.communities} == {"token_packing_leaf"}
+    assert {community.clustering_method for community in clustering.communities} == {"budget_fallback_token_packing_leaf"}
+    assert max(community.metadata["prompt_token_cost"] for community in clustering.communities) <= 50
+    tree = clustering.summary_budget["refinement_routing_tree"]
+    router = next(node for node in tree["nodes"].values() if node["kind"] == "fallback_token_router")
+    assert router["routing_model_kind"] == "fallback_centroid_softmax_v1"
+    assert router["routing_temperature"] == pytest.approx(8.0)
+    assert "singleton_budget" not in router
+
+
+def test_budget_refinement_excludes_only_true_oversize_singleton_after_fallback():
+    from dynamix_core.tree_builder import ProjectedGmmTreeBuilder
+
+    cfg = default_hierarchy_config({
+        "summary_budget": {"max_model_tokens": 100, "budget_ratio": 0.8, "prompt_overhead_reserve_tokens": 30},
+        "gmm_bic": {"min_split_size": 99, "min_effective_samples_per_component": 2},
+    })
+    items = [
+        ExperienceItem(item_id="too_big", level=0, kind=ITEM_KIND_TRAJECTORY, text="big", embedding=[1.0, 0.0], metadata={"analysis_token_count": 60}),
+        ExperienceItem(item_id="keep_1", level=0, kind=ITEM_KIND_TRAJECTORY, text="k1", embedding=[0.0, 1.0], metadata={"analysis_token_count": 40}),
+        ExperienceItem(item_id="keep_2", level=0, kind=ITEM_KIND_TRAJECTORY, text="k2", embedding=[0.1, 0.9], metadata={"analysis_token_count": 40}),
+    ]
+    clustering = asyncio.run(ProjectedGmmTreeBuilder(cfg).cluster_layer(items, level=0))
+    assert clustering.excluded_input_item_ids == ["too_big"]
+    assert sorted(item_id for community in clustering.communities for item_id in community.member_weights) == ["keep_1", "keep_2"]
+    skipped = clustering.summary_budget["excluded_oversize_singletons"]
+    assert len(skipped) == 1
+    assert skipped[0]["item_id"] == "too_big"
+    assert skipped[0]["reason"] == "oversize_singleton"
+    assert skipped[0]["budget"] == 50
+    assert "singleton_budget" not in skipped[0]
+
+
 def test_cluster_analyst_skips_diagnostic_oversize_singleton():
     analyst = ClusterAnalyst(None, None, ClusterAnalystConfig(tokenizer_required=False, allow_regex_tokenizer_fallback=True))  # type: ignore[arg-type]
     community = ExperienceCommunity(
@@ -430,6 +535,50 @@ def test_refinement_routing_masks_excluded_child_and_uses_next_active_leaf():
     )
     assert selected == {"L0_C0_R000": pytest.approx(1.0)}
     assert posterior == {"L0_C0_R000": pytest.approx(1.0)}
+
+
+def test_refinement_fallback_router_routes_to_token_packing_leaf():
+    from dynamix_core.config import SoftMembershipConfig
+    from dynamix_core.update import _route_through_refinement_tree
+
+    item = ExperienceItem(
+        item_id="new_t",
+        level=0,
+        kind=ITEM_KIND_TRAJECTORY,
+        text="new trace",
+        embedding=[1.0, 0.0],
+    )
+    tree = {
+        "coarse_roots": {"L0_C0": "router"},
+        "nodes": {
+            "router": {
+                "node_id": "router",
+                "kind": "fallback_token_router",
+                "child_node_ids": ["leaf_a", "leaf_b"],
+            },
+            "leaf_a": {"node_id": "leaf_a", "kind": "token_packing_leaf", "community_id": "L0_C0_R000", "centroid_embedding": [1.0, 0.0]},
+            "leaf_b": {"node_id": "leaf_b", "kind": "singleton_leaf", "community_id": "L0_C0_R001", "centroid_embedding": [0.0, 1.0]},
+        },
+    }
+    selected = _route_through_refinement_tree(
+        item=item,
+        coarse_community_id="L0_C0",
+        coarse_weight=1.0,
+        tree=tree,
+        soft_config=SoftMembershipConfig(recursive_assignment="cumulative_mass", cumulative_mass_coverage=0.9),
+        selected_only=True,
+    )
+    posterior = _route_through_refinement_tree(
+        item=item,
+        coarse_community_id="L0_C0",
+        coarse_weight=1.0,
+        tree=tree,
+        soft_config=SoftMembershipConfig(recursive_assignment="cumulative_mass", cumulative_mass_coverage=0.9),
+        selected_only=False,
+    )
+    assert set(selected) == {"L0_C0_R000"}
+    assert selected["L0_C0_R000"] > 0.99
+    assert posterior["L0_C0_R000"] > posterior["L0_C0_R001"]
 
 
 def test_dynamic_route_masks_removed_coarse_community_and_uses_next_active_cluster():
@@ -682,20 +831,26 @@ def test_dynamic_analyst_updates_only_explicit_previous_card_ids():
     assert patches[0].metadata["dynamic_patch_operation"] == "update"
 
 
-def test_dynamic_analyst_higher_level_prompt_is_updates_only_and_rejects_legacy_card_output():
+def test_dynamic_analyst_higher_level_prompt_is_updates_only_and_skips_unrepairable_legacy_card_output():
     from dynamix_trace2skill.summary import ClusterAnalyst, ClusterAnalystConfig
 
     class DummyGeneration:
         def __init__(self, payload):
-            self.messages = None
+            self.messages = []
+            self.kwargs = []
             self.payload = payload
 
         async def chat_json(self, messages, *, schema_name, **kwargs):
-            self.messages = messages
+            self.messages.append(messages)
+            self.kwargs.append(kwargs)
             return self.payload
 
     class DummyEmbedding:
+        def __init__(self):
+            self.calls = 0
+
         async def embed_texts(self, texts, *, cache_namespace=None):
+            self.calls += 1
             return [[1.0] for _ in texts]
 
     legacy_card = {
@@ -721,21 +876,158 @@ def test_dynamic_analyst_higher_level_prompt_is_updates_only_and_rejects_legacy_
 
     for payload in ({"new_cards": [legacy_card]}, {"cards": [legacy_card]}, legacy_card):
         generation = DummyGeneration(payload)
+        embedding = DummyEmbedding()
         analyst = ClusterAnalyst(
             generation,
-            DummyEmbedding(),
+            embedding,
             ClusterAnalystConfig(tokenizer_required=False, allow_regex_tokenizer_fallback=True),
         )
 
-        with pytest.raises(ValueError, match="only 'updates'"):
-            asyncio.run(analyst.summarize_dynamic_update(community, [member], previous))
+        patches = asyncio.run(analyst.summarize_dynamic_update(community, [member], previous))
 
-        prompt = generation.messages[1]["content"]
+        assert patches == []
+        assert embedding.calls == 0
+        assert len(generation.messages) == 3
+        assert all(call["retries"] == 0 for call in generation.kwargs)
+        assert analyst.config.token_report[-1]["event"] == "dynamic_schema_repair"
+        assert analyst.config.token_report[-1]["status"] == "ignored_invalid_llm_output"
+        assert analyst.config.token_report[-1]["action"] == "skip_invalid_dynamic_update"
+        prompt = generation.messages[0][1]["content"]
         assert "new_cards" not in prompt
         assert "Return a top-level JSON object with only updates." in prompt
-        system_prompt = generation.messages[0]["content"]
+        system_prompt = generation.messages[0][0]["content"]
         assert "new_cards" not in system_prompt
         assert "top-level cards list" not in system_prompt
+        assert all("new_cards" not in message["content"] for messages in generation.messages for message in messages)
+
+
+def test_dynamic_analyst_higher_level_repairs_legacy_schema_and_accepts_update():
+    from dynamix_trace2skill.summary import ClusterAnalyst, ClusterAnalystConfig
+
+    valid_update = {
+        "item_id": "old_l2",
+        "name": "Repaired high-level abstraction",
+        "trigger": "When lower-level cards share the repaired pattern.",
+        "content": "Use the explicit old item_id and update only the existing abstraction.",
+        "placement": {"target": "skill_md", "reference_kind": "procedure"},
+        "confidence": 0.8,
+    }
+
+    class DummyGeneration:
+        def __init__(self):
+            self.messages = []
+            self.kwargs = []
+            self.payloads = [
+                {
+                    "cards": [{
+                        "name": "Legacy shape",
+                        "trigger": "legacy",
+                        "content": "legacy",
+                        "placement": {"target": "skill_md", "reference_kind": "procedure"},
+                        "confidence": 0.5,
+                    }]
+                },
+                {"updates": [valid_update]},
+            ]
+
+        async def chat_json(self, messages, *, schema_name, **kwargs):
+            self.messages.append(messages)
+            self.kwargs.append(kwargs)
+            return self.payloads.pop(0)
+
+    class DummyEmbedding:
+        async def embed_texts(self, texts, *, cache_namespace=None):
+            return [[4.0] for _ in texts]
+
+    generation = DummyGeneration()
+    analyst = ClusterAnalyst(
+        generation,
+        DummyEmbedding(),
+        ClusterAnalystConfig(tokenizer_required=False, allow_regex_tokenizer_fallback=True),
+    )
+    community = ExperienceCommunity(community_id="L1_C0", level=1, member_weights={"e1": 1.0})
+    member = ExperienceItem(
+        item_id="e1",
+        level=1,
+        kind=ITEM_KIND_EXPERIENCE_CARD,
+        text="lower card",
+        embedding=[1.0],
+        metadata={"name": "Lower", "trigger": "lower", "content": "lower", "confidence": 0.8},
+    )
+    previous = [{
+        "item_id": "old_l2",
+        "metadata": {"name": "Old L2", "trigger": "old", "content": "old", "confidence": 0.9},
+    }]
+
+    patches = asyncio.run(analyst.summarize_dynamic_update(community, [member], previous))
+
+    assert len(patches) == 1
+    assert patches[0].operation == "update"
+    assert patches[0].item_id == "old_l2"
+    assert patches[0].metadata["dynamic_patch_operation"] == "update"
+    assert len(generation.messages) == 2
+    assert all(call["retries"] == 0 for call in generation.kwargs)
+    assert generation.messages[1][-1]["role"] == "user"
+    assert "required_top_level_schema" in generation.messages[1][-1]["content"]
+    assert "new_cards" not in generation.messages[1][-1]["content"]
+    assert analyst.config.token_report[-1]["event"] == "dynamic_schema_repair"
+    assert analyst.config.token_report[-1]["status"] == "retry"
+
+
+def test_dynamic_analyst_higher_level_skips_unrepairable_json_parse_failure():
+    from dynamix_trace2skill.summary import ClusterAnalyst, ClusterAnalystConfig
+
+    class DummyGeneration:
+        def __init__(self):
+            self.calls = 0
+            self.messages = []
+            self.kwargs = []
+
+        async def chat_json(self, messages, *, schema_name, **kwargs):
+            self.calls += 1
+            self.messages.append(messages)
+            self.kwargs.append(kwargs)
+            raise ValueError("failed to parse JSON for DynamicExperienceCardPatchSet")
+
+    class DummyEmbedding:
+        def __init__(self):
+            self.calls = 0
+
+        async def embed_texts(self, texts, *, cache_namespace=None):
+            self.calls += 1
+            return [[1.0] for _ in texts]
+
+    generation = DummyGeneration()
+    embedding = DummyEmbedding()
+    analyst = ClusterAnalyst(
+        generation,
+        embedding,
+        ClusterAnalystConfig(tokenizer_required=False, allow_regex_tokenizer_fallback=True, max_prompt_tokens=100000),
+    )
+    community = ExperienceCommunity(community_id="L1_C0", level=1, member_weights={"e1": 1.0})
+    member = ExperienceItem(
+        item_id="e1",
+        level=1,
+        kind=ITEM_KIND_EXPERIENCE_CARD,
+        text="lower card",
+        embedding=[1.0],
+        metadata={"name": "Lower", "trigger": "lower", "content": "lower", "confidence": 0.8},
+    )
+    previous = [{
+        "item_id": "old_l2",
+        "metadata": {"name": "Old L2", "trigger": "old", "content": "old", "confidence": 0.9},
+    }]
+
+    patches = asyncio.run(analyst.summarize_dynamic_update(community, [member], previous))
+
+    assert patches == []
+    assert generation.calls == 3
+    assert all(call["retries"] == 0 for call in generation.kwargs)
+    assert embedding.calls == 0
+    assert any(event.get("event") == "dynamic_schema_repair_prompt" for event in analyst.config.token_report)
+    assert analyst.config.token_report[-1]["event"] == "dynamic_schema_repair"
+    assert analyst.config.token_report[-1]["status"] == "ignored_invalid_llm_output"
+    assert analyst.config.token_report[-1]["action"] == "skip_invalid_dynamic_update"
 
 
 def test_dynamic_analyst_higher_level_accepts_explicit_updates():

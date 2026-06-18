@@ -26,9 +26,9 @@ from .skillbank import SkillBankSelector
 
 @dataclass
 class DynamicPipelineConfig:
-    initial_count: int = 160
-    update_batch_size: int = 10
-    update_batch_count: int = 4
+    initial_count: int = 120
+    update_batch_size: int = 8
+    update_batch_count: int = 10
     max_propagation_rounds: int = 16
 
 
@@ -84,7 +84,7 @@ def default_hierarchy_config(payload: dict[str, Any] | None = None) -> Projected
             "tol": 1.0e-4,
             "min_covar": 1.0e-6,
             "min_split_size": 4,
-            "min_effective_samples_per_component": 4,
+            "min_effective_samples_per_component": 2,
             "abs_kmax": 64,
             "max_concurrent_candidates": 1,
             "max_concurrent_restarts": 1,

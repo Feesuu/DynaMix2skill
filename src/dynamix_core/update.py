@@ -20,6 +20,7 @@ from .projection import normalize_rows, project_with_basis
 
 EmbedFn = Callable[[Sequence[ExperienceItem]], dict[str, list[float]] | Awaitable[dict[str, list[float]]]]
 DynamicSummaryFn = Callable[["DynamicCommunityContext"], Iterable[ExperienceCardPatch] | Awaitable[Iterable[ExperienceCardPatch]]]
+FALLBACK_ROUTING_TEMPERATURE = 8.0
 
 
 @dataclass(frozen=True)
@@ -537,12 +538,29 @@ def _route_through_refinement_tree(
             continue
         node = dict(nodes.get(node_id, {}))
         kind = str(node.get("kind", ""))
-        if kind == "leaf":
+        if _is_refinement_leaf_kind(kind):
             community_id = str(node.get("community_id", ""))
             if community_id:
                 leaves[community_id] = leaves.get(community_id, 0.0) + float(weight)
             continue
         if kind.startswith("excluded_"):
+            continue
+        if kind == "fallback_token_router":
+            child_ids = [
+                str(child_id)
+                for child_id in node.get("child_node_ids", [])
+                if _refinement_node_has_active_leaf(nodes, str(child_id))
+            ]
+            child_weights = _fallback_router_child_weights(
+                item=item,
+                nodes=nodes,
+                child_ids=child_ids,
+                selected_only=selected_only,
+                soft_config=soft_config,
+                temperature=float(node.get("routing_temperature", FALLBACK_ROUTING_TEMPERATURE)),
+            )
+            for child_id, child_weight in child_weights.items():
+                pending[child_id] = pending.get(child_id, 0.0) + float(weight) * float(child_weight)
             continue
         if kind != "gmm_split":
             raise ValueError(f"unsupported refinement routing node kind={kind!r}")
@@ -629,7 +647,7 @@ def _refinement_leaf_to_coarse_map(tree: dict[str, Any] | None) -> dict[str, str
                 continue
             seen.add(node_id)
             node = dict(nodes.get(node_id, {}))
-            if str(node.get("kind", "")) == "leaf" and node.get("community_id"):
+            if _is_refinement_leaf_kind(str(node.get("kind", ""))) and node.get("community_id"):
                 mapping[str(node["community_id"])] = str(coarse_id)
             else:
                 pending.extend(str(child_id) for child_id in node.get("child_node_ids", []))
@@ -642,7 +660,7 @@ def _refinement_node_has_active_leaf(nodes: dict[str, Any], node_id: str, memo: 
         return memo[node_id]
     node = dict(nodes.get(node_id, {}))
     kind = str(node.get("kind", ""))
-    if kind == "leaf":
+    if _is_refinement_leaf_kind(kind):
         result = bool(node.get("community_id"))
     elif kind.startswith("excluded_") or not node:
         result = False
@@ -650,6 +668,52 @@ def _refinement_node_has_active_leaf(nodes: dict[str, Any], node_id: str, memo: 
         result = any(_refinement_node_has_active_leaf(nodes, str(child_id), memo) for child_id in node.get("child_node_ids", []))
     memo[node_id] = result
     return result
+
+
+def _is_refinement_leaf_kind(kind: str) -> bool:
+    return kind in {"leaf", "token_packing_leaf", "singleton_leaf"}
+
+
+def _fallback_router_child_weights(
+    *,
+    item: ExperienceItem,
+    nodes: dict[str, Any],
+    child_ids: list[str],
+    selected_only: bool,
+    soft_config: SoftMembershipConfig,
+    temperature: float = FALLBACK_ROUTING_TEMPERATURE,
+) -> dict[str, float]:
+    if not child_ids:
+        return {}
+    if len(child_ids) == 1:
+        return {child_ids[0]: 1.0}
+    centroids = []
+    active_ids = []
+    for child_id in child_ids:
+        centroid = nodes.get(child_id, {}).get("centroid_embedding")
+        if centroid:
+            centroids.append(centroid)
+            active_ids.append(child_id)
+    if not active_ids:
+        weight = 1.0 / float(len(child_ids))
+        return {child_id: weight for child_id in child_ids}
+    item_vec = normalize_rows(np.asarray([item.embedding], dtype=float))
+    centroid_vecs = normalize_rows(np.asarray(centroids, dtype=float))
+    scores = np.matmul(item_vec, centroid_vecs.T)[0]
+    shifted = scores - float(np.max(scores))
+    probs = np.exp(shifted * float(temperature))
+    total = float(np.sum(probs))
+    if total <= 0.0 or not np.isfinite(total):
+        probs = np.ones(len(active_ids), dtype=float) / float(len(active_ids))
+    else:
+        probs = probs / total
+    if selected_only:
+        return membership_weight_dicts([item.item_id], active_ids, probs.reshape(1, -1), soft_config)[item.item_id]
+    return {
+        child_id: float(probs[index])
+        for index, child_id in enumerate(active_ids)
+        if float(probs[index]) > 1.0e-12
+    }
 
 
 def _renormalize_responsibility_columns(values: np.ndarray) -> np.ndarray:

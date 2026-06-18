@@ -1,5 +1,5 @@
 {
-  "scenario": "static_build",
+  "scenario": "dynamic_update",
   "output_dir": "/mnt/data/yaodong/codes/DynaMix2skill/runs/qwen_train200_tree_main_001",
   "records_path": "/mnt/data/yaodong/codes/DynaMix2skill/runs/qwen_cli_only_train200_001/records.json",
   "generation": {
@@ -56,7 +56,7 @@
       "tol": 0.0001,
       "min_covar": 1e-06,
       "min_split_size": 4,
-      "min_effective_samples_per_component": 4,
+      "min_effective_samples_per_component": 2,
       "abs_kmax": 64,
       "max_concurrent_candidates": 1,
       "max_concurrent_restarts": 1
@@ -81,6 +81,12 @@
       "prompt_overhead_reserve_tokens": 8000
     },
     "random_seed": 42
+  },
+  "dynamic": {
+    "initial_count": 120,
+    "update_batch_size": 8,
+    "update_batch_count": 10,
+    "max_propagation_rounds": 16
   },
   "analyst": {
     "prompt_style": "trace2skill_cluster_level_v2",

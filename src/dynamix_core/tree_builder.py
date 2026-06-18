@@ -533,23 +533,20 @@ class ProjectedGmmTreeBuilder:
                 serial_start=node_serial,
             )
             if not split.get("accepted"):
-                for item_id in node_item_ids:
-                    excluded[item_id] = {
-                        "item_id": item_id,
-                        "source_community_id": community.community_id,
-                        "node_id": node["node_id"],
-                        "token_cost": int(node_token_cost),
-                        "budget": int(token_budget),
-                        "reason": "oversize_unsplittable",
-                    }
-                routing_nodes[node["node_id"]] = {
-                    "node_id": node["node_id"],
-                    "kind": "excluded_unsplittable",
-                    "item_ids": node_item_ids,
-                    "token_cost": int(node_token_cost),
-                    "budget": int(token_budget),
-                    "last_rejection": split,
-                }
+                fallback = self._fallback_overbudget_node(
+                    community,
+                    node,
+                    items_by_id=items_by_id,
+                    token_counts=token_counts,
+                    token_budget=token_budget,
+                    split_rejection=split,
+                    serial_start=node_serial,
+                )
+                final_specs.extend(fallback["final_specs"])
+                excluded.update(fallback["excluded"])
+                routing_nodes.update(fallback["routing_nodes"])
+                split_events.append(fallback["event"])
+                node_serial += int(fallback["node_count"])
                 continue
 
             children = list(split["children"])
@@ -569,20 +566,39 @@ class ProjectedGmmTreeBuilder:
             if not member_weights:
                 continue
             success_count, failure_count, outcome_mode = _outcome_counts([items_by_id[item_id] for item_id in member_weights])
-            routing_nodes[spec["source_node_id"]] = {
+            routing_kind = str(spec.get("routing_kind", "leaf"))
+            routing_payload = {
                 "node_id": spec["source_node_id"],
-                "kind": "leaf",
+                "kind": routing_kind,
                 "community_id": community_id,
                 "source_community_id": community.community_id,
                 "token_cost": int(spec["token_cost"]),
                 "refinement_depth": int(spec["refinement_depth"]),
+            }
+            if routing_kind in {"token_packing_leaf", "singleton_leaf"}:
+                routing_payload.update({
+                    "item_ids": list(member_weights),
+                    "fallback_parent_node_id": spec.get("fallback_parent_node_id"),
+                    "fallback_reason": spec.get("fallback_reason"),
+                    "centroid_embedding": _centroid_embedding(items_by_id, list(member_weights)),
+                    "token_budget": int(token_budget),
+                })
+            routing_nodes[spec["source_node_id"]] = routing_payload
+            fallback_metadata = {
+                key: value
+                for key, value in {
+                    "fallback_kind": spec.get("routing_kind"),
+                    "fallback_parent_node_id": spec.get("fallback_parent_node_id"),
+                    "fallback_reason": spec.get("fallback_reason"),
+                }.items()
+                if value is not None
             }
             final_communities.append(ExperienceCommunity(
                 community_id=community_id,
                 level=level,
                 member_weights=member_weights,
                 posterior_member_weights=dict(member_weights),
-                clustering_method="budget_refined_weighted_gmm_bic_leaf",
+                clustering_method=str(spec.get("clustering_method", "budget_refined_weighted_gmm_bic_leaf")),
                 support_mass=_support_mass(items_by_id, member_weights),
                 outcome_mode=outcome_mode,
                 success_count=success_count,
@@ -594,7 +610,8 @@ class ProjectedGmmTreeBuilder:
                     "refinement_depth": int(spec["refinement_depth"]),
                     "prompt_token_cost": int(spec["token_cost"]),
                     "budget": int(token_budget),
-                    "split_reason": "budget_refinement_leaf",
+                    "split_reason": str(spec.get("split_reason", "budget_refinement_leaf")),
+                    **fallback_metadata,
                 },
             ))
             final_members[community_id] = list(member_weights)
@@ -606,6 +623,118 @@ class ProjectedGmmTreeBuilder:
             "excluded": excluded,
             "routing_nodes": routing_nodes,
             "split_events": split_events,
+        }
+
+    def _fallback_overbudget_node(
+        self,
+        community: ExperienceCommunity,
+        node: dict[str, Any],
+        *,
+        items_by_id: dict[str, ExperienceItem],
+        token_counts: dict[str, int],
+        token_budget: int,
+        split_rejection: dict[str, Any],
+        serial_start: int,
+    ) -> dict[str, Any]:
+        node_item_ids = list(node["item_ids"])
+        path_weights = dict(node["path_weights"])
+        packs: list[list[str]] = []
+        pack_costs: list[int] = []
+        excluded: dict[str, dict[str, Any]] = {}
+        routing_nodes: dict[str, Any] = {}
+        child_node_ids: list[str] = []
+        original_order = {item_id: index for index, item_id in enumerate(node_item_ids)}
+
+        def add_child_node_id() -> str:
+            child_id = f"{node['node_id']}_F{serial_start + len(child_node_ids)}"
+            child_node_ids.append(child_id)
+            return child_id
+
+        sortable_ids = sorted(node_item_ids, key=lambda item_id: (-int(token_counts.get(item_id, 0)), original_order[item_id]))
+        for item_id in sortable_ids:
+            count = int(token_counts.get(item_id, 0))
+            if count > token_budget:
+                child_id = add_child_node_id()
+                excluded[item_id] = {
+                    "item_id": item_id,
+                    "source_community_id": community.community_id,
+                    "node_id": child_id,
+                    "source_node_id": node["node_id"],
+                    "token_cost": count,
+                    "budget": int(token_budget),
+                    "reason": "oversize_singleton",
+                    "fallback_reason": split_rejection.get("reason"),
+                }
+                routing_nodes[child_id] = {
+                    "node_id": child_id,
+                    "kind": "excluded_oversize_singleton",
+                    "item_ids": [item_id],
+                    "excluded_item_id": item_id,
+                    "token_cost": count,
+                    "budget": int(token_budget),
+                    "fallback_parent_node_id": node["node_id"],
+                    "fallback_reason": split_rejection.get("reason"),
+                }
+                continue
+            placed = False
+            for index, cost in enumerate(pack_costs):
+                if cost <= token_budget and cost + count <= token_budget:
+                    packs[index].append(item_id)
+                    pack_costs[index] += count
+                    placed = True
+                    break
+            if not placed:
+                packs.append([item_id])
+                pack_costs.append(count)
+
+        final_specs: list[dict[str, Any]] = []
+        for pack, cost in zip(packs, pack_costs):
+            child_id = add_child_node_id()
+            ordered_pack = [item_id for item_id in node_item_ids if item_id in set(pack)]
+            routing_kind = "singleton_leaf" if len(ordered_pack) == 1 else "token_packing_leaf"
+            final_specs.append({
+                "source_node_id": child_id,
+                "item_ids": ordered_pack,
+                "member_weights": {item_id: float(path_weights.get(item_id, 1.0)) for item_id in ordered_pack},
+                "token_cost": int(cost),
+                "refinement_depth": int(node["depth"]) + 1,
+                "routing_kind": routing_kind,
+                "clustering_method": f"budget_fallback_{routing_kind}",
+                "split_reason": routing_kind,
+                "fallback_parent_node_id": node["node_id"],
+                "fallback_reason": split_rejection.get("reason"),
+            })
+
+        routing_nodes[node["node_id"]] = {
+            "node_id": node["node_id"],
+            "kind": "fallback_token_router",
+            "routing_model_kind": "fallback_centroid_softmax_v1",
+            "routing_temperature": 8.0,
+            "soft_assignment": self.config.soft_membership.__dict__,
+            "source_community_id": community.community_id,
+            "item_ids": node_item_ids,
+            "child_node_ids": child_node_ids,
+            "token_cost": int(_selected_prompt_token_cost(token_counts, node_item_ids)),
+            "budget": int(token_budget),
+            "fallback_reason": split_rejection.get("reason"),
+            "last_rejection": split_rejection,
+        }
+        return {
+            "final_specs": final_specs,
+            "excluded": excluded,
+            "routing_nodes": routing_nodes,
+            "node_count": len(child_node_ids),
+            "event": {
+                "split_reason": "budget_fallback_token_pack_singleton",
+                "node_id": node["node_id"],
+                "parent_prompt_tokens": int(_selected_prompt_token_cost(token_counts, node_item_ids)),
+                "budget": int(token_budget),
+                "fallback_reason": split_rejection.get("reason"),
+                "pack_count": len(final_specs),
+                "excluded_count": len(excluded),
+                "pack_prompt_tokens": [int(cost) for cost in pack_costs],
+                "excluded_item_ids": sorted(excluded),
+            },
         }
 
     async def _budget_refinement_gmm_split(
@@ -898,6 +1027,13 @@ def _selected_prompt_token_cost(token_counts: dict[str, int], item_ids: Sequence
     # Prompt cost is unweighted: if a trajectory is selected for a community,
     # the analyst sees it once regardless of posterior membership weight.
     return int(sum(int(token_counts.get(item_id, 0)) for item_id in set(item_ids)))
+
+
+def _centroid_embedding(items_by_id: dict[str, ExperienceItem], item_ids: Sequence[str]) -> list[float]:
+    vectors = [items_by_id[item_id].embedding for item_id in item_ids if item_id in items_by_id and items_by_id[item_id].embedding]
+    if not vectors:
+        return []
+    return normalize_rows(np.asarray(vectors, dtype=float)).mean(axis=0).astype(float).tolist()
 
 
 def _community_token_mass(token_counts: dict[str, int], member_weights: dict[str, float]) -> float:

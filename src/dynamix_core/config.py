@@ -38,7 +38,7 @@ class GmmBicConfig:
     min_split_size: int = 4
     # Used only to upper-bound searched K: kmax <= floor(total_weight / this value).
     # It is not a hard candidate-validity constraint.
-    min_effective_samples_per_component: int = 4
+    min_effective_samples_per_component: int = 2
     abs_kmax: int = 64
     max_concurrent_candidates: int = 1
     max_concurrent_restarts: int = 1

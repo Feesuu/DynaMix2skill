@@ -161,21 +161,107 @@ class ClusterAnalyst:
         system_prompt = self._dynamic_system_prompt(analyst_mode)
         prompt = self._build_dynamic_update_prompt(community, members, previous_generated_experiences, analyst_mode)
         token_event = self._preflight_prompt_budget(community, system_prompt, prompt, len(members))
-        payload = await self.generation.chat_json(
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
-            schema_name="DynamicExperienceCardPatchSet",
-            debug_metadata=self._generation_debug_metadata(
-                community,
-                members,
-                analyst_mode,
-                "DynamicExperienceCardPatchSet",
-                token_event,
-            ),
-        )
         previous_by_id = {str(card.get("item_id")): dict(card) for card in previous_generated_experiences if card.get("item_id")}
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ]
+        max_attempts = 3 if analyst_mode == "experience_abstractor" else 1
+        last_error: Exception | None = None
+        rendered_texts: list[str] = []
+        patch_specs: list[tuple[str, str, dict[str, Any], str]] = []
+        extra_patches_truncated = 0
+        for attempt in range(1, max_attempts + 1):
+            try:
+                attempt_token_event = token_event
+                if attempt > 1:
+                    attempt_token_event = self._preflight_messages_budget(
+                        community,
+                        messages,
+                        len(members),
+                        extra_metadata={
+                            "event": "dynamic_schema_repair_prompt",
+                            "dynamic_schema_attempt": attempt,
+                        },
+                    )
+                payload = await self.generation.chat_json(
+                    messages,
+                    schema_name="DynamicExperienceCardPatchSet",
+                    retries=0 if analyst_mode == "experience_abstractor" else 2,
+                    debug_metadata={
+                        **self._generation_debug_metadata(
+                            community,
+                            members,
+                            analyst_mode,
+                            "DynamicExperienceCardPatchSet",
+                            attempt_token_event,
+                        ),
+                        "dynamic_schema_attempt": attempt,
+                    },
+                )
+                rendered_texts, patch_specs, extra_patches_truncated = self._dynamic_patch_specs_from_payload(
+                    payload,
+                    community,
+                    analyst_mode,
+                    previous_by_id,
+                )
+                last_error = None
+                break
+            except (KeyError, TypeError, ValueError) as exc:
+                if analyst_mode != "experience_abstractor":
+                    raise
+                last_error = exc
+                status = "retry" if attempt < max_attempts else "ignored_invalid_llm_output"
+                self._record_dynamic_schema_repair_event(
+                    community,
+                    analyst_mode,
+                    previous_by_id,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    status=status,
+                    error=exc,
+                )
+                if attempt >= max_attempts:
+                    return []
+                messages = [
+                    *messages,
+                    {
+                        "role": "user",
+                        "content": _dynamic_update_repair_prompt(previous_by_id),
+                    },
+                ]
+        if last_error is not None:
+            return []
+
+        if not patch_specs:
+            return []
+
+        patches: list[ExperienceCardPatch] = []
+        embeddings = await self.embedding.embed_texts(rendered_texts, cache_namespace="experience_card")
+        for (operation, item_id, normalized, rendered), embedding in zip(patch_specs, embeddings):
+            patches.append(ExperienceCardPatch(
+                operation="update" if operation == "update" else "add",
+                item_id=item_id,
+                text=rendered,
+                embedding=embedding,
+                metadata=self._dynamic_card_metadata(
+                    normalized,
+                    community,
+                    members,
+                    analyst_mode,
+                    operation,
+                    extra_patches_truncated=extra_patches_truncated,
+                ),
+            ))
+        return patches
+
+    def _dynamic_patch_specs_from_payload(
+        self,
+        payload: dict[str, Any],
+        community: ExperienceCommunity,
+        analyst_mode: str,
+        previous_by_id: dict[str, dict[str, Any]],
+    ) -> tuple[list[str], list[tuple[str, str, dict[str, Any], str]], int]:
         if analyst_mode == "experience_abstractor":
             updates_payload, extra_patches_truncated = _extract_dynamic_update_only_payload(payload)
             new_cards_payload: list[dict[str, Any]] = []
@@ -189,10 +275,9 @@ class ClusterAnalyst:
             self.config,
             extra_patches_truncated=extra_patches_truncated,
         )
-        patches: list[ExperienceCardPatch] = []
+
         rendered_texts: list[str] = []
         patch_specs: list[tuple[str, str, dict[str, Any], str]] = []
-
         seen_updates: set[str] = set()
         for update in updates_payload:
             item_id = _required_string(update, "item_id")
@@ -212,27 +297,32 @@ class ClusterAnalyst:
             item_id = f"E{community.level + 1}_D{_short_hash(community.community_id + ':' + str(community.version) + ':' + str(index) + ':' + rendered)}"
             rendered_texts.append(rendered)
             patch_specs.append(("add", item_id, normalized, rendered))
+        return rendered_texts, patch_specs, extra_patches_truncated
 
-        if not patch_specs:
-            return []
-
-        embeddings = await self.embedding.embed_texts(rendered_texts, cache_namespace="experience_card")
-        for (operation, item_id, normalized, rendered), embedding in zip(patch_specs, embeddings):
-            patches.append(ExperienceCardPatch(
-                operation="update" if operation == "update" else "add",
-                item_id=item_id,
-                text=rendered,
-                embedding=embedding,
-                metadata=self._dynamic_card_metadata(
-                    normalized,
-                    community,
-                    members,
-                    analyst_mode,
-                    operation,
-                    extra_patches_truncated=extra_patches_truncated,
-                ),
-            ))
-        return patches
+    def _record_dynamic_schema_repair_event(
+        self,
+        community: ExperienceCommunity,
+        analyst_mode: str,
+        previous_by_id: dict[str, dict[str, Any]],
+        *,
+        attempt: int,
+        max_attempts: int,
+        status: str,
+        error: Exception,
+    ) -> None:
+        self.config.token_report.append({
+            "event": "dynamic_schema_repair",
+            "community_id": community.community_id,
+            "community_level": community.level,
+            "analyst_mode": analyst_mode,
+            "attempt": int(attempt),
+            "max_attempts": int(max_attempts),
+            "status": status,
+            "error_type": type(error).__name__,
+            "error": str(error),
+            "action": "retry_with_update_only_prompt" if status == "retry" else "skip_invalid_dynamic_update",
+            "previous_item_ids": sorted(previous_by_id),
+        })
 
     def _normalize_dynamic_card(
         self,
@@ -386,7 +476,15 @@ Omit unchanged old cards. Do not delete old cards. Do not output support_mass.
 Return valid JSON only.
 """
 
-    def _preflight_prompt_budget(self, community: ExperienceCommunity, system_prompt: str, user_prompt: str, member_count: int) -> dict[str, Any] | None:
+    def _preflight_prompt_budget(
+        self,
+        community: ExperienceCommunity,
+        system_prompt: str,
+        user_prompt: str,
+        member_count: int,
+        *,
+        extra_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         if self.config.max_prompt_tokens is None or int(self.config.max_prompt_tokens) <= 0:
             return None
         text = system_prompt + "\n" + user_prompt
@@ -408,6 +506,8 @@ Return valid JSON only.
             "tokenizer": tokenizer_name,
             "over_budget": token_count > int(self.config.max_prompt_tokens),
         }
+        if extra_metadata:
+            event.update(extra_metadata)
         self.config.token_report.append(event)
         if self.config.prompt_token_report_path:
             path = Path(self.config.prompt_token_report_path)
@@ -420,6 +520,28 @@ Return valid JSON only.
                 "The hierarchy summary_budget/token counts must force a finer split before analyst invocation."
             )
         return event
+
+    def _preflight_messages_budget(
+        self,
+        community: ExperienceCommunity,
+        messages: Sequence[dict[str, str]],
+        member_count: int,
+        *,
+        extra_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        system_prompt = "\n".join(message.get("content", "") for message in messages if message.get("role") == "system")
+        user_prompt = "\n\n".join(
+            f"[{message.get('role', 'user')}]\n{message.get('content', '')}"
+            for message in messages
+            if message.get("role") != "system"
+        )
+        return self._preflight_prompt_budget(
+            community,
+            system_prompt,
+            user_prompt,
+            member_count,
+            extra_metadata=extra_metadata,
+        )
 
     def save_prompt_token_report(self, path: str | Path) -> None:
         path = Path(path)
@@ -744,6 +866,39 @@ def _extract_dynamic_update_only_payload(payload: dict[str, Any]) -> tuple[list[
             raise ValueError(f"updates[{index}] must be an object")
         update_items.append(dict(card))
     return update_items, 0
+
+
+def _dynamic_update_repair_prompt(previous_by_id: dict[str, dict[str, Any]]) -> str:
+    return json.dumps({
+        "repair_instruction": (
+            "Your previous JSON did not satisfy the L1+ dynamic update schema. "
+            "Return valid JSON using only the update-only schema below. "
+            "If no existing ExperienceCard should change, return an empty updates list."
+        ),
+        "allowed_previous_item_ids": sorted(previous_by_id),
+        "required_top_level_schema": {
+            "updates": [
+                {
+                    "item_id": "must exactly equal one allowed_previous_item_ids value",
+                    "name": "string",
+                    "trigger": "string",
+                    "content": "string",
+                    "placement": {
+                        "target": "skill_md | reference | script",
+                        "reference_kind": "procedure | example | edge_case | note"
+                    },
+                    "confidence": "float in (0,1]"
+                }
+            ]
+        },
+        "hard_constraints": [
+            "Use no top-level field except updates.",
+            "Every update must revise an existing ExperienceCard by explicit item_id.",
+            "Do not infer update targets from list order, rank, or confidence.",
+            "Do not output support_mass.",
+            "Return valid JSON only.",
+        ],
+    }, ensure_ascii=False, indent=2)
 
 
 def _enforce_dynamic_patch_cardinality(

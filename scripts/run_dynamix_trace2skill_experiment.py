@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -23,26 +24,34 @@ def run(cmd: list[str], *, cwd: Path, env: dict[str, str], log_path: Path | None
         raise subprocess.CalledProcessError(proc.returncode, cmd)
 
 
-def stage_done(marker: Path, outputs: Iterable[Path]) -> bool:
+def stage_done(marker: Path, outputs: Iterable[Path], *, fingerprint: dict | None = None) -> bool:
     if not marker.exists():
         return False
-    return all(path.exists() for path in outputs)
+    if not all(path.exists() for path in outputs):
+        return False
+    if fingerprint is None:
+        return True
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return payload.get("fingerprint") == fingerprint
 
 
-def run_stage(name: str, cmd: list[str], *, cwd: Path, env: dict[str, str], log_path: Path, marker_dir: Path, outputs: list[Path], resume: bool) -> None:
+def run_stage(name: str, cmd: list[str], *, cwd: Path, env: dict[str, str], log_path: Path, marker_dir: Path, outputs: list[Path], resume: bool, fingerprint: dict | None = None) -> None:
     marker_dir.mkdir(parents=True, exist_ok=True)
     marker = marker_dir / f"{name}.done"
-    if resume and stage_done(marker, outputs):
+    if resume and stage_done(marker, outputs, fingerprint=fingerprint):
         print(f"[resume] skip stage {name}", flush=True)
         return
-    (marker_dir / f"{name}.running").write_text(json.dumps({"cmd": cmd}, ensure_ascii=False, indent=2), encoding="utf-8")
+    (marker_dir / f"{name}.running").write_text(json.dumps({"cmd": cmd, "fingerprint": fingerprint}, ensure_ascii=False, indent=2), encoding="utf-8")
     try:
         run(cmd, cwd=cwd, env=env, log_path=log_path)
     except Exception as exc:
         fail = marker_dir / f"{name}.failed.json"
         fail.write_text(json.dumps({"stage": name, "cmd": cmd, "error": repr(exc), "log": str(log_path)}, ensure_ascii=False, indent=2), encoding="utf-8")
         raise
-    marker.write_text(json.dumps({"stage": name, "outputs": [str(p) for p in outputs]}, ensure_ascii=False, indent=2), encoding="utf-8")
+    marker.write_text(json.dumps({"stage": name, "outputs": [str(p) for p in outputs], "fingerprint": fingerprint}, ensure_ascii=False, indent=2), encoding="utf-8")
     running = marker_dir / f"{name}.running"
     if running.exists():
         running.unlink()
@@ -65,6 +74,42 @@ def resolve_python_executable(value: str) -> str:
     if not resolved:
         raise FileNotFoundError(f"--python-executable is not on PATH: {value}")
     return resolved
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def expected_dynamic_counts(*, record_count: int, initial_count: int, update_batch_size: int, update_batch_count: int) -> dict[str, int]:
+    safe_record_count = max(0, int(record_count))
+    safe_initial = min(max(1, int(initial_count)), safe_record_count) if safe_record_count else 0
+    remaining = max(0, safe_record_count - safe_initial)
+    batch_size = max(1, int(update_batch_size))
+    batch_limit = int(update_batch_count)
+    updated = remaining if batch_limit <= 0 else min(remaining, batch_limit * batch_size)
+    batches = (updated + batch_size - 1) // batch_size if updated > 0 else 0
+    return {"initial_count": safe_initial, "updated_count": updated, "batch_count": batches}
+
+
+def validate_tree_summary_for_heldout(summary: dict, args: argparse.Namespace) -> None:
+    scenario = str(summary.get("scenario", ""))
+    if scenario != args.tree_scenario:
+        raise RuntimeError(f"DynaMix tree summary scenario mismatch: expected {args.tree_scenario!r}, got {scenario!r}")
+    if args.tree_scenario != "dynamic_update":
+        return
+    expected = expected_dynamic_counts(
+        record_count=int(summary.get("record_count", 0)),
+        initial_count=int(args.dynamic_initial_count),
+        update_batch_size=int(args.dynamic_update_batch_size),
+        update_batch_count=int(args.dynamic_update_batch_count),
+    )
+    observed = {key: int(summary.get(key, -1)) for key in expected}
+    if observed != expected:
+        raise RuntimeError(f"DynaMix dynamic summary mismatch before heldout: expected {expected}, got {observed}")
 
 
 def write_split_manifest(data_path: Path, run_dir: Path, *, train_start: int, train_end: int, heldout_start: int, heldout_end: int) -> dict:
@@ -109,6 +154,10 @@ def main() -> None:
     parser.add_argument("--max-turns", type=int, default=100)
     parser.add_argument("--thinking", choices=["true", "false", "null"], default="true", help="Unified Qwen thinking setting passed to Trace2Skill rollout and DynaMix analyst")
     parser.add_argument("--skillbank-top-k", type=int, default=10, help="Select top-k DynaMix nodebank nodes by embedding before each heldout task")
+    parser.add_argument("--tree-scenario", choices=["dynamic_update", "static_build"], default="dynamic_update", help="DynaMix build mode before heldout; default is the train200 60/40 dynamic protocol")
+    parser.add_argument("--dynamic-initial-count", type=int, default=120, help="Dynamic mode: number of initial train records used for the static seed tree")
+    parser.add_argument("--dynamic-update-batch-size", type=int, default=8, help="Dynamic mode: number of later train records inserted per batch")
+    parser.add_argument("--dynamic-update-batch-count", type=int, default=10, help="Dynamic mode: number of update batches; 120 + 10*8 covers train0-200")
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
@@ -150,6 +199,10 @@ def main() -> None:
         "thinking": args.thinking,
         "trace2skill_generation_config": str(gen_config_path),
         "skillbank_top_k": int(args.skillbank_top_k),
+        "tree_scenario": args.tree_scenario,
+        "dynamic_initial_count": int(args.dynamic_initial_count),
+        "dynamic_update_batch_size": int(args.dynamic_update_batch_size),
+        "dynamic_update_batch_count": int(args.dynamic_update_batch_count),
         "resume": bool(args.resume),
     }
     (run_dir / "experiment_runtime_config.json").write_text(json.dumps(runtime, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -193,7 +246,7 @@ def main() -> None:
 
     tree_dir = run_dir / "dynamix_tree"
     config = {
-        "scenario": "static_build",
+        "scenario": args.tree_scenario,
         "output_dir": str(tree_dir),
         "records_path": str(records),
         "generation": {
@@ -222,8 +275,14 @@ def main() -> None:
         },
         "hierarchy": {
             "gmm_bic": {
-                "min_split_size": 8,
+                "min_split_size": 4,
+                "min_effective_samples_per_component": 2,
             },
+        },
+        "dynamic": {
+            "initial_count": int(args.dynamic_initial_count),
+            "update_batch_size": int(args.dynamic_update_batch_size),
+            "update_batch_count": int(args.dynamic_update_batch_count),
         },
         "analyst": {
             "prompt_style": "trace2skill_cluster_level_template_inheritance_v4",
@@ -235,9 +294,18 @@ def main() -> None:
     }
     config_path = run_dir / "dynamix_config.json"
     config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
-    run_stage("04_build_tree", [python_executable, "scripts/build_dynamix_tree.py", "--config", str(config_path)], cwd=repo, env=env, log_path=logs / "04_build_tree.log", marker_dir=markers, outputs=[tree_dir / "summary.json"], resume=args.resume)
+    build_tree_cmd = [python_executable, "scripts/build_dynamix_tree.py", "--config", str(config_path)]
+    build_tree_fingerprint = {
+        "stage_contract": "04_build_tree:v2",
+        "cmd": build_tree_cmd,
+        "config_sha256": file_sha256(config_path),
+        "records_sha256": file_sha256(records),
+        "tree_scenario": args.tree_scenario,
+    }
+    run_stage("04_build_tree", build_tree_cmd, cwd=repo, env=env, log_path=logs / "04_build_tree.log", marker_dir=markers, outputs=[tree_dir / "summary.json"], resume=args.resume, fingerprint=build_tree_fingerprint)
 
     summary = json.loads((tree_dir / "summary.json").read_text(encoding="utf-8"))
+    validate_tree_summary_for_heldout(summary, args)
     manifest = json.loads(Path(summary["node_bank_manifest"]).read_text(encoding="utf-8"))
     if int(manifest.get("node_count", 0)) <= 0:
         raise RuntimeError("DynaMix produced no retrievable nodebank nodes")
