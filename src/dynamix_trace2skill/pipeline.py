@@ -428,6 +428,13 @@ def _write_runtime_artifacts(config: DynaMixRunConfig, out: Path) -> None:
     analysis = out / "analysis"
     analysis.mkdir(parents=True, exist_ok=True)
     payload = asdict(config)
+    for section in ("generation", "embedding"):
+        section_payload = payload.get(section)
+        if isinstance(section_payload, dict):
+            key = str(section_payload.get("api_key") or "")
+            if key and key != "EMPTY":
+                section_payload["api_key"] = f"sha256:{hashlib.sha256(key.encode('utf-8')).hexdigest()}"
+                section_payload["api_key_redacted"] = True
     (analysis / "runtime_config.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     manifest = {
         "records_path": str(Path(config.records_path).resolve()),

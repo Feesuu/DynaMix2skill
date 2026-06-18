@@ -32,6 +32,13 @@ AVAILABLE_AGENTS = {
 }
 
 
+def _parse_float_csv(value: str) -> tuple[float, ...]:
+    parts = [part.strip() for part in str(value).split(",") if part.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError("expected at least one comma-separated float")
+    return tuple(float(part) for part in parts)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a SpreadsheetBench agent.")
     parser.add_argument(
@@ -55,7 +62,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--agent",
         type=str,
-        default="cli_skill_preloaded",
+        default="cli_only",
         choices=list(AVAILABLE_AGENTS.keys()),
         help="Agent to use",
     )
@@ -101,6 +108,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Generation config as JSON string or path to JSON file",
+    )
+    parser.add_argument(
+        "--llm_timeout_seconds",
+        type=float,
+        default=600.0,
+        help="OpenAI-compatible LLM request timeout in seconds",
+    )
+    parser.add_argument(
+        "--llm_retry_wait_seconds",
+        type=_parse_float_csv,
+        default=(5.0, 10.0, 30.0),
+        help="Comma-separated retry wait seconds for LLM requests",
     )
     parser.add_argument(
         "--num_random_seeds",
@@ -243,6 +262,8 @@ def _build_client(args):
             config_path=args.api_chat_config,
             generation_config=generation_config or None,
             use_cache=use_cache,
+            retry_times=tuple(args.llm_retry_wait_seconds),
+            timeout=args.llm_timeout_seconds,
         )
     return OpenAIClient(
         model=args.model,
@@ -250,6 +271,8 @@ def _build_client(args):
         base_url=os.getenv("OPENAI_BASE_URL"),
         generation_config=generation_config or None,
         use_cache=use_cache,
+        retry_times=tuple(args.llm_retry_wait_seconds),
+        timeout=args.llm_timeout_seconds,
     )
 
 

@@ -117,6 +117,7 @@ def test_generation_debug_reuses_succeeded_response_and_continues_numbering(tmp_
         "request": {
             "model": "Qwen3.5-9B",
             "base_url": "http://example.invalid/v1",
+            "api_key": "EMPTY",
             "temperature": 0.6,
             "max_tokens": None,
             "timeout_seconds": 600.0,
@@ -148,6 +149,42 @@ def test_generation_debug_reuses_succeeded_response_and_continues_numbering(tmp_
     fresh_payload = json.loads((tmp_path / "generation_00008.json").read_text())
     assert fresh_payload["status"] == "succeeded"
     assert fresh_payload["metadata"]["community_id"] == "C1"
+
+
+def test_generation_debug_cache_identity_includes_api_key_fingerprint(tmp_path, monkeypatch):
+    messages = [{"role": "user", "content": "summarize C0"}]
+    cached_payload = {
+        "status": "succeeded",
+        "metadata": {"community_id": "C0"},
+        "request": {
+            "model": "Qwen3.5-9B",
+            "base_url": "http://example.invalid/v1",
+            "api_key": "sha256:old-key",
+            "temperature": 0.6,
+            "max_tokens": None,
+            "timeout_seconds": 600.0,
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        },
+        "messages": messages,
+        "response": "{\"cards\": []}",
+    }
+    (tmp_path / "generation_00001.json").write_text(json.dumps(cached_payload), encoding="utf-8")
+    client = GenerationClient(
+        GenerationConfig(
+            base_url="http://example.invalid/v1",
+            api_key="new-key",
+            debug_dir=str(tmp_path),
+            thinking_mode=False,
+        )
+    )
+
+    monkeypatch.setattr(client, "_chat_text_sync", lambda *args, **kwargs: "fresh")
+    text = asyncio.run(client.chat_text(messages, debug_metadata={"community_id": "C0"}))
+
+    assert text == "fresh"
+    payload = json.loads((tmp_path / "generation_00002.json").read_text())
+    assert payload["request"]["api_key"].startswith("sha256:")
+    assert "new-key" not in json.dumps(payload)
 
 
 def test_generation_debug_numbering_is_cross_process_safe(tmp_path):
@@ -291,6 +328,88 @@ def test_experiment_runner_tree_resume_requires_matching_fingerprint(tmp_path):
     assert not runner.stage_done(marker, [output], fingerprint={"scenario": "static_build"})
     marker.write_text(json.dumps({"stage": "04_build_tree"}), encoding="utf-8")
     assert not runner.stage_done(marker, [output], fingerprint={"scenario": "dynamic_update"})
+
+
+def test_experiment_runner_stage_report_aggregates_time_tokens_and_budget_pressure(tmp_path):
+    runner = _load_experiment_runner_module()
+    marker_dir = tmp_path / "stage_markers"
+    marker_dir.mkdir()
+    (marker_dir / "01_train_collect.done").write_text(
+        json.dumps({
+            "stage": "01_train_collect",
+            "started_at": "2026-06-19T00:00:00Z",
+            "ended_at": "2026-06-19T00:02:00Z",
+            "elapsed_seconds": 120.0,
+            "log": str(tmp_path / "logs" / "01_train_collect.log"),
+            "outputs": [],
+        }),
+        encoding="utf-8",
+    )
+    usage_dir = tmp_path / "usage"
+    usage_dir.mkdir()
+    usage_log = usage_dir / "01_train_collect.react_usage.jsonl"
+    usage_log.write_text(
+        "\n".join([
+            json.dumps({"cache_hit": False, "usage": {"prompt_tokens": 100, "completion_tokens": 25, "total_tokens": 125}}),
+            json.dumps({"cache_hit": False, "usage": {}}),
+            json.dumps({"cache_hit": True, "usage": {}}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    analysis_dir = tmp_path / "dynamix_tree" / "analysis"
+    analysis_dir.mkdir(parents=True)
+    (analysis_dir / "cluster_prompt_token_report.json").write_text(
+        json.dumps({"events": [{"community_id": "L0_C0", "level": 0, "member_count": 2, "prompt_tokens": 84, "max_prompt_tokens": 85, "over_budget": False}]}),
+        encoding="utf-8",
+    )
+    (analysis_dir / "chunked_embedding_report.json").write_text(
+        json.dumps({"chunk_tokens": 28000, "overlap_tokens": 1000, "pooling": "mean", "max_token_count": 90000, "over_limit_chunk_count": 0}),
+        encoding="utf-8",
+    )
+    args = SimpleNamespace(
+        summary_max_model_tokens=100000,
+        summary_budget_ratio=0.85,
+        summary_prompt_overhead_reserve_tokens=8000,
+        analyst_max_prompt_tokens=-1,
+        budget_refinement_apply_to_level=0,
+        soft_recursive_assignment="cumulative_mass",
+        soft_top_r_memberships=2,
+        soft_cumulative_mass_coverage=0.90,
+        soft_max_membership_gap=0.25,
+        workers=8,
+        thinking="true",
+        generation_timeout_seconds=600,
+        rollout_client_timeout_seconds=600,
+        chunked_embedding_enabled=True,
+        embedding_batch_size=8,
+        chunked_embedding_chunk_tokens=28000,
+        embedding_max_model_len=32000,
+        train_start=0,
+        train_end=200,
+        dynamic_initial_count=120,
+        dynamic_update_batch_size=8,
+        dynamic_update_batch_count=10,
+        tree_scenario="dynamic_update",
+    )
+
+    report = runner.write_experiment_stage_report(
+        run_dir=tmp_path,
+        marker_dir=marker_dir,
+        stages=["01_train_collect"],
+        usage_logs_by_stage={"01_train_collect": [usage_log]},
+        runtime={"run_dir": str(tmp_path)},
+        args=args,
+    )
+
+    assert report["stages"][0]["elapsed_seconds"] == 120.0
+    assert report["stages"][0]["token_totals"]["prompt_tokens"] == 100
+    assert report["stages"][0]["token_totals"]["completion_tokens"] == 25
+    assert report["stages"][0]["usage_logs"][0]["provider_usage_status"] == "partial"
+    assert report["stages"][0]["usage_logs"][0]["call_source_status"] == "mixed_cached_partial"
+    assert report["stages"][0]["usage_summary"]["records_without_usage"] == 1
+    assert report["prompt_token_stats"]["near_configured_limit_count"] == 1
+    assert (tmp_path / "experiment_stage_report.json").exists()
+    assert (tmp_path / "experiment_stage_report.md").exists()
 
 
 def test_experiment_runner_rejects_wrong_tree_summary_before_heldout():

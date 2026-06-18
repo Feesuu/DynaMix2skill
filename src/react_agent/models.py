@@ -8,6 +8,7 @@ with a default implementation for OpenAI-compatible APIs.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import threading
@@ -94,10 +95,79 @@ def _create_disk_cache(cache_path: str):
     return dc.Cache(cache_path, **cache_settings)
 
 
-def _make_cache_key(model: str, messages: list[dict]) -> tuple:
+def _secret_fingerprint(value: str | None) -> str:
+    if value == "EMPTY":
+        return "EMPTY"
+    if not value:
+        return ""
+    return "sha256:" + hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+
+def _make_cache_key(model: str, messages: list[dict], *, protocol: dict | None = None) -> tuple:
     """Create a cache key from model and messages."""
     messages_str = json.dumps(messages, ensure_ascii=False, sort_keys=True)
-    return (model, messages_str)
+    protocol_str = json.dumps(protocol or {}, ensure_ascii=False, sort_keys=True, default=str)
+    return ("v2", model, protocol_str, messages_str)
+
+
+def _response_usage_payload(value: Any) -> dict[str, Any]:
+    usage = getattr(value, "usage", None)
+    if usage is None and isinstance(value, dict):
+        usage = value.get("usage")
+    if usage is None:
+        return {}
+    if isinstance(usage, dict):
+        return dict(usage)
+    if hasattr(usage, "model_dump"):
+        return dict(usage.model_dump())
+    if hasattr(usage, "dict"):
+        return dict(usage.dict())
+    payload: dict[str, Any] = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens"):
+        token_value = getattr(usage, key, None)
+        if token_value is not None:
+            payload[key] = token_value
+    return payload
+
+
+def _append_usage_record(env_var: str, payload: dict[str, Any]) -> None:
+    path = os.getenv(env_var)
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        line = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str) + "\n"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
+    except Exception as exc:  # pragma: no cover - usage telemetry must not break rollouts
+        log.warning("Failed to write usage record to %s: %s", path, exc)
+
+
+def _record_react_usage(
+    *,
+    client: str,
+    model: str,
+    endpoint: str,
+    cache_hit: bool,
+    response: Any | None = None,
+    request: dict[str, Any] | None = None,
+) -> None:
+    _append_usage_record(
+        "REACT_AGENT_USAGE_LOG",
+        {
+            "component": "react_agent",
+            "client": client,
+            "model": model,
+            "endpoint": endpoint,
+            "cache_hit": cache_hit,
+            "usage": _response_usage_payload(response),
+            "request": dict(request or {}),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        },
+    )
 
 
 TRANSIENT_REPLY_PATTERNS = (
@@ -193,6 +263,7 @@ class OpenAIClient(LLMClient):
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.base_url = base_url or os.getenv("OPENAI_BASE_URL")
         self.retry_times = retry_times
+        self.timeout = timeout
         
         if not self.api_key:
             raise ValueError(
@@ -360,16 +431,47 @@ class OpenAIClient(LLMClient):
             settings_dict = settings.to_dict()
             config.update(settings_dict)
         
-        # Check cache
-        cache_key = _make_cache_key(self.model, openai_messages)
+        # Check cache.  The protocol fields prevent stale reuse when the same
+        # prompt is sent to a different endpoint or generation setup.
+        cache_key = _make_cache_key(
+            self.model,
+            openai_messages,
+            protocol={
+                "client": "openai",
+                "base_url": self.base_url or "",
+                "api_key": _secret_fingerprint(self.api_key),
+                "generation_config": config,
+                "retry_times": self.retry_times,
+                "timeout": self.timeout,
+            },
+        )
         cached = self._get_from_cache(cache_key)
         if cached is not None:
             log.debug("Loaded response from cache")
             reply, reasoning_content = cached
+            _record_react_usage(
+                client="openai",
+                model=self.model,
+                endpoint=self.base_url or "",
+                cache_hit=True,
+                request={"message_count": len(openai_messages)},
+            )
             return (reply, reasoning_content) if return_reasoning else reply
-        
+
         # Send request
         response = self._send_request_with_retry(openai_messages, config)
+        _record_react_usage(
+            client="openai",
+            model=self.model,
+            endpoint=self.base_url or "",
+            cache_hit=False,
+            response=response,
+            request={
+                "message_count": len(openai_messages),
+                "temperature": config.get("temperature"),
+                "max_tokens": config.get("max_tokens"),
+            },
+        )
         reply, reasoning_content = self._parse_response(response)
         
         # Cache the response
@@ -603,6 +705,17 @@ class ApiChatClient(LLMClient):
         cache_key = _make_cache_key(
             self.model,
             [{"messages": prompt, "params": params}],
+            protocol={
+                "client": "api_chat",
+                "url": self.url,
+                "app": self.app,
+                "quota_id": self.quota_id,
+                "user_id": self.user_id,
+                "access_key": _secret_fingerprint(self.access_key),
+                "tag": self.tag,
+                "retry_times": self.retry_times,
+                "timeout": self.timeout,
+            },
         )
         cached = self._get_from_cache(cache_key)
         if cached is not None:
@@ -610,6 +723,13 @@ class ApiChatClient(LLMClient):
             if _is_transient_error_reply(reply):
                 self._delete_from_cache(cache_key)
             else:
+                _record_react_usage(
+                    client="api_chat",
+                    model=self.model,
+                    endpoint=self.url,
+                    cache_hit=True,
+                    request={"message_count": len(prompt)},
+                )
                 return (reply, reasoning_content) if return_reasoning else reply
 
         reply = ""
@@ -620,6 +740,18 @@ class ApiChatClient(LLMClient):
                 reply = ""
                 reasoning_content = ""
             else:
+                _record_react_usage(
+                    client="api_chat",
+                    model=self.model,
+                    endpoint=self.url,
+                    cache_hit=False,
+                    response=response_json,
+                    request={
+                        "message_count": len(prompt),
+                        "temperature": params.get("temperature"),
+                        "max_tokens": params.get("max_tokens"),
+                    },
+                )
                 reply = self._extract_reply(response_json)
                 reasoning_content = self._extract_reasoning(response_json)
                 if "</think>" in reply:

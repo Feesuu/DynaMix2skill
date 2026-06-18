@@ -141,7 +141,12 @@ class SkillBankSelector:
         if self.cache_path.exists():
             try:
                 payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
-                if payload.get("model") == self.model and payload.get("document_hashes") == expected:
+                if (
+                    payload.get("model") == self.model
+                    and payload.get("base_url") == self.base_url
+                    and payload.get("api_key_fingerprint") == _api_key_fingerprint(self.api_key)
+                    and payload.get("document_hashes") == expected
+                ):
                     self._docs = [SkillNodeDocument(**item) for item in payload["documents"]]
                     self._embeddings = np.asarray(payload["embeddings"], dtype=float)
                     self._embeddings = _normalize_matrix(self._embeddings)
@@ -156,6 +161,7 @@ class SkillBankSelector:
             "skillbank_root": str(self.skillbank_root),
             "model": self.model,
             "base_url": self.base_url,
+            "api_key_fingerprint": _api_key_fingerprint(self.api_key),
             "document_hashes": expected,
             "documents": [asdict(doc) for doc in docs],
             "embeddings": embeddings.tolist(),
@@ -171,6 +177,19 @@ class SkillBankSelector:
         client_cls = OpenAI or CompatOpenAI
         client = client_cls(api_key=self.api_key, base_url=self.base_url, timeout=600)
         response = client.embeddings.create(model=self.model, input=texts)
+        _append_usage_record(
+            "DYNAMIX_SKILLBANK_USAGE_LOG",
+            {
+                "component": "dynamix_skillbank_embedding",
+                "client": "openai_embeddings",
+                "model": self.model,
+                "endpoint": self.base_url,
+                "cache_hit": False,
+                "usage": _response_usage_payload(response),
+                "request": {"input_count": len(texts)},
+                "timestamp": _utc_timestamp(),
+            },
+        )
         return [list(item.embedding) for item in response.data]
 
 
@@ -207,6 +226,56 @@ def _render_node_embedding_text(*, name: str, trigger: str, content: str) -> str
         f"trigger: {trigger.strip()}",
         f"content: {content.strip()}",
     ]).strip()
+
+
+def _api_key_fingerprint(value: str) -> str:
+    if value == "EMPTY":
+        return "EMPTY"
+    if not value:
+        return ""
+    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _utc_timestamp() -> str:
+    import time
+
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _response_usage_payload(value) -> dict:
+    usage = getattr(value, "usage", None)
+    if usage is None and isinstance(value, dict):
+        usage = value.get("usage")
+    if usage is None:
+        return {}
+    if isinstance(usage, dict):
+        return dict(usage)
+    if hasattr(usage, "model_dump"):
+        return dict(usage.model_dump())
+    if hasattr(usage, "dict"):
+        return dict(usage.dict())
+    payload = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens"):
+        token_value = getattr(usage, key, None)
+        if token_value is not None:
+            payload[key] = token_value
+    return payload
+
+
+def _append_usage_record(env_var: str, payload: dict) -> None:
+    path = os.getenv(env_var)
+    if not path:
+        return
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str) + "\n"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
+    except Exception:
+        return
 
 
 def _normalize(v: np.ndarray) -> np.ndarray:

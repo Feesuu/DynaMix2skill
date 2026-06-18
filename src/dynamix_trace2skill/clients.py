@@ -22,6 +22,7 @@ class GenerationConfig:
     base_url: str = "mock://deterministic"
     model: str = "Qwen3.5-9B"
     api_key: str = "EMPTY"
+    api_key_env_var: str | None = None
     temperature: float = 0.6
     timeout_seconds: float = 600.0
     max_concurrency: int = 4
@@ -29,6 +30,12 @@ class GenerationConfig:
     extra_body: dict[str, Any] = field(default_factory=dict)
     debug_dir: str | None = None
     retry_wait_seconds: tuple[float, ...] = (2.0, 5.0, 15.0)
+
+    @property
+    def resolved_api_key(self) -> str:
+        if self.api_key_env_var:
+            return os.environ.get(self.api_key_env_var, self.api_key or "EMPTY")
+        return self.api_key or "EMPTY"
 
 
 @dataclass
@@ -80,6 +87,19 @@ class GenerationClient:
             debug_payload = self._debug_payload(messages, temperature, max_tokens, timeout, body, debug_metadata)
             cached = self._reuse_succeeded_debug_response(debug_payload)
             if cached is not None:
+                _append_usage_record(
+                    "DYNAMIX_GENERATION_USAGE_LOG",
+                    {
+                        "component": "dynamix_generation",
+                        "client": "openai",
+                        "model": self.config.model,
+                        "endpoint": self.config.base_url,
+                        "cache_hit": True,
+                        "usage": {},
+                        "request": {"message_count": len(messages)},
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    },
+                )
                 return cached
             debug_path = self._start_debug(debug_payload)
             if self.config.base_url.startswith("mock://"):
@@ -132,7 +152,7 @@ class GenerationClient:
             kwargs["max_tokens"] = max_tokens
         if body:
             kwargs["extra_body"] = body
-        client = OpenAI(api_key=self.config.api_key, base_url=self.config.base_url, timeout=timeout or self.config.timeout_seconds)
+        client = OpenAI(api_key=self.config.resolved_api_key, base_url=self.config.base_url, timeout=timeout or self.config.timeout_seconds)
         response = None
         wait_schedule = (0.0, *tuple(float(x) for x in self.config.retry_wait_seconds))
         for attempt, wait_seconds in enumerate(wait_schedule):
@@ -160,6 +180,23 @@ class GenerationClient:
                 )
         if response is None:
             raise RuntimeError("generation request failed without an exception")
+        _append_usage_record(
+            "DYNAMIX_GENERATION_USAGE_LOG",
+            {
+                "component": "dynamix_generation",
+                "client": "openai",
+                "model": self.config.model,
+                "endpoint": self.config.base_url,
+                "cache_hit": False,
+                "usage": _response_usage_payload(response),
+                "request": {
+                    "message_count": len(messages),
+                    "temperature": kwargs.get("temperature"),
+                    "max_tokens": kwargs.get("max_tokens"),
+                },
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            },
+        )
         content = response.choices[0].message.content or ""
         return content
 
@@ -188,6 +225,7 @@ class GenerationClient:
             "request": {
                 "model": self.config.model,
                 "base_url": self.config.base_url,
+                "api_key": _api_key_fingerprint(self.config.resolved_api_key),
                 "temperature": self.config.temperature if temperature is None else temperature,
                 "max_tokens": max_tokens,
                 "timeout_seconds": timeout or self.config.timeout_seconds,
@@ -266,7 +304,7 @@ class EmbeddingClient:
         if not texts:
             return []
         model_name = model or self.config.model
-        namespace = cache_namespace or model_name
+        namespace = self._cache_namespace(cache_namespace or model_name, model_name=model_name)
         prepared_pairs = [self._prepare_text(text, index=idx) for idx, text in enumerate(texts)]
         prepared_texts = [pair[0] for pair in prepared_pairs]
         results: list[list[float] | None] = [None] * len(prepared_texts)
@@ -291,6 +329,22 @@ class EmbeddingClient:
                 if self._cache:
                     self._cache.set(namespace, prepared_text, vector)
         return [list(v or []) for v in results]
+
+    def _cache_namespace(self, logical_namespace: str, *, model_name: str) -> str:
+        payload = {
+            "base_url": self.config.base_url,
+            "model": model_name,
+            "api_key": _api_key_fingerprint(self.config.api_key),
+            "max_model_len": int(self.config.max_model_len),
+            "max_input_tokens": int(self.config.effective_max_input_tokens),
+            "truncate_long_texts": bool(self.config.truncate_long_texts),
+            "tokenizer_model": self.config.tokenizer_model or "",
+            "tokenizer_required": bool(self.config.tokenizer_required),
+            "truncation_strategy": self.config.truncation_strategy,
+            "deterministic_dim": int(self.config.deterministic_dim),
+        }
+        digest = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        return f"{logical_namespace}::protocol::{digest}"
 
     def _prepare_text(self, text: str, *, index: int | None = None) -> tuple[str, dict[str, Any]]:
         max_tokens = max(1, int(self.config.effective_max_input_tokens))
@@ -360,6 +414,19 @@ class EmbeddingClient:
             from .openai_compat import OpenAI
         client = OpenAI(api_key=self.config.api_key, base_url=self.config.base_url)
         response = client.embeddings.create(model=model_name, input=texts)
+        _append_usage_record(
+            "DYNAMIX_EMBEDDING_USAGE_LOG",
+            {
+                "component": "dynamix_embedding",
+                "client": "openai_embeddings",
+                "model": model_name,
+                "endpoint": self.config.base_url,
+                "cache_hit": False,
+                "usage": _response_usage_payload(response),
+                "request": {"input_count": len(texts)},
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            },
+        )
         return [list(item.embedding) for item in response.data]
 
     def close(self) -> None:
@@ -427,6 +494,55 @@ def _debug_io_warning(path: Path, operation: str, exc: Exception) -> None:
         file=sys.stderr,
         flush=True,
     )
+
+
+def _api_key_fingerprint(value: str) -> str:
+    if value == "EMPTY":
+        return "EMPTY"
+    if not value:
+        return ""
+    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _response_usage_payload(value: Any) -> dict[str, Any]:
+    usage = getattr(value, "usage", None)
+    if usage is None and isinstance(value, dict):
+        usage = value.get("usage")
+    if usage is None:
+        return {}
+    if isinstance(usage, dict):
+        return dict(usage)
+    if hasattr(usage, "model_dump"):
+        return dict(usage.model_dump())
+    if hasattr(usage, "dict"):
+        return dict(usage.dict())
+    payload: dict[str, Any] = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens"):
+        token_value = getattr(usage, key, None)
+        if token_value is not None:
+            payload[key] = token_value
+    return payload
+
+
+def _append_usage_record(env_var: str, payload: dict[str, Any]) -> None:
+    path = os.getenv(env_var)
+    if not path:
+        return
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str) + "\n"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
+    except Exception as exc:  # pragma: no cover - telemetry must not break builds
+        print(
+            "[dynamix-usage-warning] "
+            f"path={path} error={type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 class _SqliteEmbeddingCache:
