@@ -436,6 +436,73 @@ def test_experiment_runner_rejects_wrong_tree_summary_before_heldout():
         )
 
 
+def test_experiment_runner_reorders_reused_records_to_dataset_train_order(tmp_path):
+    runner = _load_experiment_runner_module()
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "dataset.json").write_text(
+        json.dumps([
+            {"id": "b", "instruction": "task b"},
+            {"id": "a", "instruction": "task a"},
+            {"id": "c", "instruction": "task c"},
+        ]),
+        encoding="utf-8",
+    )
+    source_records = tmp_path / "records.json"
+    source_records.write_text(
+        json.dumps([
+            {"task_id": "a", "trajectory_id": "a"},
+            {"task_id": "b", "trajectory_id": "b"},
+            {"task_id": "c", "trajectory_id": "c"},
+        ]),
+        encoding="utf-8",
+    )
+
+    manifest = runner.write_dataset_ordered_records(
+        source_records=source_records,
+        data_path=data_dir,
+        output_path=tmp_path / "ordered_records.json",
+        manifest_path=tmp_path / "records_order_manifest.json",
+        train_start=0,
+        train_end=3,
+    )
+
+    ordered = json.loads((tmp_path / "ordered_records.json").read_text(encoding="utf-8"))
+    assert [row["task_id"] for row in ordered] == ["b", "a", "c"]
+    assert manifest["source_order_equal_dataset_order"] is False
+    assert manifest["first_task_ids"] == ["b", "a", "c"]
+
+
+def test_pipeline_orders_records_before_dynamic_split(tmp_path):
+    import dynamix_trace2skill.pipeline as pipeline
+    from dynamix_trace2skill.schemas import RawTrajectoryRecord
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "dataset.json").write_text(
+        json.dumps([{"id": "b"}, {"id": "a"}, {"id": "c"}]),
+        encoding="utf-8",
+    )
+    records = [
+        RawTrajectoryRecord(trajectory_id="a", task_id="a", trial_index=0, instruction="a"),
+        RawTrajectoryRecord(trajectory_id="b", task_id="b", trial_index=0, instruction="b"),
+        RawTrajectoryRecord(trajectory_id="c", task_id="c", trial_index=0, instruction="c"),
+    ]
+
+    ordered, manifest = pipeline._order_records_by_dataset_slice(
+        records=records,
+        dataset_path=data_dir,
+        train_start=0,
+        train_end=3,
+        source_records_path=tmp_path / "records.json",
+    )
+
+    assert [record.task_id for record in ordered] == ["b", "a", "c"]
+    assert [record.task_id for record in ordered[:2]] == ["b", "a"]
+    assert [record.task_id for record in ordered[2:]] == ["c"]
+    assert manifest["source_order_equal_dataset_order"] is False
+
+
 def test_log_parser_recurses_and_loads_multiple_result_shapes(tmp_path):
     log_dir = tmp_path / "logs" / "seed_7"
     log_dir.mkdir(parents=True)

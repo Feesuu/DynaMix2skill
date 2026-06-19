@@ -301,6 +301,93 @@ def load_record_count(path: Path) -> int:
     raise ValueError(f"unsupported records format: {path}")
 
 
+def load_record_rows(path: Path) -> list[dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        rows = []
+        for key in ("records", "data", "results", "items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                rows = value
+                break
+    else:
+        rows = []
+    if not all(isinstance(row, dict) for row in rows):
+        raise ValueError(f"unsupported records format: {path}")
+    return list(rows)
+
+
+def load_dataset_rows(data_path: Path) -> list[dict[str, Any]]:
+    dataset_path = data_path / "dataset.json" if data_path.is_dir() else data_path
+    payload = json.loads(dataset_path.read_text(encoding="utf-8"))
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        rows = payload.get("results") or payload.get("data") or payload.get("instances") or []
+    else:
+        rows = []
+    if not all(isinstance(row, dict) for row in rows):
+        raise ValueError(f"unsupported dataset format: {dataset_path}")
+    return list(rows)
+
+
+def _task_id_from_row(row: dict[str, Any], fallback: object | None = None) -> str:
+    value = row.get("task_id", row.get("id", row.get("instance_id", fallback)))
+    if value is None:
+        raise ValueError(f"row has no task id: {row}")
+    return str(value)
+
+
+def write_dataset_ordered_records(
+    *,
+    source_records: Path,
+    data_path: Path,
+    output_path: Path,
+    manifest_path: Path,
+    train_start: int,
+    train_end: int,
+) -> dict[str, Any]:
+    """Write records in the exact SpreadsheetBench dataset order for the train slice."""
+    records = load_record_rows(source_records)
+    dataset_rows = load_dataset_rows(data_path)
+    expected_ids = [_task_id_from_row(row, fallback=index) for index, row in enumerate(dataset_rows[train_start:train_end], start=train_start)]
+    by_task_id: dict[str, dict[str, Any]] = {}
+    duplicates: list[str] = []
+    for record in records:
+        task_id = _task_id_from_row(record)
+        if task_id in by_task_id:
+            duplicates.append(task_id)
+        by_task_id[task_id] = record
+    missing = [task_id for task_id in expected_ids if task_id not in by_task_id]
+    expected_set = set(expected_ids)
+    extra = [task_id for task_id in by_task_id if task_id not in expected_set]
+    if duplicates or missing or extra:
+        raise RuntimeError(
+            "records.json does not match the requested train slice exactly: "
+            f"duplicates={duplicates[:10]}, missing={missing[:10]}, extra={extra[:10]}"
+        )
+    ordered = [by_task_id[task_id] for task_id in expected_ids]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(ordered, ensure_ascii=False, indent=2), encoding="utf-8")
+    source_ids = [_task_id_from_row(record) for record in records]
+    manifest = {
+        "policy": "records are ordered by dataset.json train slice order; no filename sorting or random shuffling",
+        "source_records": str(source_records),
+        "ordered_records": str(output_path),
+        "source_dataset_json": str(dataset_json_path(str(data_path)).resolve()),
+        "train_range": [int(train_start), int(train_end)],
+        "record_count": len(ordered),
+        "source_order_equal_dataset_order": source_ids == expected_ids,
+        "first_task_ids": expected_ids[:10],
+        "last_task_ids": expected_ids[-10:],
+    }
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return manifest
+
+
 def validate_tree_summary_for_heldout(summary: dict, args: argparse.Namespace) -> None:
     scenario = str(summary.get("scenario", ""))
     if scenario != args.tree_scenario:
@@ -712,9 +799,9 @@ def main() -> None:
     parser.add_argument("--model", default=os.environ.get("GEN_MODEL", "Qwen3.5-9B"))
     parser.add_argument("--openai-base-url", default=os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:18002/v1"))
     parser.add_argument("--openai-api-key", default=os.environ.get("OPENAI_API_KEY", "EMPTY"))
-    parser.add_argument("--embedding-base-url", default=os.environ.get("EMBED_BASE_URL", "http://127.0.0.1:18000/v1"))
-    parser.add_argument("--embedding-model", default=os.environ.get("EMBED_MODEL", "Qwen3-Embedding-8B"))
-    parser.add_argument("--embedding-tokenizer", default=os.environ.get("EMBED_TOKENIZER", "Qwen3-Embedding-8B"))
+    parser.add_argument("--embedding-base-url", default=os.environ.get("EMBED_BASE_URL", "http://127.0.0.1:8017/v1"))
+    parser.add_argument("--embedding-model", default=os.environ.get("EMBED_MODEL", "Qwen3-Embedding-0.6B"))
+    parser.add_argument("--embedding-tokenizer", default=os.environ.get("EMBED_TOKENIZER", "/mnt/data/grouph_share/models/modelscope/models/Qwen/Qwen3-Embedding-0___6B"))
     parser.add_argument("--python-executable", default=os.environ.get("DYNAMIX_PYTHON", sys.executable), help="Python executable used for all experiment stages; its bin dir is prepended to PATH so agent bash actions can call bare python")
     parser.add_argument("--max-turns", type=int, default=100)
     parser.add_argument("--thinking", choices=["true", "false", "null"], default="true", help="Unified Qwen thinking setting passed to Trace2Skill rollout and DynaMix analyst")
@@ -743,19 +830,19 @@ def main() -> None:
     parser.add_argument("--rollout-shuffle-seed", default="")
     parser.add_argument("--rollout-sample", type=int, default=0)
     parser.add_argument("--generation-temperature", type=float, default=0.6)
-    parser.add_argument("--generation-timeout-seconds", type=float, default=600.0)
+    parser.add_argument("--generation-timeout-seconds", type=float, default=1200.0)
     parser.add_argument("--generation-max-concurrency", type=int, default=None, help="DynaMix analyst generation concurrency; default: --workers")
     parser.add_argument("--generation-retry-wait-seconds", type=parse_float_csv, default=[2.0, 5.0, 15.0])
-    parser.add_argument("--embedding-max-model-len", type=int, default=32000)
-    parser.add_argument("--embedding-max-input-tokens", type=int, default=32000)
+    parser.add_argument("--embedding-max-model-len", type=int, default=8192)
+    parser.add_argument("--embedding-max-input-tokens", type=int, default=8000)
     parser.add_argument("--embedding-truncate-long-texts", type=parse_bool, default=True)
     parser.add_argument("--embedding-truncation-strategy", default="head")
     parser.add_argument("--embedding-batch-size", type=int, default=8)
-    parser.add_argument("--embedding-max-concurrency", type=int, default=None, help="Embedding API concurrency; default: --workers")
+    parser.add_argument("--embedding-max-concurrency", type=int, default=8, help="Embedding API concurrency")
     parser.add_argument("--embedding-tokenizer-required", type=parse_bool, default=True)
     parser.add_argument("--chunked-embedding-enabled", type=parse_bool, default=True)
-    parser.add_argument("--chunked-embedding-chunk-tokens", type=int, default=28000)
-    parser.add_argument("--chunked-embedding-overlap-tokens", type=int, default=1000)
+    parser.add_argument("--chunked-embedding-chunk-tokens", type=int, default=7600)
+    parser.add_argument("--chunked-embedding-overlap-tokens", type=int, default=512)
     parser.add_argument("--chunked-embedding-pooling", choices=["mean"], default="mean")
     parser.add_argument("--chunked-embedding-add-special-tokens", type=parse_bool, default=False)
     parser.add_argument("--chunked-embedding-normalize-after-pooling", type=parse_bool, default=False)
@@ -936,11 +1023,16 @@ def main() -> None:
         "07_heldout_eval": [],
     }
 
-    records = records_path_arg or (reuse_train_run_dir / "records.json" if reuse_train_run_dir is not None else train_artifact_dir / "records.json")
+    source_records = records_path_arg or (reuse_train_run_dir / "records.json" if reuse_train_run_dir is not None else train_artifact_dir / "records.json")
     skip_train_stages = records_path_arg is not None or reuse_train_run_dir is not None
-    if skip_train_stages and not records.is_file():
-        raise FileNotFoundError(f"reused records.json not found: {records}")
+    if skip_train_stages and not source_records.is_file():
+        raise FileNotFoundError(f"reused records.json not found: {source_records}")
+    ordered_records = scenario_dir / "ordered_records.json"
+    records_order_manifest = scenario_dir / "records_order_manifest.json"
+    records = ordered_records
+    runtime["source_records_path"] = str(source_records)
     runtime["records_path"] = str(records)
+    runtime["records_order_manifest"] = str(records_order_manifest)
     runtime["skip_train_stages"] = bool(skip_train_stages)
     runtime["records_path_arg"] = str(records_path_arg) if records_path_arg is not None else ""
     runtime["reuse_train_run_dir"] = str(reuse_train_run_dir) if reuse_train_run_dir is not None else ""
@@ -1033,7 +1125,7 @@ def main() -> None:
         python_executable, "scripts/extract_trace2skill_logs.py",
         "--log-dir", str(train_logs),
         "--results-file", str(train_eval),
-        "--output", str(records),
+        "--output", str(source_records),
     ]
     if not skip_train_stages:
         run_stage(
@@ -1043,7 +1135,7 @@ def main() -> None:
             env=env,
             log_path=train_stage_logs / "03_extract_records.log",
             marker_dir=train_markers,
-            outputs=[records],
+            outputs=[source_records],
             resume=args.resume,
             fingerprint=stage_fingerprint(
                 "03_extract_records:v2",
@@ -1058,18 +1150,35 @@ def main() -> None:
         )
 
     expected_train_records = int(args.train_end) - int(args.train_start)
-    observed_train_records = load_record_count(records)
+    observed_train_records = load_record_count(source_records)
     if observed_train_records != expected_train_records:
         raise RuntimeError(
             f"records.json count mismatch: expected {expected_train_records} "
             f"from train range [{args.train_start}, {args.train_end}), got {observed_train_records}"
         )
+    order_manifest = write_dataset_ordered_records(
+        source_records=source_records,
+        data_path=Path(args.data_path),
+        output_path=ordered_records,
+        manifest_path=records_order_manifest,
+        train_start=int(args.train_start),
+        train_end=int(args.train_end),
+    )
+    if load_record_count(records) != expected_train_records:
+        raise RuntimeError(f"ordered_records.json count mismatch after dataset-order rewrite: {records}")
+    runtime["records_order_policy"] = order_manifest["policy"]
+    runtime["records_source_order_equal_dataset_order"] = bool(order_manifest["source_order_equal_dataset_order"])
+    (scenario_dir / "experiment_runtime_config.json").write_text(json.dumps(runtime, ensure_ascii=False, indent=2), encoding="utf-8")
 
     tree_dir = scenario_dir / "dynamix_tree"
     config = {
         "scenario": args.tree_scenario,
         "output_dir": str(tree_dir),
         "records_path": str(records),
+        "dataset_path": str(Path(args.data_path).resolve()),
+        "train_start": int(args.train_start),
+        "train_end": int(args.train_end),
+        "enforce_dataset_order": True,
         "generation": {
             "base_url": args.openai_base_url,
             "model": args.model,

@@ -37,6 +37,10 @@ class DynaMixRunConfig:
     output_dir: str
     records_path: str
     scenario: str = "static_build"
+    dataset_path: str | None = None
+    train_start: int = 0
+    train_end: int | None = None
+    enforce_dataset_order: bool = False
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     # Long trajectory embedding is handled here, above core clustering.
@@ -56,6 +60,10 @@ class DynaMixRunConfig:
             output_dir=payload["output_dir"],
             records_path=payload["records_path"],
             scenario=str(payload.get("scenario", "static_build")),
+            dataset_path=payload.get("dataset_path"),
+            train_start=int(payload.get("train_start", 0)),
+            train_end=None if payload.get("train_end") is None else int(payload.get("train_end")),
+            enforce_dataset_order=bool(payload.get("enforce_dataset_order", False)),
             generation=GenerationConfig(**payload.get("generation", {})),
             embedding=EmbeddingConfig(**payload.get("embedding", {})),
             chunked_embedding=dict(payload.get("chunked_embedding", {})),
@@ -118,7 +126,7 @@ async def build_tree_from_records(config: DynaMixRunConfig) -> dict[str, Any]:
     if not config.generation.debug_dir:
         config.generation.debug_dir = str(out / "analysis" / "generation_debug")
     _write_runtime_artifacts(config, out)
-    records = load_records(config.records_path)
+    records = _load_records_for_protocol(config, out)
     embedding_client = EmbeddingClient(config.embedding)
     generation_client = GenerationClient(config.generation)
     _prepare_analyst_tokenizer_config(config, out)
@@ -174,7 +182,7 @@ async def build_dynamic_tree_from_records(config: DynaMixRunConfig) -> dict[str,
     if not config.generation.debug_dir:
         config.generation.debug_dir = str(out / "analysis" / "generation_debug")
     _write_runtime_artifacts(config, out)
-    records = load_records(config.records_path)
+    records = _load_records_for_protocol(config, out)
     embedding_client = EmbeddingClient(config.embedding)
     generation_client = GenerationClient(config.generation)
     _prepare_analyst_tokenizer_config(config, out)
@@ -367,6 +375,74 @@ def _prepare_analyst_tokenizer_config(config: DynaMixRunConfig, out: Path) -> No
     (out / "analysis").mkdir(parents=True, exist_ok=True)
     (out / "analysis" / "analyst_budget_config.json").write_text(json.dumps(budget, ensure_ascii=False, indent=2), encoding="utf-8")
 
+
+def _load_records_for_protocol(config: DynaMixRunConfig, out: Path) -> list[RawTrajectoryRecord]:
+    records = load_records(config.records_path)
+    if not config.enforce_dataset_order:
+        return records
+    if not config.dataset_path:
+        raise ValueError("enforce_dataset_order=true requires dataset_path in DynaMix config")
+    train_end = len(records) if config.train_end is None else int(config.train_end)
+    ordered, manifest = _order_records_by_dataset_slice(
+        records=records,
+        dataset_path=Path(config.dataset_path),
+        train_start=int(config.train_start),
+        train_end=train_end,
+        source_records_path=Path(config.records_path),
+    )
+    (out / "records_order_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return ordered
+
+
+def _order_records_by_dataset_slice(
+    *,
+    records: list[RawTrajectoryRecord],
+    dataset_path: Path,
+    train_start: int,
+    train_end: int,
+    source_records_path: Path,
+) -> tuple[list[RawTrajectoryRecord], dict[str, Any]]:
+    resolved_dataset = dataset_path / "dataset.json" if dataset_path.is_dir() else dataset_path
+    payload = json.loads(resolved_dataset.read_text(encoding="utf-8"))
+    if isinstance(payload, list):
+        dataset_rows = payload
+    elif isinstance(payload, dict):
+        dataset_rows = payload.get("results") or payload.get("data") or payload.get("instances") or []
+    else:
+        dataset_rows = []
+    if not all(isinstance(row, dict) for row in dataset_rows):
+        raise ValueError(f"unsupported dataset format: {resolved_dataset}")
+    expected_ids = [
+        str(row.get("id", row.get("task_id", row.get("instance_id", index))))
+        for index, row in enumerate(dataset_rows[train_start:train_end], start=train_start)
+    ]
+    by_task_id: dict[str, RawTrajectoryRecord] = {}
+    duplicates: list[str] = []
+    for record in records:
+        task_id = str(record.task_id)
+        if task_id in by_task_id:
+            duplicates.append(task_id)
+        by_task_id[task_id] = record
+    missing = [task_id for task_id in expected_ids if task_id not in by_task_id]
+    expected_set = set(expected_ids)
+    extra = [task_id for task_id in by_task_id if task_id not in expected_set]
+    if duplicates or missing or extra:
+        raise RuntimeError(
+            "records do not match dataset train slice exactly: "
+            f"duplicates={duplicates[:10]}, missing={missing[:10]}, extra={extra[:10]}"
+        )
+    source_ids = [str(record.task_id) for record in records]
+    manifest = {
+        "policy": "records are ordered by dataset.json train slice order; no filename sorting or random shuffling",
+        "source_records": str(source_records_path),
+        "source_dataset_json": str(resolved_dataset.resolve()),
+        "train_range": [int(train_start), int(train_end)],
+        "record_count": len(expected_ids),
+        "source_order_equal_dataset_order": source_ids == expected_ids,
+        "first_task_ids": expected_ids[:10],
+        "last_task_ids": expected_ids[-10:],
+    }
+    return [by_task_id[task_id] for task_id in expected_ids], manifest
 
 
 def _records_to_items(records: list[RawTrajectoryRecord], embedding_texts: list[str], embeddings: list[list[float]], *, config: DynaMixRunConfig) -> tuple[list[ExperienceItem], list[dict[str, Any]]]:

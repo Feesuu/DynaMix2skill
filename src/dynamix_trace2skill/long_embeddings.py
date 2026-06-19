@@ -27,8 +27,8 @@ class ChunkedEmbeddingConfig:
         -> embed each window with the normal embedding client
         -> average chunk embeddings to represent the original trajectory
 
-    Defaults are intentionally conservative for Qwen3-Embedding-8B: 10k-token
-    chunks with 2k-token overlap are far below the model hard limit of 32k.
+    Official handoff runs use Qwen3-Embedding-0.6B with an 8k window, so the
+    runner passes smaller chunk settings such as 7600 tokens with 512 overlap.
     """
 
     tokenizer_model: str

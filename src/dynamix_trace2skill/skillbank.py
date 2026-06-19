@@ -100,7 +100,7 @@ class SkillBankSelector:
         *,
         skillbank_root: str | Path,
         base_url: str = "mock://deterministic",
-        model: str = "Qwen3-Embedding-8B",
+        model: str = "Qwen3-Embedding-0.6B",
         api_key: str = "EMPTY",
         cache_path: str | Path | None = None,
     ):
@@ -120,7 +120,7 @@ class SkillBankSelector:
         return cls(
             skillbank_root=root,
             base_url=os.environ.get("DYNAMIX_SKILLBANK_EMBED_BASE_URL", os.environ.get("EMBED_BASE_URL", "mock://deterministic")),
-            model=os.environ.get("DYNAMIX_SKILLBANK_EMBED_MODEL", os.environ.get("EMBED_MODEL", "Qwen3-Embedding-8B")),
+            model=os.environ.get("DYNAMIX_SKILLBANK_EMBED_MODEL", os.environ.get("EMBED_MODEL", "Qwen3-Embedding-0.6B")),
             api_key=os.environ.get("DYNAMIX_SKILLBANK_EMBED_API_KEY", os.environ.get("OPENAI_API_KEY", "EMPTY")),
             cache_path=os.environ.get("DYNAMIX_SKILLBANK_CACHE_PATH") or None,
         )

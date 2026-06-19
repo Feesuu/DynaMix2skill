@@ -60,13 +60,13 @@ OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
 
 # OpenAI-compatible embedding endpoint used for trajectory/node embeddings and
 # heldout nodebank retrieval.
-EMBEDDING_BASE_URL="${EMBEDDING_BASE_URL:-http://127.0.0.1:18003/v1}"
+EMBEDDING_BASE_URL="${EMBEDDING_BASE_URL:-http://127.0.0.1:8017/v1}"
 
 # Embedding model name served by EMBEDDING_BASE_URL.
-EMBEDDING_MODEL="${EMBEDDING_MODEL:-Qwen3-Embedding-8B}"
+EMBEDDING_MODEL="${EMBEDDING_MODEL:-Qwen3-Embedding-0.6B}"
 
 # Local tokenizer path/name used for token counting and long-trace chunking.
-EMBEDDING_TOKENIZER="${EMBEDDING_TOKENIZER:-/mnt/data/grouph_share/models/modelscope/models/Qwen/Qwen3-Embedding-8B}"
+EMBEDDING_TOKENIZER="${EMBEDDING_TOKENIZER:-/mnt/data/grouph_share/models/modelscope/models/Qwen/Qwen3-Embedding-0___6B}"
 
 # Maximum ReAct turns per train/heldout spreadsheet task.
 MAX_TURNS="${MAX_TURNS:-30}"

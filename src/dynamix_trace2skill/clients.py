@@ -24,8 +24,8 @@ class GenerationConfig:
     api_key: str = "EMPTY"
     api_key_env_var: str | None = None
     temperature: float = 0.6
-    timeout_seconds: float = 600.0
-    max_concurrency: int = 4
+    timeout_seconds: float = 1200.0
+    max_concurrency: int = 8
     thinking_mode: bool | None = True
     extra_body: dict[str, Any] = field(default_factory=dict)
     debug_dir: str | None = None
@@ -41,20 +41,19 @@ class GenerationConfig:
 @dataclass
 class EmbeddingConfig:
     base_url: str = "mock://deterministic"
-    model: str = "Qwen3-Embedding-8B"
+    model: str = "Qwen3-Embedding-0.6B"
     api_key: str = "EMPTY"
-    # Hard maximum input length for the embedding model.  For Qwen3-Embedding-8B
-    # the project contract is 32k tokens.  We do not chunk+pool in this v1
-    # Trace2Skill-reuse path; if a trace exceeds the limit, it is truncated to
-    # this configured maximum and the truncation is reported as a run artifact.
-    max_model_len: int = 32000
-    max_input_tokens: int | None = None
+    # Official handoff runs use the local Qwen3-Embedding-0.6B service with an
+    # 8k input window.  Long trajectories are chunked upstream before this
+    # tokenizer-level guard is reached.
+    max_model_len: int = 8192
+    max_input_tokens: int | None = 8000
     truncate_long_texts: bool = True
     tokenizer_model: str | None = None
     tokenizer_required: bool = True
     truncation_strategy: str = "head"
     batch_size: int = 8
-    max_concurrency: int = 4
+    max_concurrency: int = 8
     cache_path: str | None = None
     deterministic_dim: int = 384
 
