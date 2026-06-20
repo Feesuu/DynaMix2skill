@@ -88,8 +88,7 @@
   },
   "dynamic": {
     "initial_count": 120,
-    "update_batch_size": 8,
-    "update_batch_count": 10,
+    "arrival_count": 80,
     "max_propagation_rounds": 16
   },
   "analyst": {

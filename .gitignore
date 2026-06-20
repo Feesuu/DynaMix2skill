@@ -17,6 +17,7 @@ env/
 .DS_Store
 .idea/
 .vscode/
+.serena/
 
 # Runtime artifacts and experiment outputs
 runs/

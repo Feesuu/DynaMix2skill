@@ -671,6 +671,12 @@ class ExperienceHierarchyState:
             if community.level != level:
                 raise ValueError("new community level mismatch")
             self._communities[community.community_id] = community
+        if new_communities and level in self._layers:
+            layer = self._layers[level]
+            self._layers[level] = replace(
+                layer,
+                community_ids=_uniq([*layer.community_ids, *[community.community_id for community in new_communities]]),
+            )
 
         communities_at_level = [c for c in self._communities.values() if c.level == level]
         if not communities_at_level:
@@ -890,6 +896,10 @@ def _validate_maps(
                     errors.append({"type": "invalid_layer_generated", "level": level, "item_id": item_id})
             if require_no_stale_layers and layer.stale:
                 errors.append({"type": "stale_layer", "level": level, "reason": layer.stale_reason})
+        for cid, community in communities.items():
+            layer = layers.get(community.level)
+            if layer is not None and cid not in set(layer.community_ids):
+                errors.append({"type": "community_missing_from_layer", "level": community.level, "community_id": cid})
     if require_no_pending_reroute and pending_reroute_item_ids:
         errors.append({"type": "pending_reroute_items", "item_ids": sorted(pending_reroute_item_ids)})
     return {"ok": not errors, "errors": errors}

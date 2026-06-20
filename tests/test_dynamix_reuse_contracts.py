@@ -14,7 +14,8 @@ from dynamix_trace2skill.clients import EmbeddingClient, EmbeddingConfig, Genera
 from dynamix_trace2skill.summary import ClusterAnalyst, ClusterAnalystConfig
 from dynamix_trace2skill.log_parser import parse_trace2skill_logs, _result_fields
 from dynamix_trace2skill.pipeline import DynaMixRunConfig, default_hierarchy_config
-from dynamix_core.data_structures import ExperienceCommunity, ExperienceItem, ITEM_KIND_EXPERIENCE_CARD, ITEM_KIND_TRAJECTORY
+from dynamix_core.data_structures import ExperienceCardPatch, ExperienceCommunity, ExperienceHierarchyState, ExperienceItem, ITEM_KIND_EXPERIENCE_CARD, ITEM_KIND_TRAJECTORY
+from dynamix_core.update import ExperienceHierarchyDynamicUpdater
 
 
 def _load_experiment_runner_module():
@@ -131,6 +132,7 @@ def test_generation_debug_reuses_succeeded_response_and_continues_numbering(tmp_
         GenerationConfig(
             base_url="http://example.invalid/v1",
             debug_dir=str(tmp_path),
+            timeout_seconds=600.0,
             thinking_mode=False,
         )
     )
@@ -174,6 +176,7 @@ def test_generation_debug_cache_identity_includes_api_key_fingerprint(tmp_path, 
             base_url="http://example.invalid/v1",
             api_key="new-key",
             debug_dir=str(tmp_path),
+            timeout_seconds=600.0,
             thinking_mode=False,
         )
     )
@@ -301,20 +304,364 @@ def test_default_hierarchy_config_is_real_not_tiny_smoke():
     assert cfg.gmm_bic.num_restarts == 5
     assert cfg.soft_membership.recursive_assignment == "cumulative_mass"
     assert cfg.soft_membership.cumulative_mass_coverage == pytest.approx(0.90)
+    assert cfg.dynamic_update.mode == "budget_constrained_online_gmm"
     assert cfg.dynamic_update.assignment == "cumulative_mass"
     assert cfg.dynamic_update.cumulative_mass_coverage == pytest.approx(0.90)
     assert cfg.budget_refinement.fallback == "gmm_bic_recursive"
     direct_cfg = ProjectedGmmDynamicTreeConfig.from_mapping({})
     assert direct_cfg.soft_membership.recursive_assignment == "cumulative_mass"
     assert direct_cfg.soft_membership.cumulative_mass_coverage == pytest.approx(0.90)
+    assert direct_cfg.dynamic_update.mode == "budget_constrained_online_gmm"
+    with pytest.raises(ValueError, match="update_routing_model must be true"):
+        ProjectedGmmDynamicTreeConfig.from_mapping({"dynamic_update": {"update_routing_model": False}})
+    with pytest.raises(ValueError, match="budget_constrained_online_gmm"):
+        ProjectedGmmDynamicTreeConfig.from_mapping({"dynamic_update": {"mode": "fixed_k_online_em"}})
 
 
-def test_default_dynamic_protocol_is_train200_sixty_forty_batches():
+def test_default_dynamic_protocol_is_train200_sixty_forty_sequential_arrivals():
     cfg = DynaMixRunConfig(output_dir="out", records_path="records.json")
     assert cfg.dynamic.initial_count == 120
-    assert cfg.dynamic.update_batch_size == 8
-    assert cfg.dynamic.update_batch_count == 10
-    assert cfg.dynamic.initial_count + cfg.dynamic.update_batch_size * cfg.dynamic.update_batch_count == 200
+    assert cfg.dynamic.arrival_count == 80
+    assert cfg.dynamic.initial_count + cfg.dynamic.arrival_count == 200
+
+
+def test_tracked_qwen_train200_config_uses_current_dynamic_arrival_schema():
+    cfg_path = Path(__file__).resolve().parents[1] / "configs" / "experiments" / "qwen_train200_tree_main_001.json"
+    payload = json.loads(cfg_path.read_text())
+    assert "update_batch_size" not in payload.get("dynamic", {})
+    assert "update_batch_count" not in payload.get("dynamic", {})
+    cfg = DynaMixRunConfig.from_json(cfg_path)
+    assert cfg.dynamic.initial_count == 120
+    assert cfg.dynamic.arrival_count == 80
+
+
+def _trajectory(item_id: str, embedding: list[float], tokens: int) -> ExperienceItem:
+    return ExperienceItem(
+        item_id=item_id,
+        level=0,
+        kind=ITEM_KIND_TRAJECTORY,
+        text=f"trace {item_id}",
+        embedding=embedding,
+        metadata={"analysis_token_count": tokens, "success": True},
+    )
+
+
+def _card(item_id: str, source_community_id: str, embedding: list[float]) -> ExperienceItem:
+    return ExperienceItem(
+        item_id=item_id,
+        level=1,
+        kind=ITEM_KIND_EXPERIENCE_CARD,
+        text=f"name: {item_id}\ntrigger: synthetic\ncontent: synthetic",
+        embedding=embedding,
+        generated_from_community_ids=[source_community_id],
+        metadata={"confidence": 1.0, "name": item_id, "trigger": "synthetic", "content": "synthetic"},
+    )
+
+
+async def _build_two_l0_state(*, c1_tokens: int, c2_tokens: int) -> ExperienceHierarchyState:
+    state = ExperienceHierarchyState()
+    await state.initialize_trajectory_items([
+        _trajectory("old_c1", [1.0, 0.0], c1_tokens),
+        _trajectory("old_c2", [0.0, 1.0], c2_tokens),
+    ])
+    await state.commit_layer(
+        level=0,
+        communities=[
+            ExperienceCommunity("L0_C1", 0, {"old_c1": 1.0}, posterior_member_weights={"old_c1": 1.0}),
+            ExperienceCommunity("L0_C2", 0, {"old_c2": 1.0}, posterior_member_weights={"old_c2": 1.0}),
+        ],
+        generated_items=[
+            _card("card_c1", "L0_C1", [1.0, 0.0]),
+            _card("card_c2", "L0_C2", [0.0, 1.0]),
+        ],
+        metadata={
+            "routing_model": {
+                "routing_model_kind": "pca_gmm",
+                "community_ids": ["L0_C1", "L0_C2"],
+                "pca_mean": [0.0, 0.0],
+                "pca_components": [[1.0, 0.0], [0.0, 1.0]],
+                "pi": [0.5, 0.5],
+                "means": [[1.0, 0.0], [0.0, 1.0]],
+                "variances": [[1.0, 1.0], [1.0, 1.0]],
+                "total_effective_count": 2.0,
+                "component_effective_counts": [1.0, 1.0],
+            }
+        },
+    )
+    return state
+
+
+def _budgeted_dynamic_config():
+    return default_hierarchy_config({
+        "summary_budget": {
+            "max_model_tokens": 100,
+            "budget_ratio": 1.0,
+            "prompt_overhead_reserve_tokens": 50,
+            "token_count_metadata_keys": ["analysis_token_count"],
+        },
+        "dynamic_update": {
+            "assignment": "cumulative_mass",
+            "top_r": 2,
+            "max_membership_gap": 1.0,
+            "cumulative_mass_coverage": 0.9,
+        },
+    })
+
+
+async def _synthetic_l0_patch(context):
+    previous = list(context.previous_generated_experiences or [])
+    if previous:
+        item_id = previous[0]["item_id"]
+        return [
+            ExperienceCardPatch(
+                operation="update",
+                item_id=item_id,
+                text=f"name: updated {item_id}\ntrigger: synthetic\ncontent: updated",
+                embedding=[0.5, 0.5],
+                metadata={"confidence": 1.0, "name": f"updated {item_id}", "trigger": "synthetic", "content": "updated"},
+            )
+        ]
+    item_id = f"card_{context.community.community_id}"
+    return [
+        ExperienceCardPatch(
+            operation="add",
+            item_id=item_id,
+            text=f"name: {item_id}\ntrigger: synthetic\ncontent: new dynamic card",
+            embedding=[0.5, 0.5],
+            metadata={"confidence": 1.0, "name": item_id, "trigger": "synthetic", "content": "new dynamic card"},
+        )
+    ]
+
+
+async def _support_only_l0_patch(context):
+    previous = list(context.previous_generated_experiences or [])
+    assert previous
+    old = previous[0]
+    return [
+        ExperienceCardPatch(
+            operation="update",
+            item_id=old["item_id"],
+            text=old["text"],
+            embedding=[0.0, 1.0],
+            metadata={**dict(old.get("metadata") or {}), "confidence": 1.0},
+        )
+    ]
+
+
+def test_dynamic_l0_budget_gate_tries_next_candidate_before_growing_k():
+    state = asyncio.run(_build_two_l0_state(c1_tokens=45, c2_tokens=20))
+    updater = ExperienceHierarchyDynamicUpdater(_budgeted_dynamic_config())
+    result = asyncio.run(
+        updater.update(
+            state=state,
+            new_trajectory_items=[_trajectory("new_t", [0.5, 0.5], 10)],
+            dynamic_summary_fn=_synthetic_l0_patch,
+        )
+    )
+    assignments = asyncio.run(state.communities_for_item("new_t"))
+    posterior = asyncio.run(state.posterior_communities_for_item("new_t"))
+    metadata = asyncio.run(state.layer_metadata(0))
+
+    assert assignments == {"L0_C2": pytest.approx(0.5)}
+    assert posterior == {"L0_C1": pytest.approx(0.5), "L0_C2": pytest.approx(0.5)}
+    assert not result.reroute_results[0].new_community_ids
+    assert metadata["routing_model"]["community_ids"] == ["L0_C1", "L0_C2"]
+    assert metadata["routing_model"]["component_effective_counts"] == [pytest.approx(1.5), pytest.approx(1.5)]
+
+
+def test_dynamic_l0_budget_gate_keeps_all_fitting_static_soft_parents():
+    state = asyncio.run(_build_two_l0_state(c1_tokens=20, c2_tokens=20))
+    updater = ExperienceHierarchyDynamicUpdater(_budgeted_dynamic_config())
+    result = asyncio.run(
+        updater.update(
+            state=state,
+            new_trajectory_items=[_trajectory("new_t", [0.5, 0.5], 10)],
+            dynamic_summary_fn=_synthetic_l0_patch,
+        )
+    )
+    assignments = asyncio.run(state.communities_for_item("new_t"))
+
+    assert assignments == {"L0_C1": pytest.approx(0.5), "L0_C2": pytest.approx(0.5)}
+    assert not result.reroute_results[0].new_community_ids
+
+
+def test_dynamic_support_only_update_clears_pending_reroute_for_sequential_item():
+    state = asyncio.run(_build_two_l0_state(c1_tokens=45, c2_tokens=20))
+    updater = ExperienceHierarchyDynamicUpdater(_budgeted_dynamic_config())
+    result = asyncio.run(
+        updater.update(
+            state=state,
+            new_trajectory_items=[_trajectory("new_t", [0.5, 0.5], 10)],
+            dynamic_summary_fn=_support_only_l0_patch,
+        )
+    )
+
+    assert result.validation["ok"]
+    assert asyncio.run(state.validate_hierarchy(require_no_pending_reroute=True))["ok"]
+
+
+def test_dynamic_l0_budget_gate_grows_new_component_when_all_candidates_overflow():
+    state = asyncio.run(_build_two_l0_state(c1_tokens=45, c2_tokens=45))
+    updater = ExperienceHierarchyDynamicUpdater(_budgeted_dynamic_config())
+    result = asyncio.run(
+        updater.update(
+            state=state,
+            new_trajectory_items=[_trajectory("new_t", [0.5, 0.5], 10)],
+            dynamic_summary_fn=_synthetic_l0_patch,
+        )
+    )
+    assignments = asyncio.run(state.communities_for_item("new_t"))
+    new_ids = result.reroute_results[0].new_community_ids
+    metadata = asyncio.run(state.layer_metadata(0))
+    new_community = asyncio.run(state.community_objects(new_ids))[0]
+
+    assert len(new_ids) == 1
+    assert new_ids[0].startswith("L0_DYN_")
+    assert assignments == {new_ids[0]: pytest.approx(1.0)}
+    assert new_ids[0] in metadata["routing_model"]["community_ids"]
+    assert metadata["routing_model"]["grow_k_components_added"] == 1
+    assert new_community.generated_item_ids == [f"card_{new_ids[0]}"]
+    assert new_community.metadata["split_reason"] == "dynamic_l0_budget_overflow_new_component"
+    assert new_community.metadata["rejected_candidate_posterior_weights"] == {"L0_C1": pytest.approx(0.5), "L0_C2": pytest.approx(0.5)}
+    snapshot = asyncio.run(state.to_dict(include_embeddings=False, validate=True))
+    assert new_ids[0] in snapshot["layers"]["0"]["community_ids"]
+    assert snapshot["validation"]["ok"]
+
+
+def test_dynamic_grow_k_requires_saved_routing_model_not_bootstrap():
+    state = asyncio.run(_build_two_l0_state(c1_tokens=45, c2_tokens=45))
+    asyncio.run(state.update_layer_metadata(0, {}))
+    updater = ExperienceHierarchyDynamicUpdater(_budgeted_dynamic_config())
+    community = ExperienceCommunity("L0_DYN_missing_model", 0, {"new_t": 1.0}, posterior_member_weights={"new_t": 1.0})
+
+    with pytest.raises(ValueError, match="no routing_model is saved"):
+        asyncio.run(
+            updater._append_routing_component(
+                state,
+                level=0,
+                community=community,
+                seed_item=_trajectory("new_t", [0.5, 0.5], 10),
+            )
+        )
+
+    metadata = asyncio.run(state.layer_metadata(0))
+    assert "routing_model" not in metadata
+
+
+def test_dynamic_update_requires_saved_routing_model_before_inserting_even_with_refinement_tree():
+    state = asyncio.run(_build_two_l0_state(c1_tokens=45, c2_tokens=45))
+    asyncio.run(
+        state.update_layer_metadata(
+            0,
+            {
+                "budget_refinement": {
+                    "refinement_routing_tree": {
+                        "coarse_roots": {"L0_C1": "root"},
+                        "nodes": {"root": {"node_id": "root", "kind": "leaf", "community_id": "L0_C1"}},
+                    }
+                }
+            },
+        )
+    )
+    updater = ExperienceHierarchyDynamicUpdater(_budgeted_dynamic_config())
+
+    with pytest.raises(ValueError, match="requires saved routing_model"):
+        asyncio.run(
+            updater.update(
+                state=state,
+                new_trajectory_items=[_trajectory("new_t", [0.5, 0.5], 10)],
+                dynamic_summary_fn=_synthetic_l0_patch,
+            )
+        )
+
+    snapshot = asyncio.run(state.to_dict(include_embeddings=False, validate=True))
+    assert "new_t" not in snapshot["items"]
+
+
+def test_dynamic_oversize_arrival_is_recorded_as_excluded_not_inserted():
+    state = asyncio.run(_build_two_l0_state(c1_tokens=20, c2_tokens=20))
+    updater = ExperienceHierarchyDynamicUpdater(_budgeted_dynamic_config())
+    result = asyncio.run(
+        updater.update(
+            state=state,
+            new_trajectory_items=[_trajectory("too_long", [0.5, 0.5], 51)],
+            dynamic_summary_fn=_synthetic_l0_patch,
+        )
+    )
+    snapshot = asyncio.run(state.to_dict(include_embeddings=False, validate=True))
+
+    assert result.inserted_item_ids == []
+    assert result.excluded_item_ids == ["too_long"]
+    assert result.excluded_oversize_singletons == [
+        {
+            "item_id": "too_long",
+            "source_community_id": None,
+            "token_cost": 51,
+            "budget": 50,
+            "reason": "oversize_singleton",
+            "dynamic_arrival": True,
+        }
+    ]
+    assert "too_long" not in snapshot["items"]
+
+
+def test_dynamic_oversize_arrival_still_requires_valid_l0_routing_model():
+    state = asyncio.run(_build_two_l0_state(c1_tokens=20, c2_tokens=20))
+    asyncio.run(state.update_layer_metadata(0, {}))
+    updater = ExperienceHierarchyDynamicUpdater(_budgeted_dynamic_config())
+
+    with pytest.raises(ValueError, match="requires saved routing_model"):
+        asyncio.run(
+            updater.update(
+                state=state,
+                new_trajectory_items=[_trajectory("too_long", [0.5, 0.5], 51)],
+                dynamic_summary_fn=_synthetic_l0_patch,
+            )
+        )
+
+    snapshot = asyncio.run(state.to_dict(include_embeddings=False, validate=True))
+    assert "too_long" not in snapshot["items"]
+
+
+def test_dynamic_contribution_cache_initialization_preserves_static_routing_parameters():
+    state = asyncio.run(_build_two_l0_state(c1_tokens=20, c2_tokens=20))
+    updater = ExperienceHierarchyDynamicUpdater(_budgeted_dynamic_config())
+    before = asyncio.run(state.layer_metadata(0))["routing_model"]
+
+    asyncio.run(updater._ensure_layer_routing_contributions(state, 0))
+    after = asyncio.run(state.layer_metadata(0))["routing_model"]
+
+    for key in ["pi", "means", "variances", "component_effective_counts", "total_effective_count"]:
+        assert after[key] == before[key]
+    assert after["item_contributions_initialized"] is True
+    assert after["item_contributions_source"] == "existing_state_preserve_routing_parameters"
+    assert sorted(after["item_contributions"]) == ["old_c1", "old_c2"]
+
+
+def test_dynamic_reroute_requires_model_for_non_terminal_upper_layer():
+    async def run_case():
+        state = await _build_two_l0_state(c1_tokens=20, c2_tokens=20)
+        await state.commit_layer(
+            level=1,
+            communities=[ExperienceCommunity("L1_C0", 1, {"card_c1": 1.0, "card_c2": 1.0}, posterior_member_weights={"card_c1": 1.0, "card_c2": 1.0})],
+            generated_items=[
+                ExperienceItem(
+                    item_id="card_l2",
+                    level=2,
+                    kind=ITEM_KIND_EXPERIENCE_CARD,
+                    text="name: L2\ntrigger: synthetic\ncontent: synthetic",
+                    embedding=[0.5, 0.5],
+                    generated_from_community_ids=["L1_C0"],
+                    metadata={"confidence": 1.0, "name": "L2", "trigger": "synthetic", "content": "synthetic"},
+                )
+            ],
+            metadata={},
+        )
+        updater = ExperienceHierarchyDynamicUpdater(_budgeted_dynamic_config())
+        await updater._propagate_reroute_items(state, ["card_c1"])
+
+    with pytest.raises(ValueError, match="non-terminal level 1"):
+        asyncio.run(run_case())
 
 
 def test_experiment_runner_tree_resume_requires_matching_fingerprint(tmp_path):
@@ -387,8 +734,7 @@ def test_experiment_runner_stage_report_aggregates_time_tokens_and_budget_pressu
         train_start=0,
         train_end=200,
         dynamic_initial_count=120,
-        dynamic_update_batch_size=8,
-        dynamic_update_batch_count=10,
+        dynamic_arrival_count=80,
         tree_scenario="dynamic_update",
     )
 
@@ -417,11 +763,14 @@ def test_experiment_runner_rejects_wrong_tree_summary_before_heldout():
     args = SimpleNamespace(
         tree_scenario="dynamic_update",
         dynamic_initial_count=120,
-        dynamic_update_batch_size=8,
-        dynamic_update_batch_count=10,
+        dynamic_arrival_count=80,
     )
     runner.validate_tree_summary_for_heldout(
-        {"scenario": "dynamic_update", "record_count": 200, "initial_count": 120, "updated_count": 80, "batch_count": 10},
+        {"scenario": "dynamic_update", "record_count": 200, "initial_count": 120, "arrival_count": 80, "updated_count": 80, "excluded_count": 0, "insertion_count": 80},
+        args,
+    )
+    runner.validate_tree_summary_for_heldout(
+        {"scenario": "dynamic_update", "record_count": 200, "initial_count": 120, "arrival_count": 80, "updated_count": 79, "excluded_count": 1, "insertion_count": 80},
         args,
     )
     with pytest.raises(RuntimeError, match="scenario mismatch"):
@@ -431,7 +780,12 @@ def test_experiment_runner_rejects_wrong_tree_summary_before_heldout():
         )
     with pytest.raises(RuntimeError, match="dynamic summary mismatch"):
         runner.validate_tree_summary_for_heldout(
-            {"scenario": "dynamic_update", "record_count": 200, "initial_count": 160, "updated_count": 40, "batch_count": 4},
+            {"scenario": "dynamic_update", "record_count": 200, "initial_count": 160, "arrival_count": 40, "updated_count": 40, "excluded_count": 0, "insertion_count": 40},
+            args,
+        )
+    with pytest.raises(RuntimeError, match="insertion accounting mismatch"):
+        runner.validate_tree_summary_for_heldout(
+            {"scenario": "dynamic_update", "record_count": 200, "initial_count": 120, "arrival_count": 80, "updated_count": 78, "excluded_count": 1, "insertion_count": 80},
             args,
         )
 
@@ -694,8 +1048,8 @@ def test_refinement_routing_masks_excluded_child_and_uses_next_active_leaf():
                 "kind": "gmm_split",
                 "pca_mean": [0.0],
                 "pca_components": [[1.0]],
-                "pi": [0.99, 0.01],
-                "means": [[0.0], [10.0]],
+                "pi": [0.7, 0.3],
+                "means": [[0.0], [1.0]],
                 "variances": [[1.0], [1.0]],
                 "child_node_ids": ["excluded", "active_leaf"],
             },
@@ -719,8 +1073,9 @@ def test_refinement_routing_masks_excluded_child_and_uses_next_active_leaf():
         soft_config=SoftMembershipConfig(recursive_assignment="cumulative_mass", cumulative_mass_coverage=0.9),
         selected_only=False,
     )
-    assert selected == {"L0_C0_R000": pytest.approx(1.0)}
-    assert posterior == {"L0_C0_R000": pytest.approx(1.0)}
+    assert set(selected) == {"L0_C0_R000"}
+    assert 0.15 < selected["L0_C0_R000"] < 0.30
+    assert posterior == selected
 
 
 def test_refinement_fallback_router_routes_to_token_packing_leaf():
@@ -797,8 +1152,8 @@ def test_dynamic_route_masks_removed_coarse_community_and_uses_next_active_clust
                     "community_ids": ["L0_C0", "L0_C1"],
                     "pca_mean": [0.0],
                     "pca_components": [[1.0]],
-                    "pi": [0.99, 0.01],
-                    "means": [[0.0], [10.0]],
+                    "pi": [0.7, 0.3],
+                    "means": [[0.0], [1.0]],
                     "variances": [[1.0], [1.0]],
                     "soft_assignment": {},
                 }
@@ -811,8 +1166,9 @@ def test_dynamic_route_masks_removed_coarse_community_and_uses_next_active_clust
         return await updater.route_existing_items(state, level=0, item_ids=["new_t"])
 
     routing = asyncio.run(run_case())
-    assert routing.selected_assignments == {"new_t": {"L0_C1": pytest.approx(1.0)}}
-    assert routing.posterior_assignments == {"new_t": {"L0_C1": pytest.approx(1.0)}}
+    assert set(routing.selected_assignments["new_t"]) == {"L0_C1"}
+    assert 0.15 < routing.selected_assignments["new_t"]["L0_C1"] < 0.30
+    assert routing.posterior_assignments == routing.selected_assignments
 
 
 def test_routing_model_refresh_coarsens_refined_leaf_posterior_only_to_active_roots():

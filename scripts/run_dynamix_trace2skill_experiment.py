@@ -278,15 +278,13 @@ def skillbank_retrieval_protocol(args: argparse.Namespace, *, cache_path: Path, 
     }
 
 
-def expected_dynamic_counts(*, record_count: int, initial_count: int, update_batch_size: int, update_batch_count: int) -> dict[str, int]:
+def expected_dynamic_counts(*, record_count: int, initial_count: int, arrival_count: int) -> dict[str, int]:
     safe_record_count = max(0, int(record_count))
     safe_initial = min(max(1, int(initial_count)), safe_record_count) if safe_record_count else 0
     remaining = max(0, safe_record_count - safe_initial)
-    batch_size = max(1, int(update_batch_size))
-    batch_limit = int(update_batch_count)
-    updated = remaining if batch_limit <= 0 else min(remaining, batch_limit * batch_size)
-    batches = (updated + batch_size - 1) // batch_size if updated > 0 else 0
-    return {"initial_count": safe_initial, "updated_count": updated, "batch_count": batches}
+    arrival_limit = int(arrival_count)
+    arrivals = remaining if arrival_limit <= 0 else min(remaining, arrival_limit)
+    return {"initial_count": safe_initial, "arrival_count": arrivals, "insertion_count": arrivals}
 
 
 def load_record_count(path: Path) -> int:
@@ -401,12 +399,18 @@ def validate_tree_summary_for_heldout(summary: dict, args: argparse.Namespace) -
     expected = expected_dynamic_counts(
         record_count=train_count,
         initial_count=int(args.dynamic_initial_count),
-        update_batch_size=int(args.dynamic_update_batch_size),
-        update_batch_count=int(args.dynamic_update_batch_count),
+        arrival_count=int(args.dynamic_arrival_count),
     )
     observed = {key: int(summary.get(key, -1)) for key in expected}
     if observed != expected:
         raise RuntimeError(f"DynaMix dynamic summary mismatch before heldout: expected {expected}, got {observed}")
+    updated = int(summary.get("updated_count", -1))
+    excluded = int(summary.get("excluded_count", 0))
+    if updated < 0 or excluded < 0 or updated + excluded != expected["arrival_count"]:
+        raise RuntimeError(
+            "DynaMix dynamic insertion accounting mismatch before heldout: "
+            f"arrival_count={expected['arrival_count']}, updated_count={updated}, excluded_count={excluded}"
+        )
 
 
 def aggregate_usage_jsonl(path: Path) -> dict[str, Any]:
@@ -631,10 +635,9 @@ def runtime_dead_corner_findings(args: argparse.Namespace) -> list[dict[str, str
     expected_dynamic = expected_dynamic_counts(
         record_count=train_count,
         initial_count=int(args.dynamic_initial_count),
-        update_batch_size=int(args.dynamic_update_batch_size),
-        update_batch_count=int(args.dynamic_update_batch_count),
+        arrival_count=int(args.dynamic_arrival_count),
     )
-    if args.tree_scenario == "dynamic_update" and expected_dynamic["initial_count"] + expected_dynamic["updated_count"] != train_count:
+    if args.tree_scenario == "dynamic_update" and expected_dynamic["initial_count"] + expected_dynamic["arrival_count"] != train_count:
         findings.append({
             "severity": "high",
             "area": "dynamic_coverage",
@@ -814,8 +817,7 @@ def main() -> None:
     parser.add_argument("--allow-multi-parent", type=parse_bool, default=True)
     parser.add_argument("--use-support-mass", type=parse_bool, default=True)
     parser.add_argument("--dynamic-initial-count", type=int, default=120, help="Dynamic mode: number of initial train records used for the static seed tree")
-    parser.add_argument("--dynamic-update-batch-size", type=int, default=8, help="Dynamic mode: number of later train records inserted per batch")
-    parser.add_argument("--dynamic-update-batch-count", type=int, default=10, help="Dynamic mode: number of update batches; 120 + 10*8 covers train0-200")
+    parser.add_argument("--dynamic-arrival-count", type=int, default=80, help="Dynamic mode: number of later train records inserted sequentially; <=0 consumes all remaining train records")
     parser.add_argument("--max-levels", type=int, default=8)
     parser.add_argument("--skill-output-dir-name", default="skills")
     parser.add_argument("--rollout-temperature", type=float, default=0.0)
@@ -880,7 +882,7 @@ def main() -> None:
     parser.add_argument("--summary-budget-ratio", type=float, default=0.85)
     parser.add_argument("--summary-prompt-overhead-reserve-tokens", type=int, default=8000)
     parser.add_argument("--summary-token-count-metadata-keys", type=parse_str_csv, default=["analysis_token_count", "prompt_token_count", "token_count", "tokens"])
-    parser.add_argument("--dynamic-update-mode", default="fixed_k_online_em")
+    parser.add_argument("--dynamic-update-mode", default="budget_constrained_online_gmm")
     parser.add_argument("--dynamic-assignment", choices=["primary_argmax", "top_r_threshold", "cumulative_mass"], default="cumulative_mass")
     parser.add_argument("--dynamic-top-r", type=int, default=2)
     parser.add_argument("--dynamic-min-membership-weight", type=float, default=0.05)
@@ -903,8 +905,10 @@ def main() -> None:
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
-    if args.dynamic_update_mode != "fixed_k_online_em":
-        parser.error("--dynamic-update-mode is currently fixed to fixed_k_online_em; this is not a tunable protocol knob")
+    if args.dynamic_update_mode != "budget_constrained_online_gmm":
+        parser.error("--dynamic-update-mode is currently fixed to budget_constrained_online_gmm; this is not a tunable protocol knob")
+    if not bool(args.dynamic_update_routing_model):
+        parser.error("--dynamic-update-routing-model is fixed to true for budget_constrained_online_gmm")
     if not bool(args.budget_refinement_skip_oversize_singleton):
         parser.error("--budget-refinement-skip-oversize-singleton is currently fixed to true; false is not implemented")
     if args.rollout_llm_client != "openai":
@@ -984,8 +988,7 @@ def main() -> None:
         "skillbank_top_k": int(args.skillbank_top_k),
         "tree_scenario": args.tree_scenario,
         "dynamic_initial_count": int(args.dynamic_initial_count),
-        "dynamic_update_batch_size": int(args.dynamic_update_batch_size),
-        "dynamic_update_batch_count": int(args.dynamic_update_batch_count),
+        "dynamic_arrival_count": int(args.dynamic_arrival_count),
         "max_levels": int(args.max_levels),
         "skill_output_dir_name": args.skill_output_dir_name,
         "rollout_temperature": float(args.rollout_temperature),
@@ -1279,8 +1282,7 @@ def main() -> None:
         },
         "dynamic": {
             "initial_count": int(args.dynamic_initial_count),
-            "update_batch_size": int(args.dynamic_update_batch_size),
-            "update_batch_count": int(args.dynamic_update_batch_count),
+            "arrival_count": int(args.dynamic_arrival_count),
             "max_propagation_rounds": int(args.dynamic_max_propagation_rounds),
         },
         "analyst": {

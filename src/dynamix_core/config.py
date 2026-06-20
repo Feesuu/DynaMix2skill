@@ -171,15 +171,15 @@ class BudgetRefinementConfig:
 
 @dataclass(frozen=True)
 class DynamicUpdateConfig:
-    """Fixed-K online-EM dynamic update configuration.
+    """Budget-constrained online GMM dynamic update configuration.
 
-    Dynamic insertion never creates, deletes, splits, or merges communities.
-    New items are routed to existing communities; the saved routing GMM is
-    updated with full posterior responsibilities. Selected memberships are kept
-    separately for prompts and community support_mass.
+    Trajectories are inserted sequentially.  L0 candidates are accepted only
+    when adding the trajectory keeps the analyst prompt under budget; otherwise
+    a new L0 community/GMM component is created when the trajectory itself fits
+    the budget.  Existing communities are not split during online insertion.
     """
 
-    mode: str = "fixed_k_online_em"
+    mode: str = "budget_constrained_online_gmm"
     assignment: str = "cumulative_mass"
     top_r: int = 2
     min_membership_weight: float = 0.05
@@ -190,8 +190,8 @@ class DynamicUpdateConfig:
     confidence_metadata_key: str = "confidence"
 
     def validate(self) -> None:
-        if self.mode != "fixed_k_online_em":
-            raise ValueError("dynamic_update.mode must be 'fixed_k_online_em'")
+        if self.mode != "budget_constrained_online_gmm":
+            raise ValueError("dynamic_update.mode must be 'budget_constrained_online_gmm'")
         allowed = {"primary_argmax", "top_r_threshold", "cumulative_mass"}
         if self.assignment not in allowed:
             raise ValueError(f"dynamic_update.assignment must be one of {sorted(allowed)}")
@@ -205,6 +205,8 @@ class DynamicUpdateConfig:
             raise ValueError("dynamic_update.max_membership_gap must be in [0, 1]")
         if not (0.0 < self.cumulative_mass_coverage <= 1.0):
             raise ValueError("dynamic_update.cumulative_mass_coverage must be in (0, 1]")
+        if not self.update_routing_model:
+            raise ValueError("dynamic_update.update_routing_model must be true for budget_constrained_online_gmm")
         if not self.confidence_metadata_key:
             raise ValueError("dynamic_update.confidence_metadata_key must be non-empty")
 
@@ -297,7 +299,7 @@ def _clean_summary_budget_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalize_dynamic_update_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Accept old payloads, but normalize to the fixed-K v1 surface."""
+    """Accept old payload aliases, but normalize to the current online surface."""
     mapping = {
         "affected_assignment": "assignment",
         "affected_top_r": "top_r",
@@ -311,7 +313,7 @@ def _normalize_dynamic_update_payload(payload: dict[str, Any]) -> dict[str, Any]
             payload[new] = payload[old]
     allowed = set(DynamicUpdateConfig.__dataclass_fields__)
     payload = {key: value for key, value in payload.items() if key in allowed}
-    payload["mode"] = "fixed_k_online_em"
+    payload.setdefault("mode", "budget_constrained_online_gmm")
     return payload
 
 

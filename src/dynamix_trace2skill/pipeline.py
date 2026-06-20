@@ -27,8 +27,7 @@ from .skillbank import SkillBankSelector
 @dataclass
 class DynamicPipelineConfig:
     initial_count: int = 120
-    update_batch_size: int = 8
-    update_batch_count: int = 10
+    arrival_count: int = 80
     max_propagation_rounds: int = 16
 
 
@@ -170,12 +169,14 @@ async def build_tree_from_records(config: DynaMixRunConfig) -> dict[str, Any]:
 
 
 async def build_dynamic_tree_from_records(config: DynaMixRunConfig) -> dict[str, Any]:
-    """Formal dynamic-update scenario using the fixed-K core updater.
+    """Formal dynamic-update scenario using the online growing-K updater.
 
     Initial records build a normal static hierarchy.  Later records are inserted
-    in batches and routed to existing communities. L0 raw trajectory communities
-    may add independent cards, while L1+ ExperienceCard communities are updated
-    in place. The updater does not create new clusters or change K online.
+    one by one in dataset order. L0 admission first tries routed candidate
+    communities under the analyst token budget; if none fit, the trajectory
+    forms a new dynamic L0 community and routing component. L0 raw trajectory
+    communities may add independent cards, while L1+ ExperienceCard communities
+    are updated in place.
     """
     out = Path(config.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -199,8 +200,8 @@ async def build_dynamic_tree_from_records(config: DynaMixRunConfig) -> dict[str,
     initial_count = min(max(1, int(dyn.initial_count)), len(items))
     initial_items = items[:initial_count]
     remaining = items[initial_count:]
-    if dyn.update_batch_count > 0:
-        remaining = remaining[: int(dyn.update_batch_count) * int(dyn.update_batch_size)]
+    if dyn.arrival_count > 0:
+        remaining = remaining[: int(dyn.arrival_count)]
 
     analyst = ClusterAnalyst(generation_client, embedding_client, config.analyst)
     hierarchy_config = default_hierarchy_config(config.hierarchy)
@@ -211,27 +212,31 @@ async def build_dynamic_tree_from_records(config: DynaMixRunConfig) -> dict[str,
     updater = ExperienceHierarchyDynamicUpdater(hierarchy_config, max_propagation_rounds=int(dyn.max_propagation_rounds))
 
     update_summaries = []
+    excluded_input_item_ids: list[str] = []
+    excluded_oversize_singletons: list[dict[str, Any]] = []
 
     async def dynamic_summary_fn(context):
         member_items = [ExperienceItem(**_item_payload_to_constructor_payload(payload)) for payload in context.member_items]
         previous = list(getattr(context, "previous_generated_experiences", []) or [])
         return await analyst.summarize_dynamic_update(context.community, member_items, previous)
 
-    batch_size = max(1, int(dyn.update_batch_size))
-    for batch_index, start in enumerate(range(0, len(remaining), batch_size), start=1):
-        batch = remaining[start: start + batch_size]
-        update_result = await updater.update(state=state, new_trajectory_items=batch, dynamic_summary_fn=dynamic_summary_fn)
+    for insertion_index, item in enumerate(remaining, start=1):
+        update_result = await updater.update(state=state, new_trajectory_items=[item], dynamic_summary_fn=dynamic_summary_fn)
         snapshot = await state.to_dict(include_embeddings=False, validate=True)
-        snap_dir = out / "dynamic_snapshots" / f"batch_{batch_index:03d}"
+        snap_dir = out / "dynamic_snapshots" / f"insertion_{insertion_index:03d}"
         snap_dir.mkdir(parents=True, exist_ok=True)
         (snap_dir / "hierarchy_state.json").write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
         skill_result = await export_skill_files(state, snap_dir, config=SkillExportConfig(output_dir_name=config.skill_output_dir_name))
         skillbank_index = _refresh_skillbank_index(skill_result.output_dir, config)
         from dynamix_core.skill_export import affected_node_refs
         affected_refs = affected_node_refs(update_result.changed_item_ids, skill_result.manifest_path)
+        excluded_input_item_ids.extend(update_result.excluded_item_ids)
+        excluded_oversize_singletons.extend(update_result.excluded_oversize_singletons)
         update_summaries.append({
-            "batch_index": batch_index,
+            "insertion_index": insertion_index,
             "inserted_item_ids": update_result.inserted_item_ids,
+            "excluded_item_ids": update_result.excluded_item_ids,
+            "excluded_oversize_singletons": update_result.excluded_oversize_singletons,
             "updated_community_ids": update_result.updated_community_ids,
             "changed_item_ids": update_result.changed_item_ids,
             "requires_skill_export": update_result.requires_skill_export,
@@ -249,8 +254,12 @@ async def build_dynamic_tree_from_records(config: DynaMixRunConfig) -> dict[str,
         "scenario": "dynamic_update",
         "record_count": len(records),
         "initial_count": len(initial_items),
-        "updated_count": len(remaining),
-        "batch_count": len(update_summaries),
+        "arrival_count": len(remaining),
+        "updated_count": len(remaining) - len(excluded_input_item_ids),
+        "insertion_count": len(update_summaries),
+        "excluded_count": len(excluded_input_item_ids),
+        "excluded_input_item_ids": excluded_input_item_ids,
+        "excluded_oversize_singletons": excluded_oversize_singletons,
         "item_count": len(final_state.get("items", {})),
         "community_count": len(final_state.get("communities", {})),
         "node_count": final_skill.node_count,

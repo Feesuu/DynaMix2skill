@@ -65,7 +65,7 @@ DATA_PATH="${DATA_PATH:-$REPO_ROOT/data/spreadsheetbench_verified/spreadsheetben
 
 # TREE_SCENARIO must be one of:
 #   static_build    : build the full tree from train[0:200] at once.
-#   dynamic_update  : seed from train[0:120], then insert train[120:200] in 10 batches of 8.
+#   dynamic_update  : seed from train[0:120], then insert the next 80 records sequentially.
 TREE_SCENARIO="${TREE_SCENARIO:-static_build}"
 
 RUN_STAMP="${RUN_STAMP:-$(date +%Y%m%d_%H%M%S)}"
@@ -231,11 +231,10 @@ SUMMARY_TOKEN_COUNT_METADATA_KEYS="${SUMMARY_TOKEN_COUNT_METADATA_KEYS:-analysis
 # ---------------------------------------------------------------------------
 
 DYNAMIC_INITIAL_COUNT="${DYNAMIC_INITIAL_COUNT:-120}"
-DYNAMIC_UPDATE_BATCH_SIZE="${DYNAMIC_UPDATE_BATCH_SIZE:-8}"
-DYNAMIC_UPDATE_BATCH_COUNT="${DYNAMIC_UPDATE_BATCH_COUNT:-10}"
+DYNAMIC_ARRIVAL_COUNT="${DYNAMIC_ARRIVAL_COUNT:-80}"
 DYNAMIC_MAX_PROPAGATION_ROUNDS="${DYNAMIC_MAX_PROPAGATION_ROUNDS:-16}"
 
-DYNAMIC_UPDATE_MODE="${DYNAMIC_UPDATE_MODE:-fixed_k_online_em}"
+DYNAMIC_UPDATE_MODE="${DYNAMIC_UPDATE_MODE:-budget_constrained_online_gmm}"
 DYNAMIC_ASSIGNMENT="${DYNAMIC_ASSIGNMENT:-cumulative_mass}"
 DYNAMIC_TOP_R="${DYNAMIC_TOP_R:-2}"
 DYNAMIC_MIN_MEMBERSHIP_WEIGHT="${DYNAMIC_MIN_MEMBERSHIP_WEIGHT:-0.05}"
@@ -344,8 +343,7 @@ cmd=(
   "--allow-multi-parent" "$ALLOW_MULTI_PARENT"
   "--use-support-mass" "$USE_SUPPORT_MASS"
   "--dynamic-initial-count" "$DYNAMIC_INITIAL_COUNT"
-  "--dynamic-update-batch-size" "$DYNAMIC_UPDATE_BATCH_SIZE"
-  "--dynamic-update-batch-count" "$DYNAMIC_UPDATE_BATCH_COUNT"
+  "--dynamic-arrival-count" "$DYNAMIC_ARRIVAL_COUNT"
   "--max-levels" "$MAX_LEVELS"
   "--skill-output-dir-name" "$SKILL_OUTPUT_DIR_NAME"
   "--rollout-temperature" "$ROLLOUT_TEMPERATURE"
