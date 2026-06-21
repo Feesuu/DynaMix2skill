@@ -4,12 +4,13 @@ import argparse
 import asyncio
 import hashlib
 import json
+import random
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 from dynamix_core import GmmBicConfig, ProjectedGmmDynamicTreeConfig, ProjectionConfig, SoftMembershipConfig, SummaryBudgetConfig
-from dynamix_core.data_structures import ExperienceItem, ITEM_KIND_TRAJECTORY
+from dynamix_core.data_structures import ExperienceCommunity, ExperienceHierarchyState, ExperienceItem, ExperienceLayer, ITEM_KIND_TRAJECTORY
 from dynamix_core.skill_export import SkillExportConfig, export_skill_files
 from dynamix_core.tree_builder import ProjectedGmmTreeBuilder
 from dynamix_core.update import ExperienceHierarchyDynamicUpdater
@@ -28,6 +29,10 @@ from .skillbank import SkillBankSelector
 class DynamicPipelineConfig:
     initial_count: int = 120
     arrival_count: int = 80
+    update_batch_size: int = 8
+    shuffle_seed: int | None = 42
+    snapshot_include_embeddings: bool = True
+    resume_from_snapshots: bool = False
     max_propagation_rounds: int = 16
 
 
@@ -171,12 +176,13 @@ async def build_tree_from_records(config: DynaMixRunConfig) -> dict[str, Any]:
 async def build_dynamic_tree_from_records(config: DynaMixRunConfig) -> dict[str, Any]:
     """Formal dynamic-update scenario using the online growing-K updater.
 
-    Initial records build a normal static hierarchy.  Later records are inserted
-    one by one in dataset order. L0 admission first tries routed candidate
-    communities under the analyst token budget; if none fit, the trajectory
-    forms a new dynamic L0 community and routing component. L0 raw trajectory
-    communities may add independent cards, while L1+ ExperienceCard communities
-    are updated in place.
+    Initial records build a normal static hierarchy. Later records are shuffled
+    reproducibly when configured, admitted sequentially inside each update
+    batch, and summarized concurrently by layer after the batch admission.
+    L0 admission first tries routed candidate communities under the analyst
+    token budget; if none fit, the trajectory forms a new dynamic L0 community
+    and routing component. L0 raw trajectory communities may add independent
+    cards, while L1+ ExperienceCard communities are updated in place.
     """
     out = Path(config.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -202,28 +208,60 @@ async def build_dynamic_tree_from_records(config: DynaMixRunConfig) -> dict[str,
     remaining = items[initial_count:]
     if dyn.arrival_count > 0:
         remaining = remaining[: int(dyn.arrival_count)]
+    if dyn.shuffle_seed is not None:
+        rng = random.Random(int(dyn.shuffle_seed))
+        remaining = list(remaining)
+        rng.shuffle(remaining)
+    arrival_items = list(remaining)
 
     analyst = ClusterAnalyst(generation_client, embedding_client, config.analyst)
     hierarchy_config = default_hierarchy_config(config.hierarchy)
     builder = ProjectedGmmTreeBuilder(hierarchy_config)
-    build_result = await builder.build(initial_items, summary_fn=analyst.summarize, max_levels=config.max_levels)
-    analyst.save_prompt_token_report(out / "analysis" / "cluster_prompt_token_report.json")
-    state = build_result.state
+    resume = await _load_dynamic_snapshot(
+        out=out,
+        all_items=items,
+        embedding_client=embedding_client,
+    ) if dyn.resume_from_snapshots else None
+    if resume is not None:
+        state, processed_count, update_summaries = resume
+        remaining = arrival_items[processed_count:]
+        excluded_input_item_ids = [
+            item_id
+            for entry in update_summaries
+            for item_id in entry.get("excluded_item_ids", [])
+        ]
+        excluded_oversize_singletons = [
+            payload
+            for entry in update_summaries
+            for payload in entry.get("excluded_oversize_singletons", [])
+        ]
+    else:
+        build_result = await builder.build(initial_items, summary_fn=analyst.summarize, max_levels=config.max_levels)
+        analyst.save_prompt_token_report(out / "analysis" / "cluster_prompt_token_report.json")
+        state = build_result.state
+        processed_count = 0
+        update_summaries = []
+        excluded_input_item_ids: list[str] = []
+        excluded_oversize_singletons: list[dict[str, Any]] = []
     updater = ExperienceHierarchyDynamicUpdater(hierarchy_config, max_propagation_rounds=int(dyn.max_propagation_rounds))
-
-    update_summaries = []
-    excluded_input_item_ids: list[str] = []
-    excluded_oversize_singletons: list[dict[str, Any]] = []
 
     async def dynamic_summary_fn(context):
         member_items = [ExperienceItem(**_item_payload_to_constructor_payload(payload)) for payload in context.member_items]
         previous = list(getattr(context, "previous_generated_experiences", []) or [])
         return await analyst.summarize_dynamic_update(context.community, member_items, previous)
 
-    for insertion_index, item in enumerate(remaining, start=1):
-        update_result = await updater.update(state=state, new_trajectory_items=[item], dynamic_summary_fn=dynamic_summary_fn)
-        snapshot = await state.to_dict(include_embeddings=False, validate=True)
-        snap_dir = out / "dynamic_snapshots" / f"insertion_{insertion_index:03d}"
+    batch_size = max(1, int(dyn.update_batch_size))
+    for batch_index, batch_items in enumerate(_chunks(remaining, batch_size), start=(processed_count // batch_size) + 1):
+        processed_count += len(batch_items)
+        update_result = await updater.update(
+            state=state,
+            new_trajectory_items=batch_items,
+            dynamic_summary_fn=dynamic_summary_fn,
+            dynamic_prompt_token_estimator=analyst.estimate_dynamic_prompt_tokens,
+            dynamic_prompt_token_budget=int(config.analyst.max_prompt_tokens or hierarchy_config.summary_budget.analyst_prompt_token_budget),
+        )
+        snapshot = await state.to_dict(include_embeddings=bool(dyn.snapshot_include_embeddings), validate=True)
+        snap_dir = out / "dynamic_snapshots" / f"batch_{batch_index:03d}"
         snap_dir.mkdir(parents=True, exist_ok=True)
         (snap_dir / "hierarchy_state.json").write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
         skill_result = await export_skill_files(state, snap_dir, config=SkillExportConfig(output_dir_name=config.skill_output_dir_name))
@@ -233,7 +271,9 @@ async def build_dynamic_tree_from_records(config: DynaMixRunConfig) -> dict[str,
         excluded_input_item_ids.extend(update_result.excluded_item_ids)
         excluded_oversize_singletons.extend(update_result.excluded_oversize_singletons)
         update_summaries.append({
-            "insertion_index": insertion_index,
+            "batch_index": batch_index,
+            "processed_count": processed_count,
+            "batch_item_ids": [item.item_id for item in batch_items],
             "inserted_item_ids": update_result.inserted_item_ids,
             "excluded_item_ids": update_result.excluded_item_ids,
             "excluded_oversize_singletons": update_result.excluded_oversize_singletons,
@@ -244,6 +284,16 @@ async def build_dynamic_tree_from_records(config: DynaMixRunConfig) -> dict[str,
             "skillbank_index": skillbank_index,
             "affected_node_refs": affected_refs,
         })
+        (snap_dir / "snapshot_meta.json").write_text(
+            json.dumps({
+                "batch_index": batch_index,
+                "processed_count": processed_count,
+                "batch_size": len(batch_items),
+                "snapshot_include_embeddings": bool(dyn.snapshot_include_embeddings),
+                "updates": update_summaries,
+            }, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     analyst.save_prompt_token_report(out / "analysis" / "cluster_prompt_token_report.json")
     final_state = await state.to_dict(include_embeddings=False, validate=True)
@@ -254,9 +304,12 @@ async def build_dynamic_tree_from_records(config: DynaMixRunConfig) -> dict[str,
         "scenario": "dynamic_update",
         "record_count": len(records),
         "initial_count": len(initial_items),
-        "arrival_count": len(remaining),
-        "updated_count": len(remaining) - len(excluded_input_item_ids),
-        "insertion_count": len(update_summaries),
+        "arrival_count": len(arrival_items),
+        "updated_count": sum(len(entry["inserted_item_ids"]) for entry in update_summaries),
+        "insertion_count": sum(len(entry["inserted_item_ids"]) + len(entry["excluded_item_ids"]) for entry in update_summaries),
+        "batch_count": len(update_summaries),
+        "update_batch_size": batch_size,
+        "shuffle_seed": dyn.shuffle_seed,
         "excluded_count": len(excluded_input_item_ids),
         "excluded_input_item_ids": excluded_input_item_ids,
         "excluded_oversize_singletons": excluded_oversize_singletons,
@@ -378,6 +431,8 @@ def _prepare_analyst_tokenizer_config(config: DynaMixRunConfig, out: Path) -> No
         config.analyst.prompt_token_report_path = str(out / "analysis" / "cluster_prompt_token_report.json")
     budget = {
         "analyst_max_prompt_tokens": config.analyst.max_prompt_tokens,
+        "analyst_max_output_tokens": config.analyst.max_output_tokens,
+        "analyst_dynamic_max_output_tokens": config.analyst.dynamic_max_output_tokens,
         "source": "analyst.max_prompt_tokens override" if analyst_budget_was_overridden else "hierarchy.summary_budget",
         "hierarchy_summary_budget": default_hierarchy_config(config.hierarchy).summary_budget.to_dict(),
     }
@@ -540,6 +595,77 @@ def _core_checksums(core_dir: Path) -> dict[str, str]:
 def _item_payload_to_constructor_payload(payload: dict[str, Any]) -> dict[str, Any]:
     allowed = {"item_id", "level", "kind", "text", "embedding", "support_mass", "generated_from_community_ids", "version", "metadata"}
     return {k: v for k, v in payload.items() if k in allowed}
+
+
+def _chunks(items: list[ExperienceItem], size: int) -> list[list[ExperienceItem]]:
+    size = max(1, int(size))
+    return [items[index : index + size] for index in range(0, len(items), size)]
+
+
+async def _load_dynamic_snapshot(
+    *,
+    out: Path,
+    all_items: list[ExperienceItem],
+    embedding_client: EmbeddingClient,
+) -> tuple[ExperienceHierarchyState, int, list[dict[str, Any]]] | None:
+    del embedding_client
+    snapshot_root = out / "dynamic_snapshots"
+    if not snapshot_root.exists():
+        return None
+    candidates = [
+        path
+        for path in sorted(snapshot_root.glob("batch_*"), key=_dynamic_batch_snapshot_sort_key)
+        if (path / "hierarchy_state.json").is_file() and (path / "snapshot_meta.json").is_file()
+    ]
+    if not candidates:
+        return None
+    latest = candidates[-1]
+    payload = json.loads((latest / "hierarchy_state.json").read_text(encoding="utf-8"))
+    meta = json.loads((latest / "snapshot_meta.json").read_text(encoding="utf-8"))
+    embedding_by_item = {item.item_id: list(item.embedding) for item in all_items if item.embedding}
+
+    state = ExperienceHierarchyState()
+    items: dict[str, ExperienceItem] = {}
+    missing_embeddings: list[str] = []
+    for item_id, item_payload in dict(payload.get("items", {})).items():
+        data = _item_payload_to_constructor_payload(dict(item_payload))
+        embedding = data.get("embedding")
+        if not embedding:
+            if str(item_id) in embedding_by_item:
+                data["embedding"] = embedding_by_item[str(item_id)]
+            else:
+                missing_embeddings.append(str(item_id))
+        items[str(item_id)] = ExperienceItem(**data)
+    if missing_embeddings:
+        raise RuntimeError(
+            "cannot resume dynamic snapshot without embeddings; "
+            f"missing item embeddings for {missing_embeddings[:10]}. "
+            "Run with dynamic.snapshot_include_embeddings=true or rebuild from the initial static state."
+        )
+
+    state._items = items
+    state._communities = {
+        str(community_id): ExperienceCommunity(**dict(community_payload))
+        for community_id, community_payload in dict(payload.get("communities", {})).items()
+    }
+    state._layers = {
+        int(level): ExperienceLayer(**dict(layer_payload))
+        for level, layer_payload in dict(payload.get("layers", {})).items()
+    }
+    state._pending_reroute_item_ids = set(str(item_id) for item_id in payload.get("pending_reroute_item_ids", []))
+    state._index = None
+    validation = await state.validate_hierarchy(require_no_pending_reroute=True, require_no_stale_layers=False)
+    if not validation.get("ok", False):
+        raise RuntimeError(f"dynamic snapshot {latest} is invalid: {validation}")
+    return state, int(meta.get("processed_count", 0)), list(meta.get("updates", []))
+
+
+def _dynamic_batch_snapshot_sort_key(path: Path) -> tuple[int, str]:
+    suffix = path.name.removeprefix("batch_")
+    try:
+        return int(suffix), path.name
+    except ValueError:
+        return -1, path.name
 
 
 async def run_config(config: DynaMixRunConfig) -> dict[str, Any]:

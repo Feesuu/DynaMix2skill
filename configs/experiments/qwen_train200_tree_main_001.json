@@ -89,6 +89,10 @@
   "dynamic": {
     "initial_count": 120,
     "arrival_count": 80,
+    "update_batch_size": 8,
+    "shuffle_seed": 42,
+    "snapshot_include_embeddings": true,
+    "resume_from_snapshots": false,
     "max_propagation_rounds": 16
   },
   "analyst": {
@@ -97,6 +101,8 @@
     "tokenizer_model": "/mnt/data/grouph_share/models/modelscope/models/Qwen/Qwen3-Embedding-0___6B",
     "tokenizer_required": true,
     "allow_regex_tokenizer_fallback": false,
+    "max_output_tokens": 4096,
+    "dynamic_max_output_tokens": 8192,
     "multi_card_max_level": 0,
     "max_cards_l0": null,
     "max_cards_higher": 1,

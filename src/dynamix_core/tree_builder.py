@@ -196,7 +196,7 @@ class ProjectedGmmTreeBuilder:
         if n_items < self.config.gmm_bic.min_split_size and not budget_refinement_enabled:
             return _stopped(level, input_ids, "too_small")
 
-        if n_items < 2 and budget_refinement_enabled:
+        if n_items < self.config.gmm_bic.min_split_size and budget_refinement_enabled:
             success_count, failure_count, outcome_mode = _outcome_counts(ordered)
             coarse = ExperienceCommunity(
                 community_id=f"L{level}_C0",
@@ -208,7 +208,12 @@ class ProjectedGmmTreeBuilder:
                 outcome_mode=outcome_mode,
                 success_count=success_count,
                 failure_count=failure_count,
-                metadata={"component_index": 0, "budget_refinement_coarse_root": True, "too_few_items_for_pca": True},
+                metadata={
+                    "component_index": 0,
+                    "budget_refinement_coarse_root": True,
+                    "too_few_items_for_gmm": True,
+                    "too_few_items_for_pca": n_items < 2,
+                },
             )
             refined = await self._refine_overbudget_coarse_communities(
                 [coarse],
@@ -522,16 +527,25 @@ class ProjectedGmmTreeBuilder:
                 }
                 continue
 
-            local_items = [items_by_id[item_id] for item_id in node_item_ids]
-            split = await self._budget_refinement_gmm_split(
-                local_items,
-                node=node,
-                level=level,
-                token_counts=token_counts,
-                parent_token_cost=node_token_cost,
-                token_budget=token_budget,
-                serial_start=node_serial,
-            )
+            if len(node_item_ids) < self.config.gmm_bic.min_split_size:
+                split = {
+                    "accepted": False,
+                    "reason": "too_few_items_for_gmm_refinement",
+                    "node_id": node["node_id"],
+                    "item_count": len(node_item_ids),
+                    "min_split_size": int(self.config.gmm_bic.min_split_size),
+                }
+            else:
+                local_items = [items_by_id[item_id] for item_id in node_item_ids]
+                split = await self._budget_refinement_gmm_split(
+                    local_items,
+                    node=node,
+                    level=level,
+                    token_counts=token_counts,
+                    parent_token_cost=node_token_cost,
+                    token_budget=token_budget,
+                    serial_start=node_serial,
+                )
             if not split.get("accepted"):
                 fallback = self._fallback_overbudget_node(
                     community,

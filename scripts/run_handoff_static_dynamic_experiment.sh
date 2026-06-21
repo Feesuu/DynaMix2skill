@@ -112,7 +112,8 @@ MODEL="${MODEL:-Qwen3.5-9B-AWQ}"
 OPENAI_BASE_URL="${OPENAI_BASE_URL:-http://asmiatbrqksz.10.27.127.9.nip.io/v1}"
 OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
 
-# Unified thinking mode for train rollout, heldout rollout, and DynaMix analyst.
+# Thinking mode for train/heldout rollout and static DynaMix analyst calls.
+# Dynamic patch analyst calls force enable_thinking=false while using guided_json.
 # Allowed: true, false, null.
 THINKING="${THINKING:-true}"
 
@@ -232,6 +233,10 @@ SUMMARY_TOKEN_COUNT_METADATA_KEYS="${SUMMARY_TOKEN_COUNT_METADATA_KEYS:-analysis
 
 DYNAMIC_INITIAL_COUNT="${DYNAMIC_INITIAL_COUNT:-120}"
 DYNAMIC_ARRIVAL_COUNT="${DYNAMIC_ARRIVAL_COUNT:-80}"
+DYNAMIC_UPDATE_BATCH_SIZE="${DYNAMIC_UPDATE_BATCH_SIZE:-8}"
+DYNAMIC_SHUFFLE_SEED="${DYNAMIC_SHUFFLE_SEED:-42}"
+DYNAMIC_SNAPSHOT_INCLUDE_EMBEDDINGS="${DYNAMIC_SNAPSHOT_INCLUDE_EMBEDDINGS:-true}"
+DYNAMIC_RESUME_FROM_SNAPSHOTS="${DYNAMIC_RESUME_FROM_SNAPSHOTS:-false}"
 DYNAMIC_MAX_PROPAGATION_ROUNDS="${DYNAMIC_MAX_PROPAGATION_ROUNDS:-16}"
 
 DYNAMIC_UPDATE_MODE="${DYNAMIC_UPDATE_MODE:-budget_constrained_online_gmm}"
@@ -255,6 +260,11 @@ ANALYST_ALLOW_REGEX_TOKENIZER_FALLBACK="${ANALYST_ALLOW_REGEX_TOKENIZER_FALLBACK
 
 # -1 means derive analyst max prompt tokens from summary budget.
 ANALYST_MAX_PROMPT_TOKENS="${ANALYST_MAX_PROMPT_TOKENS:--1}"
+
+# Analyst JSON completion caps.  These prevent guided_json calls from running
+# unbounded when the model keeps expanding a patch.  -1 disables the explicit cap.
+ANALYST_MAX_OUTPUT_TOKENS="${ANALYST_MAX_OUTPUT_TOKENS:-4096}"
+ANALYST_DYNAMIC_MAX_OUTPUT_TOKENS="${ANALYST_DYNAMIC_MAX_OUTPUT_TOKENS:-8192}"
 
 # L0 raw trajectory communities may generate multiple cards.  L1+ communities
 # are constrained to one higher-level abstraction card.
@@ -344,6 +354,10 @@ cmd=(
   "--use-support-mass" "$USE_SUPPORT_MASS"
   "--dynamic-initial-count" "$DYNAMIC_INITIAL_COUNT"
   "--dynamic-arrival-count" "$DYNAMIC_ARRIVAL_COUNT"
+  "--dynamic-update-batch-size" "$DYNAMIC_UPDATE_BATCH_SIZE"
+  "--dynamic-shuffle-seed" "$DYNAMIC_SHUFFLE_SEED"
+  "--dynamic-snapshot-include-embeddings" "$DYNAMIC_SNAPSHOT_INCLUDE_EMBEDDINGS"
+  "--dynamic-resume-from-snapshots" "$DYNAMIC_RESUME_FROM_SNAPSHOTS"
   "--max-levels" "$MAX_LEVELS"
   "--skill-output-dir-name" "$SKILL_OUTPUT_DIR_NAME"
   "--rollout-temperature" "$ROLLOUT_TEMPERATURE"
@@ -423,6 +437,8 @@ cmd=(
   "--analyst-tokenizer-required" "$ANALYST_TOKENIZER_REQUIRED"
   "--analyst-allow-regex-tokenizer-fallback" "$ANALYST_ALLOW_REGEX_TOKENIZER_FALLBACK"
   "--analyst-max-prompt-tokens" "$ANALYST_MAX_PROMPT_TOKENS"
+  "--analyst-max-output-tokens" "$ANALYST_MAX_OUTPUT_TOKENS"
+  "--analyst-dynamic-max-output-tokens" "$ANALYST_DYNAMIC_MAX_OUTPUT_TOKENS"
   "--analyst-multi-card-max-level" "$ANALYST_MULTI_CARD_MAX_LEVEL"
   "--analyst-max-cards-l0" "$ANALYST_MAX_CARDS_L0"
   "--analyst-max-cards-higher" "$ANALYST_MAX_CARDS_HIGHER"

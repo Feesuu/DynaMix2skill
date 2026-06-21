@@ -11,6 +11,72 @@ from .clients import EmbeddingClient, GenerationClient
 from .tokenization import get_tokenizer, TokenizerUnavailable
 
 
+_PLACEMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "target": {"type": "string", "enum": ["skill_md", "reference", "script"]},
+        "reference_kind": {"type": "string", "enum": ["procedure", "example", "edge_case", "note"]},
+    },
+    "required": ["target", "reference_kind"],
+    "additionalProperties": False,
+}
+
+_CARD_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "trigger": {"type": "string"},
+        "content": {"type": "string"},
+        "placement": _PLACEMENT_SCHEMA,
+        "confidence": {"type": "number", "exclusiveMinimum": 0.0, "maximum": 1.0},
+    },
+    "required": ["name", "trigger", "content", "placement", "confidence"],
+    "additionalProperties": False,
+}
+
+_UPDATE_CARD_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "item_id": {"type": "string"},
+        "name": {"type": "string"},
+        "trigger": {"type": "string"},
+        "content": {"type": "string"},
+        "placement": _PLACEMENT_SCHEMA,
+        "confidence": {"type": "number", "exclusiveMinimum": 0.0, "maximum": 1.0},
+    },
+    "required": ["item_id", "name", "trigger", "content", "placement", "confidence"],
+    "additionalProperties": False,
+}
+
+MINIMAL_CLUSTER_EXPERIENCE_CARDS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "cards": {"type": "array", "items": _CARD_SCHEMA},
+    },
+    "required": ["cards"],
+    "additionalProperties": False,
+}
+
+DYNAMIC_EXPERIENCE_CARD_PATCH_SET_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "updates": {"type": "array", "items": _UPDATE_CARD_SCHEMA},
+        "new_cards": {"type": "array", "items": _CARD_SCHEMA},
+    },
+    "required": ["updates", "new_cards"],
+    "additionalProperties": False,
+}
+
+DYNAMIC_EXPERIENCE_CARD_UPDATE_ONLY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "updates": {"type": "array", "items": _UPDATE_CARD_SCHEMA},
+    },
+    "required": ["updates"],
+    "additionalProperties": False,
+}
+
+
 @dataclass
 class ClusterAnalystConfig:
     """Configuration for cluster-level Trace2Skill-style abstraction.
@@ -29,6 +95,8 @@ class ClusterAnalystConfig:
     allow_regex_tokenizer_fallback: bool = False
     # None means: derive from hierarchy.summary_budget.effective_token_budget in pipeline.
     max_prompt_tokens: int | None = None
+    max_output_tokens: int | None = 4096
+    dynamic_max_output_tokens: int | None = 8192
     prompt_token_report_path: str | None = None
     token_report: list[dict[str, Any]] = field(default_factory=list)
 
@@ -61,6 +129,10 @@ class ClusterAnalyst:
         self.config = config or ClusterAnalystConfig()
         self._templates = _load_trace2skill_templates(self.config.trace2skill_analysis_dir)
 
+    @staticmethod
+    def _analyst_extra_body() -> dict[str, Any]:
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+
     async def summarize(self, community: ExperienceCommunity, members: Sequence[ExperienceItem], clustering: Any | None = None) -> list[ExperienceItem]:
         if _is_diagnostic_community(community):
             return []
@@ -74,6 +146,8 @@ class ClusterAnalyst:
                 {"role": "user", "content": prompt},
             ],
             schema_name="MinimalClusterExperienceCards",
+            guided_json=MINIMAL_CLUSTER_EXPERIENCE_CARDS_SCHEMA,
+            max_tokens=self.config.max_output_tokens,
             debug_metadata=self._generation_debug_metadata(
                 community,
                 members,
@@ -171,6 +245,11 @@ class ClusterAnalyst:
         rendered_texts: list[str] = []
         patch_specs: list[tuple[str, str, dict[str, Any], str]] = []
         extra_patches_truncated = 0
+        guided_schema = (
+            DYNAMIC_EXPERIENCE_CARD_UPDATE_ONLY_SCHEMA
+            if analyst_mode == "experience_abstractor"
+            else DYNAMIC_EXPERIENCE_CARD_PATCH_SET_SCHEMA
+        )
         for attempt in range(1, max_attempts + 1):
             try:
                 attempt_token_event = token_event
@@ -187,7 +266,10 @@ class ClusterAnalyst:
                 payload = await self.generation.chat_json(
                     messages,
                     schema_name="DynamicExperienceCardPatchSet",
+                    guided_json=guided_schema,
+                    max_tokens=self.config.dynamic_max_output_tokens,
                     retries=0 if analyst_mode == "experience_abstractor" else 2,
+                    extra_body=self._analyst_extra_body(),
                     debug_metadata={
                         **self._generation_debug_metadata(
                             community,
@@ -418,7 +500,7 @@ Return one JSON object with a top-level cards list. For higher-level abstraction
 - name: short name of the experience.
 - trigger: when a future agent should use this experience.
 - content: the concrete reusable experience/guidance. This is the main body.
-- placement: where this experience should be exported. Keep it minimal: target plus optional reference_kind.
+- placement: where this experience should be exported. Include target and reference_kind.
 - confidence: float in (0, 1].
 
 Do not output support_mass. Do not output extra structured fields such as shared_patterns, success_motifs, anti_patterns, or patch_hints. Put the useful guidance in content. Do not duplicate semantically identical cards.
@@ -476,6 +558,30 @@ Omit unchanged old cards. Do not delete old cards. Do not output support_mass.
 Return valid JSON only.
 """
 
+    def estimate_dynamic_prompt_tokens(
+        self,
+        community: ExperienceCommunity,
+        members: Sequence[ExperienceItem],
+        previous_generated_experiences: Sequence[dict[str, Any]],
+    ) -> int:
+        analyst_mode = _infer_analyst_mode(community, members, self.config)
+        system_prompt = self._dynamic_system_prompt(analyst_mode)
+        user_prompt = self._build_dynamic_update_prompt(community, members, previous_generated_experiences, analyst_mode)
+        token_count, _tokenizer_name = self._count_text_tokens(system_prompt + "\n" + user_prompt)
+        return int(token_count)
+
+    def _count_text_tokens(self, text: str) -> tuple[int, str]:
+        try:
+            tokenizer = get_tokenizer(self.config.tokenizer_model, allow_regex_fallback=self.config.allow_regex_tokenizer_fallback)
+            token_count = tokenizer.count(text)
+            tokenizer_name = tokenizer.name
+        except Exception as exc:
+            if self.config.tokenizer_required:
+                raise TokenizerUnavailable(f"cluster analyst tokenizer unavailable for prompt preflight: {exc}") from exc
+            token_count = max(1, (len(text) + 3) // 4)
+            tokenizer_name = "char_estimate_fallback"
+        return int(token_count), tokenizer_name
+
     def _preflight_prompt_budget(
         self,
         community: ExperienceCommunity,
@@ -488,15 +594,7 @@ Return valid JSON only.
         if self.config.max_prompt_tokens is None or int(self.config.max_prompt_tokens) <= 0:
             return None
         text = system_prompt + "\n" + user_prompt
-        try:
-            tokenizer = get_tokenizer(self.config.tokenizer_model, allow_regex_fallback=self.config.allow_regex_tokenizer_fallback)
-            token_count = tokenizer.count(text)
-            tokenizer_name = tokenizer.name
-        except Exception as exc:
-            if self.config.tokenizer_required:
-                raise TokenizerUnavailable(f"cluster analyst tokenizer unavailable for prompt preflight: {exc}") from exc
-            token_count = max(1, (len(text) + 3) // 4)
-            tokenizer_name = "char_estimate_fallback"
+        token_count, tokenizer_name = self._count_text_tokens(text)
         event = {
             "community_id": community.community_id,
             "level": community.level,
@@ -640,7 +738,6 @@ Return valid JSON only.
         for item in members:
             member_payloads.append({
                 "item_id": item.item_id,
-                "membership_weight": community.member_weights.get(item.item_id),
                 "success": item.metadata.get("success"),
                 "analysis_bundle": item.metadata.get("analysis_bundle", item.text),
             })
@@ -653,8 +750,6 @@ Return valid JSON only.
                 "trigger": metadata.get("trigger"),
                 "content": metadata.get("content"),
                 "confidence": metadata.get("confidence"),
-                "support_mass": card.get("support_mass"),
-                "text": card.get("text"),
             })
         higher_level = analyst_mode == "experience_abstractor"
         if higher_level:
@@ -677,21 +772,6 @@ Return valid JSON only.
                 "Never mention ground truth, gold answers, hidden labels, or verifier internals as something the target agent can access.",
                 "Return valid JSON only.",
             ]
-            output_schema = {
-                "updates": [
-                    {
-                        "item_id": "string: must equal one previous_generated_experiences item_id",
-                        "name": "string",
-                        "trigger": "string",
-                        "content": "string",
-                        "placement": {
-                            "target": "skill_md | reference | script",
-                            "reference_kind": "procedure | example | edge_case | note"
-                        },
-                        "confidence": "float in (0,1]"
-                    }
-                ],
-            }
         else:
             instruction = (
                 "Analyze the updated raw trajectory community after dynamic insertion. "
@@ -714,47 +794,13 @@ Return valid JSON only.
                 "Never mention ground truth, gold answers, hidden labels, or verifier internals as something the target agent can access.",
                 "Return valid JSON only.",
             ]
-            output_schema = {
-                "updates": [
-                    {
-                        "item_id": "string: must equal one previous_generated_experiences item_id",
-                        "name": "string",
-                        "trigger": "string",
-                        "content": "string",
-                        "placement": {
-                            "target": "skill_md | reference | script",
-                            "reference_kind": "procedure | example | edge_case | note"
-                        },
-                        "confidence": "float in (0,1]"
-                    }
-                ],
-                "new_cards": [
-                    {
-                        "name": "string",
-                        "trigger": "string",
-                        "content": "string",
-                        "placement": {
-                            "target": "skill_md | reference | script",
-                            "reference_kind": "procedure | example | edge_case | note"
-                        },
-                        "confidence": "float in (0,1]"
-                    }
-                ],
-            }
         return json.dumps({
             "instruction": instruction,
             "analyst_mode": analyst_mode,
             "dynamic_patch_policy": dynamic_patch_policy,
-            "template_user_prompt_adaptation": {
-                "success_user_template": self._templates.get("success_user_llm", ""),
-                "error_user_template": self._templates.get("error_user_llm", ""),
-                "replace_agent_log_with": "cluster_member_analysis_bundles",
-            },
             "hard_constraints": hard_constraints,
-            "community": community.to_dict(),
             "members": member_payloads,
             "previous_generated_experiences": previous_payloads,
-            "output_schema": output_schema,
         }, ensure_ascii=False, indent=2)
 
 
@@ -930,7 +976,7 @@ def _enforce_dynamic_patch_cardinality(
 
 def _is_diagnostic_community(community: ExperienceCommunity) -> bool:
     metadata = dict(community.metadata or {})
-    return bool(metadata.get("llm_summary_skipped") or metadata.get("oversize_singleton"))
+    return bool(metadata.get("llm_summary_skipped") or metadata.get("dynamic_llm_summary_skipped") or metadata.get("oversize_singleton"))
 
 
 def _member_debug_metadata(item: ExperienceItem) -> dict[str, Any]:

@@ -79,11 +79,12 @@ class GenerationClient:
         max_tokens: int | None = None,
         timeout: float | None = None,
         extra_body: dict | None = None,
+        response_format: dict[str, Any] | None = None,
         debug_metadata: dict[str, Any] | None = None,
     ) -> str:
         async with self._sem:
             body = self._request_extra_body(extra_body)
-            debug_payload = self._debug_payload(messages, temperature, max_tokens, timeout, body, debug_metadata)
+            debug_payload = self._debug_payload(messages, temperature, max_tokens, timeout, body, response_format, debug_metadata)
             cached = self._reuse_succeeded_debug_response(debug_payload)
             if cached is not None:
                 _append_usage_record(
@@ -106,7 +107,12 @@ class GenerationClient:
                 self._finish_debug(debug_path, "succeeded", response=content)
                 return content
             try:
-                content = await asyncio.to_thread(self._chat_text_sync, messages, temperature, max_tokens, timeout, body)
+                request_timeout = float(timeout or self.config.timeout_seconds)
+                content = await self._chat_text_with_app_timeout(messages, temperature, max_tokens, timeout, body, response_format, request_timeout)
+            except asyncio.TimeoutError as exc:
+                error = TimeoutError(f"generation request exceeded timeout_seconds={request_timeout:g}")
+                self._finish_debug(debug_path, "failed", error=error)
+                raise error from exc
             except Exception as exc:
                 self._finish_debug(debug_path, "failed", error=exc)
                 raise
@@ -118,7 +124,9 @@ class GenerationClient:
         messages: list[dict[str, str]],
         *,
         schema_name: str,
+        guided_json: dict[str, Any] | None = None,
         timeout: float | None = None,
+        max_tokens: int | None = None,
         retries: int = 2,
         extra_body: dict | None = None,
         debug_metadata: dict[str, Any] | None = None,
@@ -126,17 +134,67 @@ class GenerationClient:
         last_error: Exception | None = None
         metadata = dict(debug_metadata or {})
         metadata.setdefault("schema_name", schema_name)
+        request_extra_body = dict(extra_body or {})
+        response_format = _json_schema_response_format(schema_name, guided_json) if guided_json is not None else None
         for attempt in range(max(1, retries + 1)):
             attempt_metadata = {**metadata, "json_parse_attempt": attempt + 1}
-            text = await self.chat_text(messages, timeout=timeout, extra_body=extra_body, debug_metadata=attempt_metadata)
+            text = await self.chat_text(
+                messages,
+                timeout=timeout,
+                max_tokens=max_tokens,
+                extra_body=request_extra_body,
+                response_format=response_format,
+                debug_metadata=attempt_metadata,
+            )
             try:
+                if guided_json is not None:
+                    return _extract_strict_json_object(text)
                 return _extract_json_object(text)
             except Exception as exc:
                 last_error = exc
                 messages = list(messages) + [{"role": "user", "content": f"Return valid JSON only for schema {schema_name}. Previous parse error: {exc}"}]
         raise ValueError(f"failed to parse JSON for {schema_name}: {last_error}")
 
-    def _chat_text_sync(self, messages: list[dict[str, str]], temperature: float | None, max_tokens: int | None, timeout: float | None, body: dict[str, Any]) -> str:
+    async def _chat_text_with_app_timeout(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float | None,
+        max_tokens: int | None,
+        timeout: float | None,
+        body: dict[str, Any],
+        response_format: dict[str, Any] | None,
+        request_timeout: float,
+    ) -> str:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str] = loop.create_future()
+
+        def deliver_result(content: str) -> None:
+            if not future.done():
+                future.set_result(content)
+
+        def deliver_exception(exc: BaseException) -> None:
+            if not future.done():
+                future.set_exception(exc)
+
+        def worker() -> None:
+            try:
+                content = self._chat_text_sync(messages, temperature, max_tokens, timeout, body, response_format)
+            except BaseException as exc:
+                try:
+                    loop.call_soon_threadsafe(deliver_exception, exc)
+                except RuntimeError:
+                    pass
+            else:
+                try:
+                    loop.call_soon_threadsafe(deliver_result, content)
+                except RuntimeError:
+                    pass
+
+        thread = threading.Thread(target=worker, name="dynamix-generation-request", daemon=True)
+        thread.start()
+        return await asyncio.wait_for(future, timeout=max(0.001, request_timeout))
+
+    def _chat_text_sync(self, messages: list[dict[str, str]], temperature: float | None, max_tokens: int | None, timeout: float | None, body: dict[str, Any], response_format: dict[str, Any] | None) -> str:
         try:
             from openai import OpenAI
         except ImportError:
@@ -151,6 +209,8 @@ class GenerationClient:
             kwargs["max_tokens"] = max_tokens
         if body:
             kwargs["extra_body"] = body
+        if response_format:
+            kwargs["response_format"] = response_format
         client = OpenAI(api_key=self.config.resolved_api_key, base_url=self.config.base_url, timeout=timeout or self.config.timeout_seconds)
         response = None
         wait_schedule = (0.0, *tuple(float(x) for x in self.config.retry_wait_seconds))
@@ -216,6 +276,7 @@ class GenerationClient:
         max_tokens: int | None,
         timeout: float | None,
         extra_body: dict[str, Any],
+        response_format: dict[str, Any] | None,
         debug_metadata: dict[str, Any] | None,
     ) -> dict[str, Any]:
         return {
@@ -229,6 +290,7 @@ class GenerationClient:
                 "max_tokens": max_tokens,
                 "timeout_seconds": timeout or self.config.timeout_seconds,
                 "extra_body": extra_body,
+                "response_format": response_format,
             },
             "messages": messages,
         }
@@ -602,22 +664,118 @@ def _mock_text(messages: list[dict[str, str]]) -> str:
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
-    text = text.strip()
+    text = _strip_think_blocks(text).strip()
+    candidates = [text]
+    candidates.extend(_fenced_code_blocks(text))
     if text.startswith("```"):
-        text = re_sub_fence(text)
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        obj = json.loads(text[start:end + 1])
-        if isinstance(obj, dict):
-            return obj
+        candidates.append(re_sub_fence(text))
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+    for candidate in candidates:
+        for snippet in _balanced_json_object_candidates(candidate):
+            obj = json.loads(snippet)
+            if isinstance(obj, dict):
+                return obj
     raise ValueError("no JSON object found")
+
+
+def _extract_strict_json_object(text: str) -> dict[str, Any]:
+    text = _strip_think_blocks(text).strip()
+    candidates = [text]
+    if text.startswith("```") and text.endswith("```"):
+        candidates.append(re_sub_fence(text))
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        try:
+            obj = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    raise ValueError("guided JSON response was not a strict JSON object")
+
+
+def _json_schema_response_format(schema_name: str, schema: dict[str, Any] | None) -> dict[str, Any] | None:
+    if schema is None:
+        return None
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": schema_name,
+            "strict": True,
+            "schema": schema,
+        },
+    }
+
+
+def _strip_think_blocks(text: str) -> str:
+    out = str(text)
+    while True:
+        start = out.find("<think>")
+        end = out.find("</think>", start + len("<think>")) if start >= 0 else -1
+        if start < 0 or end < 0:
+            return out
+        out = out[:start] + out[end + len("</think>") :]
+
+
+def _fenced_code_blocks(text: str) -> list[str]:
+    blocks: list[str] = []
+    lines = text.splitlines()
+    in_block = False
+    current: list[str] = []
+    for line in lines:
+        if line.strip().startswith("```"):
+            if in_block:
+                blocks.append("\n".join(current).strip())
+                current = []
+                in_block = False
+            else:
+                in_block = True
+                current = []
+            continue
+        if in_block:
+            current.append(line)
+    return [block for block in blocks if block]
+
+
+def _balanced_json_object_candidates(text: str) -> list[str]:
+    candidates: list[str] = []
+    for start, char in enumerate(text):
+        if char != "{":
+            continue
+        depth = 0
+        in_string = False
+        escape = False
+        for index in range(start, len(text)):
+            current = text[index]
+            if in_string:
+                if escape:
+                    escape = False
+                elif current == "\\":
+                    escape = True
+                elif current == '"':
+                    in_string = False
+                continue
+            if current == '"':
+                in_string = True
+            elif current == "{":
+                depth += 1
+            elif current == "}":
+                depth -= 1
+                if depth == 0:
+                    candidates.append(text[start : index + 1])
+                    break
+    return candidates
 
 
 def re_sub_fence(text: str) -> str:

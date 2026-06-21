@@ -5,6 +5,7 @@ import asyncio
 import importlib.util
 import multiprocessing as mp
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -110,6 +111,75 @@ def test_generation_debug_records_effective_timeout(tmp_path):
     assert payload["request"]["timeout_seconds"] == 12.5
 
 
+def test_chat_json_uses_response_format_json_schema():
+    client = GenerationClient(GenerationConfig(base_url="mock://deterministic"))
+    seen = {}
+    schema = {"type": "object", "properties": {"cards": {"type": "array"}}, "required": ["cards"]}
+
+    async def fake_chat_text(messages, **kwargs):
+        seen.update(kwargs)
+        return '{"cards": []}'
+
+    client.chat_text = fake_chat_text
+    result = asyncio.run(
+        client.chat_json(
+            [{"role": "user", "content": "return cards"}],
+            schema_name="MinimalClusterExperienceCards",
+            guided_json=schema,
+            max_tokens=1234,
+            retries=0,
+        )
+    )
+
+    assert result == {"cards": []}
+    assert seen["extra_body"] == {}
+    assert seen["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "MinimalClusterExperienceCards",
+            "strict": True,
+            "schema": schema,
+        },
+    }
+    assert seen["max_tokens"] == 1234
+
+
+def test_generation_debug_marks_outer_timeout(tmp_path, monkeypatch):
+    client = GenerationClient(GenerationConfig(base_url="http://example.invalid/v1", debug_dir=str(tmp_path), timeout_seconds=30.0))
+
+    def slow_request(*args, **kwargs):
+        time.sleep(0.2)
+        return "late response"
+
+    monkeypatch.setattr(client, "_chat_text_sync", slow_request)
+    with pytest.raises(TimeoutError, match="generation request exceeded timeout_seconds"):
+        asyncio.run(client.chat_text([{"role": "user", "content": "hello"}], timeout=0.01))
+
+    payload = json.loads(next(tmp_path.glob("generation_*.json")).read_text())
+    assert payload["status"] == "failed"
+    assert payload["error"]["type"] == "TimeoutError"
+    assert payload["request"]["timeout_seconds"] == 0.01
+
+
+def test_chat_json_rejects_embedded_json_when_guided_schema_is_requested():
+    client = GenerationClient(GenerationConfig(base_url="mock://deterministic"))
+    schema = {"type": "object", "properties": {"cards": {"type": "array"}}, "required": ["cards"]}
+
+    async def fake_chat_text(messages, **kwargs):
+        return 'Here is the JSON you requested:\n{"cards": []}'
+
+    client.chat_text = fake_chat_text
+    with pytest.raises(ValueError, match="failed to parse JSON"):
+        asyncio.run(
+            client.chat_json(
+                [{"role": "user", "content": "return cards"}],
+                schema_name="MinimalClusterExperienceCards",
+                guided_json=schema,
+                retries=0,
+            )
+        )
+
+
 def test_generation_debug_reuses_succeeded_response_and_continues_numbering(tmp_path, monkeypatch):
     messages = [{"role": "user", "content": "summarize C0"}]
     cached_payload = {
@@ -123,6 +193,7 @@ def test_generation_debug_reuses_succeeded_response_and_continues_numbering(tmp_
             "max_tokens": None,
             "timeout_seconds": 600.0,
             "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+            "response_format": None,
         },
         "messages": messages,
         "response": "{\"cards\": []}",
@@ -166,6 +237,7 @@ def test_generation_debug_cache_identity_includes_api_key_fingerprint(tmp_path, 
             "max_tokens": None,
             "timeout_seconds": 600.0,
             "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+            "response_format": None,
         },
         "messages": messages,
         "response": "{\"cards\": []}",
@@ -318,21 +390,27 @@ def test_default_hierarchy_config_is_real_not_tiny_smoke():
         ProjectedGmmDynamicTreeConfig.from_mapping({"dynamic_update": {"mode": "fixed_k_online_em"}})
 
 
-def test_default_dynamic_protocol_is_train200_sixty_forty_sequential_arrivals():
+def test_default_dynamic_protocol_is_train200_sixty_forty_batched_arrivals():
     cfg = DynaMixRunConfig(output_dir="out", records_path="records.json")
     assert cfg.dynamic.initial_count == 120
     assert cfg.dynamic.arrival_count == 80
     assert cfg.dynamic.initial_count + cfg.dynamic.arrival_count == 200
+    assert cfg.dynamic.update_batch_size == 8
+    assert cfg.dynamic.shuffle_seed == 42
+    assert cfg.dynamic.snapshot_include_embeddings is True
+    assert cfg.dynamic.resume_from_snapshots is False
 
 
 def test_tracked_qwen_train200_config_uses_current_dynamic_arrival_schema():
     cfg_path = Path(__file__).resolve().parents[1] / "configs" / "experiments" / "qwen_train200_tree_main_001.json"
     payload = json.loads(cfg_path.read_text())
-    assert "update_batch_size" not in payload.get("dynamic", {})
-    assert "update_batch_count" not in payload.get("dynamic", {})
     cfg = DynaMixRunConfig.from_json(cfg_path)
     assert cfg.dynamic.initial_count == 120
     assert cfg.dynamic.arrival_count == 80
+    assert cfg.dynamic.update_batch_size == 8
+    assert cfg.dynamic.shuffle_seed == 42
+    assert cfg.dynamic.snapshot_include_embeddings is True
+    assert cfg.dynamic.resume_from_snapshots is False
 
 
 def _trajectory(item_id: str, embedding: list[float], tokens: int) -> ExperienceItem:
@@ -467,6 +545,63 @@ def test_dynamic_l0_budget_gate_tries_next_candidate_before_growing_k():
     assert not result.reroute_results[0].new_community_ids
     assert metadata["routing_model"]["community_ids"] == ["L0_C1", "L0_C2"]
     assert metadata["routing_model"]["component_effective_counts"] == [pytest.approx(1.5), pytest.approx(1.5)]
+
+
+def test_dynamic_l0_budget_gate_uses_dynamic_prompt_token_estimator():
+    state = asyncio.run(_build_two_l0_state(c1_tokens=1, c2_tokens=1))
+    updater = ExperienceHierarchyDynamicUpdater(_budgeted_dynamic_config())
+    calls = []
+
+    async def estimator(community, members, previous_generated_experiences):
+        calls.append({
+            "community_id": community.community_id,
+            "member_ids": [item.item_id for item in members],
+            "previous_ids": [card.get("item_id") for card in previous_generated_experiences],
+        })
+        if community.community_id == "L0_C1":
+            return 101
+        return 50
+
+    result = asyncio.run(
+        updater.update(
+            state=state,
+            new_trajectory_items=[_trajectory("new_t", [0.5, 0.5], 1)],
+            dynamic_summary_fn=_synthetic_l0_patch,
+            dynamic_prompt_token_estimator=estimator,
+        )
+    )
+    assignments = asyncio.run(state.communities_for_item("new_t"))
+
+    assert assignments == {"L0_C2": pytest.approx(0.5)}
+    assert not result.reroute_results[0].new_community_ids
+    assert any(call["community_id"] == "L0_C1" and call["previous_ids"] == ["card_c1"] for call in calls)
+    assert any(call["community_id"] == "L0_C2" and "new_t" in call["member_ids"] for call in calls)
+
+
+def test_dynamic_l0_budget_gate_uses_explicit_prompt_budget_override():
+    state = asyncio.run(_build_two_l0_state(c1_tokens=1, c2_tokens=1))
+    updater = ExperienceHierarchyDynamicUpdater(_budgeted_dynamic_config())
+
+    async def estimator(community, members, previous_generated_experiences):
+        if community.community_id == "L0_C1":
+            return 60
+        if community.community_id == "L0_C2":
+            return 40
+        return 40
+
+    result = asyncio.run(
+        updater.update(
+            state=state,
+            new_trajectory_items=[_trajectory("new_t", [0.5, 0.5], 1)],
+            dynamic_summary_fn=_synthetic_l0_patch,
+            dynamic_prompt_token_estimator=estimator,
+            dynamic_prompt_token_budget=50,
+        )
+    )
+    assignments = asyncio.run(state.communities_for_item("new_t"))
+
+    assert assignments == {"L0_C2": pytest.approx(0.5)}
+    assert not result.reroute_results[0].new_community_ids
 
 
 def test_dynamic_l0_budget_gate_keeps_all_fitting_static_soft_parents():
@@ -1262,6 +1397,53 @@ def test_cluster_prompt_uses_minimal_experience_schema():
     assert "Do not output fields except cards and each card's name, trigger, content, placement, confidence" in constraints
 
 
+def test_static_cluster_analyst_uses_guided_json_without_forcing_thinking():
+    class DummyGeneration:
+        def __init__(self):
+            self.kwargs = None
+
+        async def chat_json(self, messages, *, schema_name, **kwargs):
+            self.kwargs = kwargs
+            return {
+                "cards": [{
+                    "name": "Static lesson",
+                    "trigger": "When static clusters need one reusable card.",
+                    "content": "Use the guided JSON card schema.",
+                    "placement": {"target": "skill_md", "reference_kind": "procedure"},
+                    "confidence": 0.8,
+                }]
+            }
+
+    class DummyEmbedding:
+        async def embed_texts(self, texts, *, cache_namespace=None):
+            return [[1.0] for _ in texts]
+
+    generation = DummyGeneration()
+    analyst = ClusterAnalyst(
+        generation,
+        DummyEmbedding(),
+        ClusterAnalystConfig(tokenizer_required=False, allow_regex_tokenizer_fallback=True, max_output_tokens=3333),
+    )
+    community = ExperienceCommunity(community_id="C0", level=0, member_weights={"t0": 1.0})
+    member = ExperienceItem(
+        item_id="t0",
+        level=0,
+        kind=ITEM_KIND_TRAJECTORY,
+        text="trace",
+        embedding=[1.0],
+        metadata={"analysis_bundle": "trajectory text"},
+    )
+
+    items = asyncio.run(analyst.summarize(community, [member]))
+
+    assert len(items) == 1
+    assert generation.kwargs["guided_json"]["required"] == ["cards"]
+    placement_schema = generation.kwargs["guided_json"]["properties"]["cards"]["items"]["properties"]["placement"]
+    assert placement_schema["required"] == ["target", "reference_kind"]
+    assert generation.kwargs["max_tokens"] == 3333
+    assert "extra_body" not in generation.kwargs
+
+
 def test_render_card_text_minimal_schema_only():
     from dynamix_trace2skill.summary import _render_card_text
     text = _render_card_text({"name": "N", "trigger": "T", "content": "C"})
@@ -1278,9 +1460,11 @@ def test_dynamic_analyst_adds_new_cards_without_position_matching_old_cards():
     class DummyGeneration:
         def __init__(self):
             self.messages = None
+            self.kwargs = None
 
         async def chat_json(self, messages, *, schema_name, **kwargs):
             self.messages = messages
+            self.kwargs = kwargs
             return {
                 "new_cards": [{
                     "name": "New lesson",
@@ -1299,7 +1483,7 @@ def test_dynamic_analyst_adds_new_cards_without_position_matching_old_cards():
     analyst = ClusterAnalyst(
         generation,
         DummyEmbedding(),
-        ClusterAnalystConfig(tokenizer_required=False, allow_regex_tokenizer_fallback=True),
+        ClusterAnalystConfig(tokenizer_required=False, allow_regex_tokenizer_fallback=True, dynamic_max_output_tokens=7777),
     )
     community = ExperienceCommunity(community_id="C0", level=0, member_weights={"t0": 1.0})
     member = ExperienceItem(
@@ -1329,6 +1513,15 @@ def test_dynamic_analyst_adds_new_cards_without_position_matching_old_cards():
     assert "old_high_conf" in prompt
     assert "new_cards" in prompt
     assert "Never infer update targets from output order or confidence rank" in prompt
+    payload = json.loads(prompt)
+    assert set(payload) == {"instruction", "analyst_mode", "dynamic_patch_policy", "hard_constraints", "members", "previous_generated_experiences"}
+    assert "community" not in payload
+    assert "output_schema" not in payload
+    assert all("support_mass" not in member for member in payload["members"])
+    assert all("support_mass" not in card for card in payload["previous_generated_experiences"])
+    assert generation.kwargs["guided_json"]["required"] == ["updates", "new_cards"]
+    assert generation.kwargs["max_tokens"] == 7777
+    assert generation.kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
 
 
 def test_dynamic_analyst_updates_only_explicit_previous_card_ids():

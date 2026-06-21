@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable, Iterable, Sequence
 
 import numpy as np
@@ -21,6 +22,10 @@ from .projection import normalize_rows, project_with_basis
 
 EmbedFn = Callable[[Sequence[ExperienceItem]], dict[str, list[float]] | Awaitable[dict[str, list[float]]]]
 DynamicSummaryFn = Callable[["DynamicCommunityContext"], Iterable[ExperienceCardPatch] | Awaitable[Iterable[ExperienceCardPatch]]]
+DynamicPromptTokenEstimator = Callable[
+    [ExperienceCommunity, Sequence[ExperienceItem], Sequence[dict[str, Any]]],
+    int | Awaitable[int],
+]
 FALLBACK_ROUTING_TEMPERATURE = 8.0
 
 
@@ -99,6 +104,8 @@ class ExperienceHierarchyDynamicUpdater:
         new_trajectory_items: Iterable[ExperienceItem],
         dynamic_summary_fn: DynamicSummaryFn,
         embed_fn: EmbedFn | None = None,
+        dynamic_prompt_token_estimator: DynamicPromptTokenEstimator | None = None,
+        dynamic_prompt_token_budget: int | None = None,
     ) -> DynamicUpdateResult:
         new_items = [copy.deepcopy(item) for item in new_trajectory_items]
         if not new_items:
@@ -126,21 +133,30 @@ class ExperienceHierarchyDynamicUpdater:
                 item = (await _ensure_embeddings([item], embed_fn))[0]
             _validate_new_trajectories([item])
             await self._ensure_all_routing_contribution_caches(state)
-            result = await self._update_one_trajectory(
+            result = await self._admit_one_trajectory(
                 state=state,
                 item=item,
-                dynamic_summary_fn=dynamic_summary_fn,
+                dynamic_prompt_token_estimator=dynamic_prompt_token_estimator,
+                dynamic_prompt_token_budget=dynamic_prompt_token_budget,
             )
             inserted_ids.extend(result.inserted_item_ids)
             excluded_ids.extend(result.excluded_item_ids)
             excluded_oversize_singletons.extend(result.excluded_oversize_singletons)
             initial_affected.update(result.initial_affected_community_ids)
-            patch_results.extend(result.patch_results)
             reroute_results.extend(result.reroute_results)
             routing_results.extend(result.routing_results)
-            updated_communities.update(result.updated_community_ids)
-            changed_items.update(result.changed_item_ids)
-            terminal_changed.update(result.terminal_changed_item_ids)
+
+        propagated = await self._propagate_affected_communities(
+            state=state,
+            affected=sorted(initial_affected),
+            dynamic_summary_fn=dynamic_summary_fn,
+        )
+        patch_results.extend(propagated.patch_results)
+        reroute_results.extend(propagated.reroute_results)
+        routing_results.extend(propagated.routing_results)
+        updated_communities.update(propagated.updated_community_ids)
+        changed_items.update(propagated.changed_item_ids)
+        terminal_changed.update(propagated.terminal_changed_item_ids)
 
         await state.clear_pending_reroute_items()
         if self.config.dynamic_update.clear_stale_after_propagation:
@@ -163,19 +179,28 @@ class ExperienceHierarchyDynamicUpdater:
             validation=validation,
         )
 
-    async def _update_one_trajectory(
+    async def _admit_one_trajectory(
         self,
         *,
         state: ExperienceHierarchyState,
         item: ExperienceItem,
-        dynamic_summary_fn: DynamicSummaryFn,
+        dynamic_prompt_token_estimator: DynamicPromptTokenEstimator | None = None,
+        dynamic_prompt_token_budget: int | None = None,
     ) -> DynamicUpdateResult:
         await self._require_saved_routing_model(state, level=0)
         item_token_count = self._item_token_count(item)
-        token_budget = int(self.config.summary_budget.effective_token_budget)
-        if item_token_count > token_budget:
+        if dynamic_prompt_token_estimator is not None:
+            token_budget = int(dynamic_prompt_token_budget or self.config.summary_budget.analyst_prompt_token_budget)
+        else:
+            token_budget = int(self.config.summary_budget.effective_token_budget)
+        singleton_prompt_tokens = await self._estimate_l0_singleton_prompt_tokens(
+            item=item,
+            token_budget=token_budget,
+            dynamic_prompt_token_estimator=dynamic_prompt_token_estimator,
+        )
+        if singleton_prompt_tokens > token_budget:
             validation = await state.validate_hierarchy(require_no_pending_reroute=True, require_no_stale_layers=False)
-            excluded = _dynamic_excluded_oversize_singleton(item, item_token_count, token_budget)
+            excluded = _dynamic_excluded_oversize_singleton(item, singleton_prompt_tokens, token_budget)
             return DynamicUpdateResult(
                 [],
                 [],
@@ -196,6 +221,7 @@ class ExperienceHierarchyDynamicUpdater:
             routing=initial_routing,
             item_token_count=item_token_count,
             token_budget=token_budget,
+            dynamic_prompt_token_estimator=dynamic_prompt_token_estimator,
         )
         gated_routing = DynamicRoutingResult(
             level=0,
@@ -215,54 +241,109 @@ class ExperienceHierarchyDynamicUpdater:
                 await self._append_routing_component(state, level=0, community=community, seed_item=item)
             await self._update_layer_routing_model(state, level=0, item_ids=inserted_ids, posterior_assignments=gated_posterior)
 
-        affected = sorted(initial_reroute.affected_community_ids)
-        patch_results: list[DynamicPatchResult] = []
-        reroute_results: list[RerouteResult] = [initial_reroute]
-        routing_results: list[DynamicRoutingResult] = [gated_routing]
-        updated_communities: set[str] = set()
-        changed_items: set[str] = set()
-        terminal_changed: set[str] = set()
+        return DynamicUpdateResult(
+            inserted_item_ids=inserted_ids,
+            initial_affected_community_ids=sorted(set(initial_reroute.affected_community_ids)),
+            updated_community_ids=[],
+            changed_item_ids=[],
+            reroute_results=[initial_reroute],
+            routing_results=[gated_routing],
+        )
 
-        rounds = 0
-        while affected:
-            rounds += 1
-            if rounds > self.max_propagation_rounds:
-                raise RuntimeError("dynamic update exceeded max_propagation_rounds")
-            current = sorted(set(affected))
-            affected = []
-            for community in await state.community_objects(current):
-                context = await self._build_context(state, community)
-                patches = list(await _maybe_await(dynamic_summary_fn(context)))
-                patch_result = await state.commit_dynamic_community_update(community=community, patches=patches)
-                patch_results.append(patch_result)
-                updated_communities.add(community.community_id)
-                changed_items.update(patch_result.changed_item_ids)
-
-                # New or embedding/text-changed cards need full reroute.
-                reroute_ids = list(dict.fromkeys(patch_result.requires_reroute_item_ids))
-                support_only_ids = [iid for iid in patch_result.support_changed_item_ids if iid not in set(reroute_ids)]
-
-                next_affected, next_terminal = await self._propagate_reroute_items(state, reroute_ids)
-                affected.extend(next_affected)
-                terminal_changed.update(next_terminal)
-
-                support_affected, support_terminal = await self._propagate_support_only_items(state, support_only_ids)
-                affected.extend(support_affected)
-                terminal_changed.update(support_terminal)
-
-                # Collect routing/reroute results emitted by helper calls.
-                routing_results.extend(getattr(self, "_last_routing_results", []))
-                reroute_results.extend(getattr(self, "_last_reroute_results", []))
-                self._last_routing_results = []
-                self._last_reroute_results = []
+    async def _update_one_trajectory(
+        self,
+        *,
+        state: ExperienceHierarchyState,
+        item: ExperienceItem,
+        dynamic_summary_fn: DynamicSummaryFn,
+    ) -> DynamicUpdateResult:
+        admission = await self._admit_one_trajectory(state=state, item=item)
+        propagated = await self._propagate_affected_communities(
+            state=state,
+            affected=admission.initial_affected_community_ids,
+            dynamic_summary_fn=dynamic_summary_fn,
+        )
 
         await state.clear_pending_reroute_items()
         validation = await state.validate_hierarchy(require_no_pending_reroute=True, require_no_stale_layers=False)
         if not validation.get("ok", False):
             raise ValueError(f"dynamic update produced invalid hierarchy: {validation}")
         return DynamicUpdateResult(
-            inserted_item_ids=inserted_ids,
-            initial_affected_community_ids=sorted(set(initial_reroute.affected_community_ids)),
+            inserted_item_ids=admission.inserted_item_ids,
+            initial_affected_community_ids=admission.initial_affected_community_ids,
+            updated_community_ids=propagated.updated_community_ids,
+            changed_item_ids=propagated.changed_item_ids,
+            excluded_item_ids=admission.excluded_item_ids,
+            excluded_oversize_singletons=admission.excluded_oversize_singletons,
+            terminal_changed_item_ids=propagated.terminal_changed_item_ids,
+            requires_skill_export=propagated.requires_skill_export,
+            patch_results=propagated.patch_results,
+            reroute_results=[*admission.reroute_results, *propagated.reroute_results],
+            routing_results=[*admission.routing_results, *propagated.routing_results],
+            validation=validation,
+        )
+
+    async def _propagate_affected_communities(
+        self,
+        *,
+        state: ExperienceHierarchyState,
+        affected: Sequence[str],
+        dynamic_summary_fn: DynamicSummaryFn,
+    ) -> DynamicUpdateResult:
+        patch_results: list[DynamicPatchResult] = []
+        reroute_results: list[RerouteResult] = []
+        routing_results: list[DynamicRoutingResult] = []
+        updated_communities: set[str] = set()
+        changed_items: set[str] = set()
+        terminal_changed: set[str] = set()
+
+        rounds = 0
+        pending = sorted(set(affected))
+        while pending:
+            rounds += 1
+            if rounds > self.max_propagation_rounds:
+                raise RuntimeError("dynamic update exceeded max_propagation_rounds")
+            current = sorted(set(pending))
+            pending = []
+            communities = await state.community_objects(current)
+            by_level: dict[int, list[ExperienceCommunity]] = {}
+            for community in communities:
+                by_level.setdefault(int(community.level), []).append(community)
+
+            for level in sorted(by_level):
+                level_communities = sorted(by_level[level], key=lambda community: community.community_id)
+
+                async def run_one(community: ExperienceCommunity) -> tuple[ExperienceCommunity, list[ExperienceCardPatch]]:
+                    context = await self._build_context(state, community)
+                    patches = list(await _maybe_await(dynamic_summary_fn(context)))
+                    return community, patches
+
+                llm_results = await asyncio.gather(*(run_one(community) for community in level_communities))
+                for community, patches in llm_results:
+                    patch_result = await state.commit_dynamic_community_update(community=community, patches=patches)
+                    patch_results.append(patch_result)
+                    updated_communities.add(community.community_id)
+                    changed_items.update(patch_result.changed_item_ids)
+
+                    reroute_ids = list(dict.fromkeys(patch_result.requires_reroute_item_ids))
+                    support_only_ids = [iid for iid in patch_result.support_changed_item_ids if iid not in set(reroute_ids)]
+
+                    next_affected, next_terminal = await self._propagate_reroute_items(state, reroute_ids)
+                    pending.extend(next_affected)
+                    terminal_changed.update(next_terminal)
+
+                    support_affected, support_terminal = await self._propagate_support_only_items(state, support_only_ids)
+                    pending.extend(support_affected)
+                    terminal_changed.update(support_terminal)
+
+                    routing_results.extend(getattr(self, "_last_routing_results", []))
+                    reroute_results.extend(getattr(self, "_last_reroute_results", []))
+                    self._last_routing_results = []
+                    self._last_reroute_results = []
+
+        return DynamicUpdateResult(
+            inserted_item_ids=[],
+            initial_affected_community_ids=[],
             updated_community_ids=sorted(updated_communities),
             changed_item_ids=sorted(changed_items),
             terminal_changed_item_ids=sorted(terminal_changed),
@@ -270,7 +351,6 @@ class ExperienceHierarchyDynamicUpdater:
             patch_results=patch_results,
             reroute_results=reroute_results,
             routing_results=routing_results,
-            validation=validation,
         )
 
     async def _propagate_reroute_items(self, state: ExperienceHierarchyState, item_ids: Sequence[str]) -> tuple[list[str], list[str]]:
@@ -545,15 +625,24 @@ class ExperienceHierarchyDynamicUpdater:
         routing: DynamicRoutingResult,
         item_token_count: int,
         token_budget: int,
+        dynamic_prompt_token_estimator: DynamicPromptTokenEstimator | None = None,
     ) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, float]], list[ExperienceCommunity]]:
         item_id = item.item_id
         selected = dict(routing.selected_assignments.get(item_id, {}))
         posterior = dict(routing.posterior_assignments.get(item_id, {}))
         ordered_candidates = sorted(selected, key=lambda cid: float(selected[cid]), reverse=True)
-        candidate_costs = await self._community_token_costs(state, ordered_candidates)
+        candidate_costs = await self._community_prompt_token_costs(
+            state,
+            ordered_candidates,
+            item=item,
+            selected_weights=selected,
+            posterior_weights=posterior,
+            fallback_item_token_count=item_token_count,
+            dynamic_prompt_token_estimator=dynamic_prompt_token_estimator,
+        )
         accepted: list[str] = []
         for community_id in ordered_candidates:
-            if int(candidate_costs.get(community_id, 0)) + int(item_token_count) <= int(token_budget):
+            if int(candidate_costs.get(community_id, 0)) <= int(token_budget):
                 accepted.append(community_id)
 
         if accepted:
@@ -584,6 +673,70 @@ class ExperienceHierarchyDynamicUpdater:
             rejected_candidate_token_costs=candidate_costs,
         )
         return {item_id: {community.community_id: 1.0}}, {item_id: {community.community_id: 1.0}}, [community]
+
+    async def _estimate_l0_singleton_prompt_tokens(
+        self,
+        *,
+        item: ExperienceItem,
+        token_budget: int,
+        dynamic_prompt_token_estimator: DynamicPromptTokenEstimator | None,
+    ) -> int:
+        item_token_count = self._item_token_count(item)
+        if dynamic_prompt_token_estimator is None:
+            return int(item_token_count)
+        community = self._new_l0_dynamic_community(
+            item=item,
+            item_token_count=item_token_count,
+            token_budget=token_budget,
+            rejected_candidates=[],
+            rejected_candidate_posterior_weights={},
+            rejected_candidate_token_costs={},
+        )
+        return int(await _maybe_await(dynamic_prompt_token_estimator(community, [item], [])))
+
+    async def _community_prompt_token_costs(
+        self,
+        state: ExperienceHierarchyState,
+        community_ids: Sequence[str],
+        *,
+        item: ExperienceItem,
+        selected_weights: dict[str, float],
+        posterior_weights: dict[str, float],
+        fallback_item_token_count: int,
+        dynamic_prompt_token_estimator: DynamicPromptTokenEstimator | None,
+    ) -> dict[str, int]:
+        if dynamic_prompt_token_estimator is None:
+            member_costs = await self._community_token_costs(state, community_ids)
+            return {
+                community_id: int(member_costs.get(community_id, 0)) + int(fallback_item_token_count)
+                for community_id in community_ids
+            }
+        costs: dict[str, int] = {}
+        communities = await state.community_objects(community_ids)
+        for community in communities:
+            proposed = replace(
+                community,
+                member_weights={
+                    **dict(community.member_weights),
+                    item.item_id: float(selected_weights.get(community.community_id, 0.0)),
+                },
+                posterior_member_weights={
+                    **dict(community.posterior_member_weights),
+                    item.item_id: float(posterior_weights.get(community.community_id, selected_weights.get(community.community_id, 0.0))),
+                },
+            )
+            context = await self._build_context(state, proposed)
+            member_items = await state.item_objects(list(proposed.member_weights))
+            costs[community.community_id] = int(
+                await _maybe_await(
+                    dynamic_prompt_token_estimator(
+                        proposed,
+                        member_items,
+                        list(context.previous_generated_experiences or []),
+                    )
+                )
+            )
+        return costs
 
     async def _community_token_costs(self, state: ExperienceHierarchyState, community_ids: Sequence[str]) -> dict[str, int]:
         community_ids = list(dict.fromkeys(community_ids))

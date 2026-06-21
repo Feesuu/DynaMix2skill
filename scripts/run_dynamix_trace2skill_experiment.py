@@ -807,7 +807,7 @@ def main() -> None:
     parser.add_argument("--embedding-tokenizer", default=os.environ.get("EMBED_TOKENIZER", "/mnt/data/grouph_share/models/modelscope/models/Qwen/Qwen3-Embedding-0___6B"))
     parser.add_argument("--python-executable", default=os.environ.get("DYNAMIX_PYTHON", sys.executable), help="Python executable used for all experiment stages; its bin dir is prepended to PATH so agent bash actions can call bare python")
     parser.add_argument("--max-turns", type=int, default=100)
-    parser.add_argument("--thinking", choices=["true", "false", "null"], default="true", help="Unified Qwen thinking setting passed to Trace2Skill rollout and DynaMix analyst")
+    parser.add_argument("--thinking", choices=["true", "false", "null"], default="true", help="Qwen thinking setting for Trace2Skill rollout and static DynaMix analyst; dynamic patch analyst forces enable_thinking=false")
     parser.add_argument("--skillbank-top-k", type=int, default=10, help="Select top-k DynaMix nodebank nodes by embedding before each heldout task")
     parser.add_argument("--tree-scenario", choices=["dynamic_update", "static_build"], default="dynamic_update", help="DynaMix build mode before heldout; default is the train200 60/40 dynamic protocol")
     parser.add_argument("--random-seed", type=int, default=42)
@@ -818,6 +818,10 @@ def main() -> None:
     parser.add_argument("--use-support-mass", type=parse_bool, default=True)
     parser.add_argument("--dynamic-initial-count", type=int, default=120, help="Dynamic mode: number of initial train records used for the static seed tree")
     parser.add_argument("--dynamic-arrival-count", type=int, default=80, help="Dynamic mode: number of later train records inserted sequentially; <=0 consumes all remaining train records")
+    parser.add_argument("--dynamic-update-batch-size", type=int, default=8, help="Dynamic mode: admit this many arrival trajectories sequentially, then run layer-local LLM summaries concurrently")
+    parser.add_argument("--dynamic-shuffle-seed", type=int, default=42, help="Dynamic mode: reproducibly shuffle arrival trajectories before batched admission; use -1 to disable shuffle")
+    parser.add_argument("--dynamic-snapshot-include-embeddings", type=parse_bool, default=True, help="Dynamic mode: include item embeddings in per-batch snapshots so resume can continue routing")
+    parser.add_argument("--dynamic-resume-from-snapshots", type=parse_bool, default=False, help="Dynamic mode: resume from latest dynamic_snapshots/batch_* snapshot when present; default false until fingerprint validation is enabled")
     parser.add_argument("--max-levels", type=int, default=8)
     parser.add_argument("--skill-output-dir-name", default="skills")
     parser.add_argument("--rollout-temperature", type=float, default=0.0)
@@ -897,6 +901,8 @@ def main() -> None:
     parser.add_argument("--analyst-tokenizer-required", type=parse_bool, default=True)
     parser.add_argument("--analyst-allow-regex-tokenizer-fallback", type=parse_bool, default=False)
     parser.add_argument("--analyst-max-prompt-tokens", type=int, default=-1, help="-1 derives this from summary_max_model_tokens * budget_ratio")
+    parser.add_argument("--analyst-max-output-tokens", type=int, default=4096, help="-1 disables explicit output cap for static cluster analyst JSON generation")
+    parser.add_argument("--analyst-dynamic-max-output-tokens", type=int, default=8192, help="-1 disables explicit output cap for dynamic patch analyst JSON generation")
     parser.add_argument("--analyst-multi-card-max-level", type=int, default=0)
     parser.add_argument("--analyst-max-cards-l0", type=int, default=0, help="0 means unlimited L0 cards")
     parser.add_argument("--analyst-max-cards-higher", type=int, default=1)
@@ -989,6 +995,10 @@ def main() -> None:
         "tree_scenario": args.tree_scenario,
         "dynamic_initial_count": int(args.dynamic_initial_count),
         "dynamic_arrival_count": int(args.dynamic_arrival_count),
+        "dynamic_update_batch_size": int(args.dynamic_update_batch_size),
+        "dynamic_shuffle_seed": None if int(args.dynamic_shuffle_seed) < 0 else int(args.dynamic_shuffle_seed),
+        "dynamic_snapshot_include_embeddings": bool(args.dynamic_snapshot_include_embeddings),
+        "dynamic_resume_from_snapshots": bool(args.dynamic_resume_from_snapshots),
         "max_levels": int(args.max_levels),
         "skill_output_dir_name": args.skill_output_dir_name,
         "rollout_temperature": float(args.rollout_temperature),
@@ -1283,6 +1293,10 @@ def main() -> None:
         "dynamic": {
             "initial_count": int(args.dynamic_initial_count),
             "arrival_count": int(args.dynamic_arrival_count),
+            "update_batch_size": int(args.dynamic_update_batch_size),
+            "shuffle_seed": None if int(args.dynamic_shuffle_seed) < 0 else int(args.dynamic_shuffle_seed),
+            "snapshot_include_embeddings": bool(args.dynamic_snapshot_include_embeddings),
+            "resume_from_snapshots": bool(args.dynamic_resume_from_snapshots),
             "max_propagation_rounds": int(args.dynamic_max_propagation_rounds),
         },
         "analyst": {
@@ -1292,6 +1306,8 @@ def main() -> None:
             "tokenizer_required": bool(args.analyst_tokenizer_required),
             "allow_regex_tokenizer_fallback": bool(args.analyst_allow_regex_tokenizer_fallback),
             "max_prompt_tokens": None if int(args.analyst_max_prompt_tokens) <= 0 else int(args.analyst_max_prompt_tokens),
+            "max_output_tokens": None if int(args.analyst_max_output_tokens) <= 0 else int(args.analyst_max_output_tokens),
+            "dynamic_max_output_tokens": None if int(args.analyst_dynamic_max_output_tokens) <= 0 else int(args.analyst_dynamic_max_output_tokens),
             "multi_card_max_level": int(args.analyst_multi_card_max_level),
             "max_cards_l0": None if int(args.analyst_max_cards_l0) <= 0 else int(args.analyst_max_cards_l0),
             "max_cards_higher": int(args.analyst_max_cards_higher),

@@ -802,12 +802,13 @@ class ExperienceHierarchyState:
 
         # Redistribute source community support_mass across all active generated cards.
         active_ids = [iid for iid in existing_ids if iid in self._items]
-        new_support_by_item = _support_mass_allocation(self._items, community, active_ids)
-        for item_id, new_support in new_support_by_item.items():
-            old = self._items[item_id]
-            if abs(old.support_mass - new_support) > 1.0e-9:
-                support_changed.add(item_id)
-                self._items[item_id] = replace(old, support_mass=float(new_support), version=old.version + 1)
+        if active_ids or not _community_allows_no_generated_card(community):
+            new_support_by_item = _support_mass_allocation(self._items, community, active_ids)
+            for item_id, new_support in new_support_by_item.items():
+                old = self._items[item_id]
+                if abs(old.support_mass - new_support) > 1.0e-9:
+                    support_changed.add(item_id)
+                    self._items[item_id] = replace(old, support_mass=float(new_support), version=old.version + 1)
 
         self._communities[source_community_id] = replace(community, generated_item_ids=_uniq(active_ids))
         for item_id in support_changed:
@@ -827,7 +828,11 @@ class ExperienceHierarchyState:
 
 def _community_allows_no_generated_card(community: ExperienceCommunity) -> bool:
     metadata = dict(community.metadata or {})
-    return bool(metadata.get("llm_summary_skipped") or metadata.get("oversize_singleton"))
+    return bool(
+        metadata.get("llm_summary_skipped")
+        or metadata.get("dynamic_llm_summary_skipped")
+        or metadata.get("oversize_singleton")
+    )
 
 
 def _support_mass_allocation(items: dict[str, ExperienceItem], community: ExperienceCommunity, generated_item_ids: list[str]) -> dict[str, float]:
