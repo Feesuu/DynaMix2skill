@@ -802,6 +802,8 @@ class ExperienceHierarchyState:
 
         # Redistribute source community support_mass across all active generated cards.
         active_ids = [iid for iid in existing_ids if iid in self._items]
+        if not active_ids and not patches and _community_allows_empty_dynamic_patch_skip(community):
+            community = _mark_empty_dynamic_patch_skipped(community)
         if active_ids or not _community_allows_no_generated_card(community):
             new_support_by_item = _support_mass_allocation(self._items, community, active_ids)
             for item_id, new_support in new_support_by_item.items():
@@ -833,6 +835,25 @@ def _community_allows_no_generated_card(community: ExperienceCommunity) -> bool:
         or metadata.get("dynamic_llm_summary_skipped")
         or metadata.get("oversize_singleton")
     )
+
+
+def _community_allows_empty_dynamic_patch_skip(community: ExperienceCommunity) -> bool:
+    metadata = dict(community.metadata or {})
+    return bool(
+        community.level == 0
+        and community.clustering_method == "dynamic_budget_overflow_singleton"
+        and metadata.get("created_by") == "dynamic_budget_constrained_online_gmm"
+        and metadata.get("split_reason") == "dynamic_l0_budget_overflow_new_component"
+    )
+
+
+def _mark_empty_dynamic_patch_skipped(community: ExperienceCommunity) -> ExperienceCommunity:
+    metadata = {
+        **dict(community.metadata or {}),
+        "dynamic_llm_summary_skipped": True,
+        "dynamic_summary_skip_reason": "empty_dynamic_l0_patch",
+    }
+    return replace(community, metadata=metadata)
 
 
 def _support_mass_allocation(items: dict[str, ExperienceItem], community: ExperienceCommunity, generated_item_ids: list[str]) -> dict[str, float]:

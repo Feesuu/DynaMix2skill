@@ -63,13 +63,15 @@ class Message:
 @dataclass
 class ModelSettings:
     """Settings for LLM generation."""
-    temperature: float = 0.7
+    temperature: float | None = None
     max_tokens: int | None = None
     stop: list[str] = field(default_factory=list)
     extra_body: dict = field(default_factory=dict)
     
     def to_dict(self) -> dict:
-        result = {"temperature": self.temperature}
+        result = {}
+        if self.temperature is not None:
+            result["temperature"] = self.temperature
         if self.max_tokens:
             result["max_tokens"] = self.max_tokens
         if self.stop:

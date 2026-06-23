@@ -28,6 +28,15 @@ def _load_experiment_runner_module():
     return module
 
 
+def _load_officeqa_runner_module():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "run_officeqa_benchmark.py"
+    spec = importlib.util.spec_from_file_location("run_officeqa_benchmark", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_embedding_truncates_to_configured_32k_budget_with_tokenizer(tmp_path):
     cfg = EmbeddingConfig(
         base_url="mock://deterministic",
@@ -1978,6 +1987,61 @@ def test_dynamic_l0_add_updates_existing_next_layer_inputs():
     assert after == ["old_l1", "new_l1"]
 
 
+def test_dynamic_l0_overflow_singleton_empty_patch_is_marked_skipped():
+    async def run_case():
+        state = ExperienceHierarchyState()
+        item = ExperienceItem(item_id="t0", level=0, kind=ITEM_KIND_TRAJECTORY, text="trace", embedding=[1.0])
+        await state.initialize_trajectory_items([item])
+        community = ExperienceCommunity(
+            community_id="L0_DYN_t0",
+            level=0,
+            member_weights={"t0": 1.0},
+            posterior_member_weights={"t0": 1.0},
+            clustering_method="dynamic_budget_overflow_singleton",
+            support_mass=1.0,
+            failure_count=1,
+            metadata={
+                "created_by": "dynamic_budget_constrained_online_gmm",
+                "seed_item_id": "t0",
+                "prompt_token_cost": 100,
+                "budget": 85000,
+                "split_reason": "dynamic_l0_budget_overflow_new_component",
+            },
+        )
+        state._communities[community.community_id] = community
+
+        result = await state.commit_dynamic_community_update(community=community, patches=[])
+        updated = (await state.community_objects([community.community_id]))[0]
+        return result, updated
+
+    result, updated = asyncio.run(run_case())
+
+    assert result.changed_item_ids == []
+    assert result.requires_reroute_item_ids == []
+    assert updated.generated_item_ids == []
+    assert updated.metadata["dynamic_llm_summary_skipped"] is True
+    assert updated.metadata["dynamic_summary_skip_reason"] == "empty_dynamic_l0_patch"
+
+
+def test_dynamic_plain_empty_patch_still_rejects_missing_generated_cards():
+    async def run_case():
+        state = ExperienceHierarchyState()
+        item = ExperienceItem(item_id="t0", level=0, kind=ITEM_KIND_TRAJECTORY, text="trace", embedding=[1.0])
+        await state.initialize_trajectory_items([item])
+        community = ExperienceCommunity(
+            community_id="L0_C0",
+            level=0,
+            member_weights={"t0": 1.0},
+            clustering_method="projected_gmm_bic",
+            support_mass=1.0,
+        )
+        state._communities[community.community_id] = community
+        return await state.commit_dynamic_community_update(community=community, patches=[])
+
+    with pytest.raises(ValueError, match="no generated cards"):
+        asyncio.run(run_case())
+
+
 def test_dynamic_state_rejects_l1_plus_add_patch():
     from dynamix_core.data_structures import ExperienceCardPatch, ExperienceHierarchyState
 
@@ -2402,3 +2466,666 @@ def test_l1_singleton_community_is_summarized_by_analyst():
     generated = asyncio.run(ProjectedGmmTreeBuilder(default_hierarchy_config({}))._summarize_communities(clustering, items_by_id={"e1": member}, summary_fn=summary_fn))
     assert calls == [("L1_C000", ["e1"])]
     assert [item.item_id for item in generated] == ["e2"]
+
+
+def test_officeqa_loader_and_query_exclude_gold_answer(tmp_path):
+    from dynamix_benchmarks.officeqa import load_officeqa_items, officeqa_skillbank_query
+
+    split_dir = tmp_path / "officeqa" / "splits" / "train"
+    split_dir.mkdir(parents=True)
+    (split_dir / "items.json").write_text(
+        json.dumps([
+            {
+                "uid": "q1",
+                "question": "What was the 1984 balance?",
+                "answer": "$123 million",
+                "category": "numeric",
+                "source_docs": ["https://example.test/doc?page=7"],
+                "source_files": ["tb1984.pdf"],
+            }
+        ]),
+        encoding="utf-8",
+    )
+
+    item = load_officeqa_items(tmp_path / "officeqa" / "splits", split="train")[0]
+    query = officeqa_skillbank_query(item)
+
+    assert item.uid == "q1"
+    assert "What was the 1984 balance?" in query
+    assert "Task type: numeric" in query
+    assert "$123 million" not in query
+    assert "page=7" not in query
+    assert "tb1984" not in query
+
+
+def test_officeqa_skillopt_evaluator_is_default_and_requires_answer_tag():
+    from dynamix_benchmarks.officeqa import evaluate_officeqa_prediction
+
+    result = evaluate_officeqa_prediction(
+        prediction_text="<think>hidden</think>\n<answer>$42 million</answer>",
+        gold_answer="42",
+    )
+
+    assert result.hard == 1
+    assert result.predicted_answer == "$42 million"
+    assert result.evaluator == "skillopt_normalized_em_f1"
+
+    missing_tag = evaluate_officeqa_prediction(
+        prediction_text="<think>hidden</think>\n42",
+        gold_answer="42",
+    )
+    assert missing_tag.hard == 0
+    assert missing_tag.fail_reason == "missing_answer_tag"
+
+    wrong_tag = evaluate_officeqa_prediction(
+        prediction_text="<FINAL_ANSWER>42</FINAL_ANSWER>",
+        gold_answer="42",
+    )
+    assert wrong_tag.hard == 0
+    assert wrong_tag.fail_reason == "missing_answer_tag"
+
+
+def test_officeqa_official_reward_wrapper_strips_thinking_when_explicit(tmp_path):
+    from dynamix_benchmarks.officeqa import evaluate_officeqa_prediction
+
+    reward = tmp_path / "reward.py"
+    reward.write_text(
+        "def score_answer(ground_truth, predicted, tolerance=0.0):\n"
+        "    assert '<think>' not in predicted\n"
+        "    return 1.0 if ground_truth == '42' and predicted == '<FINAL_ANSWER>42</FINAL_ANSWER>' else 0.0\n",
+        encoding="utf-8",
+    )
+
+    result = evaluate_officeqa_prediction(
+        prediction_text="<think>hidden</think>\n<FINAL_ANSWER>42</FINAL_ANSWER>",
+        gold_answer="42",
+        reward_path=reward,
+        evaluator="official_reward",
+    )
+
+    assert result.hard == 1
+    assert result.predicted_answer == "42"
+    assert result.evaluator.startswith("official_reward:")
+
+    skillopt_tag = evaluate_officeqa_prediction(
+        prediction_text="<think>hidden</think>\n<answer>42</answer>",
+        gold_answer="42",
+        reward_path=reward,
+        evaluator="official_reward",
+    )
+    assert skillopt_tag.hard == 1
+    assert skillopt_tag.predicted_answer == "42"
+
+    malformed = evaluate_officeqa_prediction(
+        prediction_text="<think>hidden</think>\n42",
+        gold_answer="42",
+        reward_path=reward,
+        evaluator="official_reward",
+    )
+    assert malformed.hard == 0
+
+
+def test_officeqa_result_converts_to_raw_trajectory_record():
+    from dynamix_benchmarks.officeqa import record_from_officeqa_result
+
+    record = record_from_officeqa_result({
+        "id": "q1",
+        "trajectory_id": "officeqa_q1",
+        "item": {
+            "uid": "q1",
+            "question": "Find the deficit.",
+            "category": "numeric",
+            "source_files": ["tb.txt"],
+            "source_docs": ["https://example.test/doc?page=1"],
+        },
+        "final_response": "<answer>5</answer>",
+        "success": True,
+        "score": 1.0,
+        "steps": [
+            {
+                "step_id": 1,
+                "raw_model_output": "Action...",
+                "action": "{\"name\":\"grep\",\"arguments\":{}}",
+                "observation": "evidence",
+                "tool_name": "grep",
+                "action_valid": True,
+            }
+        ],
+        "predicted_answer": "5",
+        "evaluator": "skillopt_normalized_em_f1",
+    })
+
+    assert record.task_id == "q1"
+    assert record.instruction == "Find the deficit."
+    assert record.instruction_type == "numeric"
+    assert record.answer_position == ""
+    assert record.success is True
+    assert record.extra["benchmark"] == "officeqa"
+
+
+def test_officeqa_fallback_evaluator_requires_explicit_debug_flag():
+    from dynamix_benchmarks.officeqa import evaluate_officeqa_prediction
+
+    with pytest.raises(ValueError):
+        evaluate_officeqa_prediction(prediction_text="<answer>42</answer>", gold_answer="42", evaluator="fallback")
+
+    result = evaluate_officeqa_prediction(
+        prediction_text="<answer>42</answer>",
+        gold_answer="42",
+        evaluator="fallback",
+        allow_fallback=True,
+    )
+    assert result.hard == 1
+    assert result.evaluator == "fallback_numeric_or_text"
+
+
+def test_officeqa_official_reward_exception_fails_formal_eval(tmp_path):
+    from dynamix_benchmarks.officeqa import OfficeQAOfficialRewardError, evaluate_officeqa_prediction
+
+    reward = tmp_path / "reward.py"
+    reward.write_text(
+        "def score_answer(ground_truth, predicted, tolerance=0.0):\n"
+        "    raise RuntimeError('broken evaluator')\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OfficeQAOfficialRewardError):
+        evaluate_officeqa_prediction(
+            prediction_text="<FINAL_ANSWER>42</FINAL_ANSWER>",
+            gold_answer="42",
+            reward_path=reward,
+            evaluator="official_reward",
+        )
+
+    debug = evaluate_officeqa_prediction(
+        prediction_text="<FINAL_ANSWER>42</FINAL_ANSWER>",
+        gold_answer="42",
+        reward_path=reward,
+        evaluator="official_reward",
+        allow_fallback=True,
+        raise_official_errors=False,
+    )
+    assert debug.hard == 0
+    assert debug.fail_reason.startswith("official_reward_error:")
+
+
+def test_officeqa_agent_execution_exceptions_are_infra_errors():
+    from dynamix_benchmarks.officeqa import is_infrastructure_agent_error
+
+    assert is_infrastructure_agent_error("Exception during execution: connection reset")
+    assert not is_infrastructure_agent_error("Max turns exceeded")
+    assert not is_infrastructure_agent_error("")
+
+
+def test_officeqa_doc_tools_do_not_follow_symlink_outside_root(tmp_path):
+    from dynamix_benchmarks.officeqa import OfficeQADocTools
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    outside = tmp_path / "outside_secret.txt"
+    outside.write_text("SECRET_VALUE", encoding="utf-8")
+    os.symlink(outside, docs / "secret.txt")
+
+    tools = OfficeQADocTools([docs], source_files=["secret.txt"])
+    assert "SECRET_VALUE" not in tools.grep("SECRET")
+    assert "secret.txt" not in tools.glob("*")
+
+
+def test_officeqa_oracle_context_does_not_follow_symlink_outside_root(tmp_path):
+    from dynamix_benchmarks.officeqa import OfficeQAItem, build_oracle_context
+
+    parsed_root = tmp_path / "treasury_bulletins_parsed"
+    transformed = parsed_root / "transformed"
+    jsons = parsed_root / "jsons"
+    transformed.mkdir(parents=True)
+    jsons.mkdir(parents=True)
+    outside = tmp_path / "outside.json"
+    outside.write_text(
+        json.dumps({"document": {"elements": [{"bbox": [{"page_id": 7}], "content": "ORACLE_LEAK_MARKER_789"}]}}),
+        encoding="utf-8",
+    )
+    os.symlink(outside, jsons / "tb1984.json")
+
+    item = OfficeQAItem(
+        id="q1",
+        uid="q1",
+        question="Q?",
+        ground_truth="A",
+        source_files=["tb1984.pdf"],
+        source_docs=["https://example.test/doc?page=7"],
+    )
+
+    assert "ORACLE_LEAK_MARKER_789" not in build_oracle_context(item, [transformed])
+
+
+def test_officeqa_oracle_context_preserves_multi_page_table_context(tmp_path):
+    from dynamix_benchmarks.officeqa import OfficeQAItem, build_oracle_context
+
+    parsed_root = tmp_path / "treasury_bulletins_parsed"
+    transformed = parsed_root / "transformed"
+    jsons = parsed_root / "jsons"
+    transformed.mkdir(parents=True)
+    jsons.mkdir(parents=True)
+    (jsons / "tb1984.json").write_text(
+        json.dumps({
+            "document": {
+                "elements": [
+                    {"bbox": [{"page_id": 7}], "content": "<table><tr><th>Year</th><th>Value</th></tr><tr><td>1984</td><td>42</td></tr></table>"},
+                    {"bbox": [{"page_id": 8}], "content": "Second page evidence"},
+                ]
+            }
+        }),
+        encoding="utf-8",
+    )
+    item = OfficeQAItem(
+        id="q1",
+        uid="q1",
+        question="Q?",
+        ground_truth="A",
+        source_files=["tb1984.pdf"],
+        source_docs=["https://example.test/doc?page=7", "https://example.test/doc?page=8"],
+    )
+
+    context = build_oracle_context(item, [transformed])
+    assert "tb1984.pdf page 7" in context
+    assert "tb1984.pdf page 8" in context
+    assert "| Year | Value |" in context
+    assert "Second page evidence" in context
+
+
+def test_officeqa_public_item_artifact_excludes_gold_answer():
+    from dynamix_benchmarks.officeqa import normalize_item
+
+    item = normalize_item({"uid": "q1", "question": "Q?", "answer": "SECRET_ANSWER", "source_docs": ["doc"]})
+    public = item.to_public_dict()
+
+    assert "SECRET_ANSWER" not in json.dumps(public)
+    assert "ground_truth" not in public
+    assert "answer" not in public
+    assert "answers" not in public
+
+
+def test_benchmark_adapter_orders_officeqa_records(tmp_path):
+    from dynamix_benchmarks.adapters import BenchmarkSlice, OfficeQAAdapter
+
+    split_root = tmp_path / "splits" / "train"
+    split_root.mkdir(parents=True)
+    (split_root / "items.json").write_text(
+        json.dumps([
+            {"uid": "a", "question": "A?", "answer": "1"},
+            {"uid": "b", "question": "B?", "answer": "2"},
+        ]),
+        encoding="utf-8",
+    )
+    source_records = tmp_path / "records.json"
+    source_records.write_text(
+        json.dumps([
+            {"trajectory_id": "officeqa_b", "task_id": "b", "trial_index": 0, "instruction": "B?"},
+            {"trajectory_id": "officeqa_a", "task_id": "a", "trial_index": 0, "instruction": "A?"},
+        ]),
+        encoding="utf-8",
+    )
+
+    adapter = OfficeQAAdapter()
+    manifest = adapter.write_ordered_records(
+        source_records=source_records,
+        output_path=tmp_path / "ordered.json",
+        manifest_path=tmp_path / "manifest.json",
+        data_path=tmp_path / "splits",
+        train_slice=BenchmarkSlice(split="train", start=0, end=2),
+    )
+    ordered = json.loads((tmp_path / "ordered.json").read_text(encoding="utf-8"))
+
+    assert [row["task_id"] for row in ordered] == ["a", "b"]
+    assert manifest["record_count"] == 2
+
+
+def test_benchmark_adapter_officeqa_builds_rollout_eval_extract_commands(tmp_path):
+    from dynamix_benchmarks.adapters import BenchmarkSlice, EvalCommandSpec, ExtractCommandSpec, OfficeQAAdapter, RolloutCommandSpec
+
+    adapter = OfficeQAAdapter()
+    data_slice = BenchmarkSlice(split="train", start=0, end=2)
+    rollout = adapter.run_rollout(RolloutCommandSpec(
+        python_executable="/bin/python",
+        data_path=tmp_path / "splits",
+        data_slice=data_slice,
+        output_dir=tmp_path / "out",
+        results_file=tmp_path / "results.json",
+        log_dir=tmp_path / "logs",
+        generation_config=tmp_path / "gen.json",
+        model="model",
+        openai_base_url="http://127.0.0.1:18002/v1",
+        rollout_llm_client="openai",
+        rollout_temperature=0.0,
+        llm_timeout_seconds=1200.0,
+        llm_retry_wait_seconds=[5.0],
+        officeqa_docs_dirs=[tmp_path / "docs"],
+        officeqa_allow_fallback_evaluator=True,
+    ))
+    eval_cmd = adapter.evaluate_results(EvalCommandSpec(
+        python_executable="/bin/python",
+        data_path=tmp_path / "splits",
+        data_slice=data_slice,
+        output_dir=tmp_path / "out",
+        results_file=tmp_path / "results.json",
+        eval_file=tmp_path / "eval.json",
+        officeqa_allow_fallback_evaluator=True,
+    ))
+    extract_cmd = adapter.extract_records(ExtractCommandSpec(
+        python_executable="/bin/python",
+        log_dir=tmp_path / "logs",
+        eval_file=tmp_path / "eval.json",
+        records_file=tmp_path / "records.json",
+    ))
+
+    assert "scripts/run_officeqa_benchmark.py" in rollout
+    assert "--evaluator" in rollout
+    assert rollout[rollout.index("--evaluator") + 1] == "skillopt"
+    assert "--max-completion-tokens" in rollout
+    assert rollout[rollout.index("--max-completion-tokens") + 1] == "16384"
+    assert "--allow-fallback-evaluator" in rollout
+    assert "scripts/evaluate_officeqa_results.py" in eval_cmd
+    assert "--evaluator" in eval_cmd
+    assert eval_cmd[eval_cmd.index("--evaluator") + 1] == "skillopt"
+    assert "scripts/extract_officeqa_records.py" in extract_cmd
+
+
+def test_benchmark_adapter_omits_none_end_idx_for_officeqa(tmp_path):
+    from dynamix_benchmarks.adapters import BenchmarkSlice, OfficeQAAdapter, RolloutCommandSpec
+
+    cmd = OfficeQAAdapter().run_rollout(RolloutCommandSpec(
+        python_executable="/bin/python",
+        data_path=tmp_path / "splits",
+        data_slice=BenchmarkSlice(split="train", start=0, end=None),
+        output_dir=tmp_path / "out",
+        results_file=tmp_path / "results.json",
+        log_dir=tmp_path / "logs",
+        generation_config=tmp_path / "gen.json",
+        model="model",
+        openai_base_url="http://127.0.0.1:18002/v1",
+        rollout_llm_client="openai",
+        rollout_temperature=0.0,
+        llm_timeout_seconds=1200.0,
+        officeqa_docs_dirs=[tmp_path / "docs"],
+    ))
+
+    assert "--end_idx" not in cmd
+    assert cmd[cmd.index("--llm_retry_wait_seconds") + 1] == "5.0,10.0,30.0"
+
+
+def test_officeqa_default_ranges_use_named_split_sizes(tmp_path):
+    runner = _load_experiment_runner_module()
+    from dynamix_benchmarks.adapters import OfficeQAAdapter
+
+    for split, count in (("train", 5), ("test", 3)):
+        split_dir = tmp_path / "officeqa" / split
+        split_dir.mkdir(parents=True)
+        (split_dir / "items.json").write_text(
+            json.dumps([
+                {"uid": f"{split}_{idx}", "question": f"Q{idx}?", "answer": str(idx)}
+                for idx in range(count)
+            ]),
+            encoding="utf-8",
+        )
+
+    args = SimpleNamespace(
+        benchmark="officeqa",
+        officeqa_train_split="train",
+        officeqa_heldout_split="test",
+        train_start=0,
+        train_end=200,
+        heldout_start=200,
+        heldout_end=400,
+        tree_scenario="dynamic_update",
+        dynamic_initial_count=120,
+        dynamic_arrival_count=80,
+        rollout_temperature=0.0,
+        generation_temperature=0.6,
+        thinking="true",
+    )
+    runner.apply_officeqa_default_ranges(args, OfficeQAAdapter(), tmp_path / "officeqa", [])
+
+    assert (args.train_start, args.train_end) == (0, 5)
+    assert (args.heldout_start, args.heldout_end) == (0, 3)
+    assert args.dynamic_initial_count == 3
+    assert args.dynamic_arrival_count == 2
+    assert args.rollout_temperature == 0.7
+    assert args.generation_temperature == 0.7
+    assert args.thinking == "false"
+
+
+def test_officeqa_skillopt_qwen_temperature_defaults_do_not_override_explicit_cli(tmp_path):
+    runner = _load_experiment_runner_module()
+    from dynamix_benchmarks.adapters import OfficeQAAdapter
+
+    for split in ("train", "test"):
+        split_dir = tmp_path / "officeqa" / split
+        split_dir.mkdir(parents=True)
+        (split_dir / "items.json").write_text(
+            json.dumps([{"uid": f"{split}_0", "question": "Q?", "answer": "A"}]),
+            encoding="utf-8",
+        )
+
+    args = SimpleNamespace(
+        benchmark="officeqa",
+        officeqa_train_split="train",
+        officeqa_heldout_split="test",
+        train_start=0,
+        train_end=1,
+        heldout_start=0,
+        heldout_end=1,
+        tree_scenario="static_build",
+        dynamic_initial_count=120,
+        dynamic_arrival_count=80,
+        rollout_temperature=0.0,
+        generation_temperature=0.0,
+        thinking="true",
+    )
+    runner.apply_officeqa_default_ranges(
+        args,
+        OfficeQAAdapter(),
+        tmp_path / "officeqa",
+        ["--rollout-temperature", "0.0", "--generation-temperature=0.0", "--thinking", "true"],
+    )
+
+    assert args.rollout_temperature == 0.0
+    assert args.generation_temperature == 0.0
+    assert args.thinking == "true"
+
+
+def test_officeqa_default_ranges_reject_invalid_explicit_bounds(tmp_path):
+    runner = _load_experiment_runner_module()
+    from dynamix_benchmarks.adapters import OfficeQAAdapter
+
+    for split in ("train", "test"):
+        split_dir = tmp_path / "officeqa" / split
+        split_dir.mkdir(parents=True)
+        (split_dir / "items.json").write_text(
+            json.dumps([{"uid": f"{split}_0", "question": "Q?", "answer": "A"}]),
+            encoding="utf-8",
+        )
+
+    args = SimpleNamespace(
+        benchmark="officeqa",
+        officeqa_train_split="train",
+        officeqa_heldout_split="test",
+        train_start=0,
+        train_end=1,
+        heldout_start=0,
+        heldout_end=2,
+        tree_scenario="static_build",
+        dynamic_initial_count=120,
+        dynamic_arrival_count=80,
+        rollout_temperature=0.0,
+        generation_temperature=0.6,
+        thinking="true",
+    )
+
+    with pytest.raises(ValueError, match="Invalid OfficeQA heldout range"):
+        runner.apply_officeqa_default_ranges(
+            args,
+            OfficeQAAdapter(),
+            tmp_path / "officeqa",
+            ["--heldout-end", "2"],
+        )
+
+
+def test_officeqa_runner_generation_config_follows_skillopt_qwen_defaults():
+    runner = _load_officeqa_runner_module()
+
+    config = runner.apply_skillopt_qwen_generation_defaults({}, max_completion_tokens=16384)
+
+    assert config["max_tokens"] == 16384
+    assert config["temperature"] == 0.7
+    assert config["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+
+    explicit = runner.apply_skillopt_qwen_generation_defaults(
+        {"temperature": 0.0, "max_tokens": 128, "extra_body": {"chat_template_kwargs": {"enable_thinking": True}}},
+        max_completion_tokens=16384,
+    )
+    assert explicit["temperature"] == 0.0
+    assert explicit["max_tokens"] == 128
+    assert explicit["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}
+
+    partial_extra = runner.apply_skillopt_qwen_generation_defaults(
+        {"extra_body": {"top_k": 20}},
+        max_completion_tokens=16384,
+    )
+    assert partial_extra["extra_body"]["top_k"] == 20
+    assert partial_extra["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+
+
+def test_react_stop_settings_do_not_override_generation_temperature():
+    from react_agent.models import ModelSettings
+
+    request_config = {"temperature": 0.0, "max_tokens": 128}
+    request_config.update(ModelSettings(stop=["Observation:"]).to_dict())
+
+    assert request_config["temperature"] == 0.0
+    assert request_config["max_tokens"] == 128
+    assert request_config["stop"] == ["Observation:"]
+    assert ModelSettings(temperature=0.7).to_dict()["temperature"] == 0.7
+
+
+def test_officeqa_tree_config_disables_dataset_json_ordering(tmp_path):
+    runner = _load_experiment_runner_module()
+    args = SimpleNamespace(
+        benchmark="officeqa",
+        data_path=str(tmp_path / "officeqa"),
+        train_start=0,
+        train_end=5,
+    )
+
+    payload = runner.tree_dataset_order_payload(args)
+
+    assert payload["dataset_path"] == str((tmp_path / "officeqa").resolve())
+    assert payload["train_start"] == 0
+    assert payload["train_end"] == 5
+    assert payload["enforce_dataset_order"] is False
+
+
+def test_officeqa_item_results_manifest_rotates_stale_jsonl(tmp_path):
+    runner = _load_officeqa_runner_module()
+    jsonl = tmp_path / "results.jsonl"
+    manifest = tmp_path / "results.jsonl.manifest.json"
+    selection_log = tmp_path / "selection.jsonl"
+    jsonl.write_text(json.dumps({"id": "old"}) + "\n", encoding="utf-8")
+    manifest.write_text(json.dumps({"fingerprint": {"old": True}}), encoding="utf-8")
+    selection_log.write_text(json.dumps({"id": "old", "selected": []}) + "\n", encoding="utf-8")
+
+    runner.rotate_stale_item_results(jsonl, manifest, reason="fingerprint mismatch", selection_log_path=selection_log)
+
+    assert not jsonl.exists()
+    assert not selection_log.exists()
+    stale_jsonls = list(tmp_path.glob("results.jsonl.stale_*"))
+    stale_selection_logs = list(tmp_path.glob("selection.jsonl.stale_*"))
+    assert len(stale_jsonls) == 1
+    assert len(stale_selection_logs) == 1
+    assert json.loads(stale_jsonls[0].read_text(encoding="utf-8"))["id"] == "old"
+    marker = json.loads(manifest.read_text(encoding="utf-8"))
+    assert marker["reason"] == "fingerprint mismatch"
+
+
+def test_officeqa_selection_log_resume_requires_matching_task_ids(tmp_path):
+    runner = _load_officeqa_runner_module()
+    selection_log = tmp_path / "selection.jsonl"
+    selection_log.write_text(
+        json.dumps({"task_id": "unrelated", "selected": []}) + "\n"
+        + json.dumps({"task_id": "another", "selected": []}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert not runner.selection_log_covers(selection_log, {"expected"})
+
+    with selection_log.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"task_id": "expected", "selected": []}) + "\n")
+
+    assert runner.selection_log_covers(selection_log, {"expected"})
+
+
+def test_officeqa_item_results_fingerprint_covers_docs_tree_files(tmp_path):
+    runner = _load_officeqa_runner_module()
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    child = docs / "doc.txt"
+    child.write_text("old", encoding="utf-8")
+
+    before = runner.path_tree_identity(docs)
+    child.write_text("newer content", encoding="utf-8")
+    after = runner.path_tree_identity(docs)
+
+    assert before["file_count"] == 1
+    assert after["file_count"] == 1
+    assert before["tree_content_sha256"] != after["tree_content_sha256"]
+
+
+def test_officeqa_item_results_fingerprint_covers_skillbank_content_and_flags(tmp_path):
+    runner = _load_officeqa_runner_module()
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "doc.txt").write_text("doc", encoding="utf-8")
+    skillbank = tmp_path / "nodebank"
+    skillbank.mkdir()
+    manifest = skillbank / "node_bank_manifest.json"
+    manifest.write_text("old", encoding="utf-8")
+
+    def make_args(**overrides):
+        payload = dict(
+            split_dir=str(tmp_path / "splits"),
+            split="test",
+            start_idx=0,
+            end_idx=1,
+            model="model",
+            openai_base_url="http://127.0.0.1:18002/v1",
+            openai_api_key="EMPTY",
+            max_turns=24,
+            evaluator="skillopt",
+            reward_tolerance=0.0,
+            allow_fallback_evaluator=False,
+            continue_on_infra_error=False,
+            skillbank_root=str(skillbank),
+            skillbank_top_k=4,
+            use_oracle_context=True,
+        )
+        payload.update(overrides)
+        return SimpleNamespace(**payload)
+
+    before = runner.build_item_results_fingerprint(make_args(), [str(docs)], {"max_tokens": 16}, None)
+    manifest.write_text("new", encoding="utf-8")
+    after = runner.build_item_results_fingerprint(make_args(), [str(docs)], {"max_tokens": 16}, None)
+    fallback = runner.build_item_results_fingerprint(make_args(allow_fallback_evaluator=True), [str(docs)], {"max_tokens": 16}, None)
+    infra = runner.build_item_results_fingerprint(make_args(continue_on_infra_error=True), [str(docs)], {"max_tokens": 16}, None)
+
+    assert before["skillbank_root"]["tree_content_sha256"] != after["skillbank_root"]["tree_content_sha256"]
+    assert after != fallback
+    assert after != infra
+
+
+def test_no_proxy_helper_adds_internal_hosts_without_wildcard():
+    runner = _load_experiment_runner_module()
+    env = {"NO_PROXY": "localhost"}
+
+    runner.append_no_proxy_hosts(env, ["http://asmiatbrqksz.10.27.127.9.nip.io/v1", "https://api.openai.com/v1"])
+
+    assert "asmiatbrqksz.10.27.127.9.nip.io" in env["NO_PROXY"].split(",")
+    assert "*" not in env["NO_PROXY"].split(",")

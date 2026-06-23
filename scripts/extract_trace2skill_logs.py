@@ -2,6 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
 from dynamix_trace2skill.log_parser import parse_trace2skill_logs, save_records
 
 

@@ -12,6 +12,16 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import urlparse
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from dynamix_benchmarks.adapters import BenchmarkSlice, EvalCommandSpec, ExtractCommandSpec, RolloutCommandSpec, get_benchmark_adapter
+from dynamix_benchmarks.officeqa import resolve_reward_path
+
+
+SKILLOPT_QWEN_DEFAULT_TEMPERATURE = 0.7
 
 
 def run(cmd: list[str], *, cwd: Path, env: dict[str, str], log_path: Path | None = None) -> None:
@@ -143,6 +153,95 @@ def parse_str_csv(value: str) -> list[str]:
     return parts
 
 
+def arg_was_provided(argv: list[str], flag: str) -> bool:
+    return any(arg == flag or arg.startswith(flag + "=") for arg in argv)
+
+
+def apply_officeqa_default_ranges(args: argparse.Namespace, adapter: Any, data_path: Path, argv: list[str]) -> None:
+    if args.benchmark != "officeqa":
+        return
+    if not arg_was_provided(argv, "--rollout-temperature"):
+        args.rollout_temperature = SKILLOPT_QWEN_DEFAULT_TEMPERATURE
+    if not arg_was_provided(argv, "--generation-temperature"):
+        args.generation_temperature = SKILLOPT_QWEN_DEFAULT_TEMPERATURE
+    if not arg_was_provided(argv, "--thinking"):
+        args.thinking = "false"
+    train_total = len(adapter.load_rows(data_path, BenchmarkSlice(split=args.officeqa_train_split, start=0, end=None)))
+    heldout_total = len(adapter.load_rows(data_path, BenchmarkSlice(split=args.officeqa_heldout_split, start=0, end=None)))
+    if train_total <= 0:
+        raise ValueError(f"OfficeQA train split {args.officeqa_train_split!r} is empty under {data_path}")
+    if heldout_total <= 0:
+        raise ValueError(f"OfficeQA heldout split {args.officeqa_heldout_split!r} is empty under {data_path}")
+    if not arg_was_provided(argv, "--train-start"):
+        args.train_start = 0
+    if not arg_was_provided(argv, "--train-end"):
+        args.train_end = train_total
+    if not arg_was_provided(argv, "--heldout-start"):
+        args.heldout_start = 0
+    if not arg_was_provided(argv, "--heldout-end"):
+        args.heldout_end = heldout_total
+    if not (0 <= int(args.train_start) < int(args.train_end) <= train_total):
+        raise ValueError(
+            f"Invalid OfficeQA train range [{args.train_start}, {args.train_end}) "
+            f"for split {args.officeqa_train_split!r} with {train_total} items"
+        )
+    if not (0 <= int(args.heldout_start) < int(args.heldout_end) <= heldout_total):
+        raise ValueError(
+            f"Invalid OfficeQA heldout range [{args.heldout_start}, {args.heldout_end}) "
+            f"for split {args.officeqa_heldout_split!r} with {heldout_total} items"
+        )
+    train_count = max(0, int(args.train_end) - int(args.train_start))
+    if args.tree_scenario == "dynamic_update" and train_count > 0:
+        if not arg_was_provided(argv, "--dynamic-initial-count"):
+            args.dynamic_initial_count = max(1, int(train_count * 0.6))
+        if not arg_was_provided(argv, "--dynamic-arrival-count"):
+            args.dynamic_arrival_count = max(0, train_count - int(args.dynamic_initial_count))
+
+
+def _host_from_url(value: str) -> str:
+    try:
+        return urlparse(value).hostname or ""
+    except Exception:
+        return ""
+
+
+def _proxy_bypass_host(host: str) -> bool:
+    normalized = host.strip().lower()
+    if not normalized:
+        return False
+    if normalized in {"localhost", "127.0.0.1", "0.0.0.0"} or normalized.endswith(".nip.io"):
+        return True
+    if normalized.startswith("10.") or normalized.startswith("192.168."):
+        return True
+    if normalized.startswith("172."):
+        parts = normalized.split(".")
+        return len(parts) >= 2 and parts[1].isdigit() and 16 <= int(parts[1]) <= 31
+    return False
+
+
+def append_no_proxy_hosts(env: dict[str, str], urls: Iterable[str]) -> None:
+    hosts = [host for host in (_host_from_url(url) for url in urls) if _proxy_bypass_host(host)]
+    if not hosts:
+        return
+    existing = [part.strip() for part in env.get("NO_PROXY", env.get("no_proxy", "")).split(",") if part.strip()]
+    merged = existing[:]
+    for host in hosts:
+        if host not in merged:
+            merged.append(host)
+    value = ",".join(merged)
+    env["NO_PROXY"] = value
+    env["no_proxy"] = value
+
+
+def tree_dataset_order_payload(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "dataset_path": str(Path(args.data_path).resolve()),
+        "train_start": int(args.train_start),
+        "train_end": int(args.train_end),
+        "enforce_dataset_order": args.benchmark == "spreadsheetbench",
+    }
+
+
 def resolve_python_executable(value: str) -> str:
     candidate = Path(value).expanduser()
     if candidate.is_absolute():
@@ -235,17 +334,59 @@ def stage_source_fingerprints(repo: Path) -> dict[str, dict[str, str | bool | in
         "run_spreadsheetbench": path_fingerprint(repo / "run_spreadsheetbench.py"),
         "evaluate_with_official": path_fingerprint(repo / "evaluate_with_official.py"),
         "extract_trace2skill_logs": path_fingerprint(repo / "scripts" / "extract_trace2skill_logs.py"),
+        "run_officeqa_benchmark": path_fingerprint(repo / "scripts" / "run_officeqa_benchmark.py"),
+        "evaluate_officeqa_results": path_fingerprint(repo / "scripts" / "evaluate_officeqa_results.py"),
+        "extract_officeqa_records": path_fingerprint(repo / "scripts" / "extract_officeqa_records.py"),
         "build_dynamix_tree": path_fingerprint(repo / "scripts" / "build_dynamix_tree.py"),
         "spreadsheetbench_support": path_fingerprint(repo / "spreadsheetbench_support.py"),
         "spreadsheet_agent": path_fingerprint(repo / "spreadsheet_agent", source_only=True),
         "react_agent": path_fingerprint(repo / "src" / "react_agent", source_only=True),
+        "dynamix_benchmarks": path_fingerprint(repo / "src" / "dynamix_benchmarks", source_only=True),
         "dynamix_core": path_fingerprint(repo / "src" / "dynamix_core", source_only=True),
         "dynamix_trace2skill": path_fingerprint(repo / "src" / "dynamix_trace2skill", source_only=True),
     }
 
 
+def benchmark_source_fingerprints(source_fp: dict[str, dict[str, str | bool | int]], *, benchmark: str, stage: str) -> dict[str, dict[str, str | bool | int]]:
+    base = {"runner": source_fp["runner"]}
+    if benchmark == "officeqa":
+        by_stage = {
+            "rollout": {
+                "run_officeqa_benchmark": source_fp["run_officeqa_benchmark"],
+                "react_agent": source_fp["react_agent"],
+                "dynamix_benchmarks": source_fp["dynamix_benchmarks"],
+                "dynamix_trace2skill": source_fp["dynamix_trace2skill"],
+            },
+            "eval": {
+                "evaluate_officeqa_results": source_fp["evaluate_officeqa_results"],
+                "dynamix_benchmarks": source_fp["dynamix_benchmarks"],
+            },
+            "extract": {
+                "extract_officeqa_records": source_fp["extract_officeqa_records"],
+                "dynamix_benchmarks": source_fp["dynamix_benchmarks"],
+            },
+        }
+        return {**base, **by_stage[stage]}
+    by_stage = {
+        "rollout": {
+            "run_spreadsheetbench": source_fp["run_spreadsheetbench"],
+            "spreadsheet_agent": source_fp["spreadsheet_agent"],
+            "react_agent": source_fp["react_agent"],
+        },
+        "eval": {
+            "evaluate_with_official": source_fp["evaluate_with_official"],
+            "spreadsheetbench_support": source_fp["spreadsheetbench_support"],
+        },
+        "extract": {
+            "extract_trace2skill_logs": source_fp["extract_trace2skill_logs"],
+        },
+    }
+    return {**base, **by_stage[stage]}
+
+
 def rollout_protocol(args: argparse.Namespace, *, generation_config: Path) -> dict[str, object]:
     return {
+        "benchmark": args.benchmark,
         "model": args.model,
         "openai_base_url": args.openai_base_url,
         "openai_api_key": api_key_fingerprint(args.openai_api_key),
@@ -263,12 +404,25 @@ def rollout_protocol(args: argparse.Namespace, *, generation_config: Path) -> di
         "shuffle_seed": str(args.rollout_shuffle_seed),
         "sample": int(args.rollout_sample),
         "generation_config": path_fingerprint(generation_config),
+        "officeqa": {
+            "docs_dir": list(getattr(args, "_officeqa_docs_dirs_resolved", getattr(args, "officeqa_docs_dir", []))),
+            "train_split": getattr(args, "officeqa_train_split", ""),
+            "heldout_split": getattr(args, "officeqa_heldout_split", ""),
+            "evaluator": getattr(args, "officeqa_evaluator", "skillopt"),
+            "max_completion_tokens": int(getattr(args, "officeqa_max_completion_tokens", 16384)),
+            "reward_path": getattr(args, "_officeqa_reward_path_resolved", getattr(args, "officeqa_reward_path", "")),
+            "reward_tolerance": float(getattr(args, "officeqa_reward_tolerance", 0.0)),
+            "allow_fallback_evaluator": bool(getattr(args, "officeqa_allow_fallback_evaluator", False)),
+            "continue_on_infra_error": bool(getattr(args, "officeqa_continue_on_infra_error", False)),
+            "use_oracle_context": bool(getattr(args, "officeqa_use_oracle_context", True)),
+        } if getattr(args, "benchmark", "spreadsheetbench") == "officeqa" else {},
     }
 
 
 def skillbank_retrieval_protocol(args: argparse.Namespace, *, cache_path: Path, selection_log: Path) -> dict[str, object]:
     return {
-        "query_policy": "instruction + Task type; answer_position excluded",
+        "benchmark": args.benchmark,
+        "query_policy": "instruction/question + Task type; answer_position/gold answer/source_docs excluded",
         "top_k": int(args.skillbank_top_k),
         "embedding_base_url": args.embedding_base_url,
         "embedding_model": args.embedding_model,
@@ -392,7 +546,9 @@ def validate_tree_summary_for_heldout(summary: dict, args: argparse.Namespace) -
         raise RuntimeError(f"DynaMix tree summary scenario mismatch: expected {args.tree_scenario!r}, got {scenario!r}")
     if args.tree_scenario != "dynamic_update":
         return
-    if hasattr(args, "train_start") and hasattr(args, "train_end"):
+    if getattr(args, "benchmark", "spreadsheetbench") == "officeqa":
+        train_count = int(summary.get("record_count", 0))
+    elif hasattr(args, "train_start") and hasattr(args, "train_end"):
         train_count = int(args.train_end) - int(args.train_start)
     else:
         train_count = int(summary.get("record_count", 0))
@@ -631,7 +787,7 @@ def runtime_dead_corner_findings(args: argparse.Namespace) -> list[dict[str, str
             "finding": "each embedding item is under the model limit, but a large batch of long chunks can still overload an embedding service by aggregate tokens.",
             "evidence": f"batch_size={args.embedding_batch_size}, chunk_tokens={args.chunked_embedding_chunk_tokens}, max_model_len={args.embedding_max_model_len}",
         })
-    train_count = int(args.train_end) - int(args.train_start)
+    train_count = int(getattr(args, "_observed_train_records", int(args.train_end) - int(args.train_start)))
     expected_dynamic = expected_dynamic_counts(
         record_count=train_count,
         initial_count=int(args.dynamic_initial_count),
@@ -788,7 +944,18 @@ def write_split_manifest(data_path: Path, run_dir: Path, *, train_start: int, tr
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Trace2Skill train collection -> nodebank build -> heldout experiment")
+    parser.add_argument("--benchmark", choices=["spreadsheetbench", "officeqa"], default="spreadsheetbench", help="Benchmark adapter. spreadsheetbench preserves the original Trace2Skill flow; officeqa uses local OfficeQA document ReAct rollout.")
     parser.add_argument("--data-path", required=True)
+    parser.add_argument("--officeqa-docs-dir", action="append", default=[], help="OfficeQA docs root; repeatable. Defaults to OFFICEQA_DOCS_DIR in run_officeqa_benchmark.py.")
+    parser.add_argument("--officeqa-train-split", default="train")
+    parser.add_argument("--officeqa-heldout-split", default="test")
+    parser.add_argument("--officeqa-evaluator", choices=["skillopt", "official_reward", "fallback"], default="skillopt")
+    parser.add_argument("--officeqa-max-completion-tokens", type=int, default=16384)
+    parser.add_argument("--officeqa-reward-path", default="")
+    parser.add_argument("--officeqa-reward-tolerance", type=float, default=0.0)
+    parser.add_argument("--officeqa-allow-fallback-evaluator", action="store_true", help="Debug only: allow simplified OfficeQA numeric/text evaluator when official reward.py is missing.")
+    parser.add_argument("--officeqa-continue-on-infra-error", action="store_true", help="Debug only: convert OfficeQA infra/config exceptions into failed rows instead of failing the stage.")
+    parser.add_argument("--officeqa-use-oracle-context", type=parse_bool, default=True)
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--records-path", default=None, help="Existing extracted records.json; when set, skip train rollout/eval/extraction and build from this file")
     parser.add_argument("--reuse-train-run-dir", default=None, help="Existing run dir containing records.json; when set, skip train rollout/eval/extraction")
@@ -909,7 +1076,24 @@ def main() -> None:
     parser.add_argument("--analyst-higher-level-mode", default="single_abstraction")
     parser.add_argument("--analyst-truncate-higher-level-extra-cards", type=parse_bool, default=True)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
-    args = parser.parse_args()
+    argv = sys.argv[1:]
+    args = parser.parse_args(argv)
+
+    adapter = get_benchmark_adapter(args.benchmark)
+    try:
+        apply_officeqa_default_ranges(args, adapter, Path(args.data_path), argv)
+    except ValueError as exc:
+        parser.error(str(exc))
+    train_slice = BenchmarkSlice(
+        split=args.officeqa_train_split if args.benchmark == "officeqa" else "dataset",
+        start=int(args.train_start),
+        end=int(args.train_end),
+    )
+    heldout_slice = BenchmarkSlice(
+        split=args.officeqa_heldout_split if args.benchmark == "officeqa" else "dataset",
+        start=int(args.heldout_start),
+        end=int(args.heldout_end),
+    )
 
     if args.dynamic_update_mode != "budget_constrained_online_gmm":
         parser.error("--dynamic-update-mode is currently fixed to budget_constrained_online_gmm; this is not a tunable protocol knob")
@@ -964,17 +1148,68 @@ def main() -> None:
     env["DYNAMIX_PYTHON"] = python_executable
     env["OPENAI_API_KEY"] = args.openai_api_key
     env["OPENAI_BASE_URL"] = args.openai_base_url
+    append_no_proxy_hosts(env, [args.openai_base_url, args.embedding_base_url])
+
+    officeqa_docs_dirs_resolved: list[Path] = []
+    officeqa_reward_path_resolved: Path | None = None
+    if args.benchmark == "officeqa":
+        if args.officeqa_evaluator == "fallback" and not args.officeqa_allow_fallback_evaluator:
+            parser.error("--officeqa-evaluator fallback requires --officeqa-allow-fallback-evaluator")
+        docs_values = list(args.officeqa_docs_dir)
+        if not docs_values:
+            docs_values = [part for part in env.get("OFFICEQA_DOCS_DIR", "").split(os.pathsep) if part]
+        if not docs_values:
+            parser.error("--officeqa-docs-dir or OFFICEQA_DOCS_DIR is required for --benchmark officeqa")
+        for value in docs_values:
+            docs_dir = Path(value).expanduser().resolve()
+            if not docs_dir.is_dir():
+                parser.error(f"OfficeQA docs directory does not exist: {docs_dir}")
+            officeqa_docs_dirs_resolved.append(docs_dir)
+        officeqa_reward_path_resolved = (
+            resolve_reward_path(args.data_path, args.officeqa_reward_path or None, required=args.officeqa_evaluator == "official_reward")
+            if args.officeqa_evaluator == "official_reward" or args.officeqa_reward_path
+            else None
+        )
+        args._officeqa_docs_dirs_resolved = [str(path) for path in officeqa_docs_dirs_resolved]
+        args._officeqa_reward_path_resolved = str(officeqa_reward_path_resolved) if officeqa_reward_path_resolved else ""
 
     train_gen_config_path = train_artifact_dir / "trace2skill_generation_config.json"
     write_generation_config(train_gen_config_path, thinking=thinking, temperature=args.rollout_temperature)
     scenario_gen_config_path = scenario_dir / "trace2skill_generation_config.json"
     write_generation_config(scenario_gen_config_path, thinking=thinking, temperature=args.rollout_temperature)
-    split_manifest = write_split_manifest(Path(args.data_path), scenario_dir, train_start=args.train_start, train_end=args.train_end, heldout_start=args.heldout_start, heldout_end=args.heldout_end)
-    dataset_fp = path_fingerprint(dataset_json_path(args.data_path))
+    split_manifest = adapter.write_split_manifest(
+        data_path=Path(args.data_path),
+        run_dir=scenario_dir,
+        train_slice=train_slice,
+        heldout_slice=heldout_slice,
+    )
+    dataset_fp = path_fingerprint(dataset_json_path(args.data_path) if args.benchmark == "spreadsheetbench" else Path(args.data_path))
     source_fp = stage_source_fingerprints(repo)
+    officeqa_inputs_fp = {
+        "docs_dirs": [
+            {"path": str(path), "fingerprint": path_fingerprint(path)}
+            for path in officeqa_docs_dirs_resolved
+        ],
+        "reward": (
+            {"path": str(officeqa_reward_path_resolved), "fingerprint": path_fingerprint(officeqa_reward_path_resolved)}
+            if officeqa_reward_path_resolved is not None
+            else {"exists": False, "allow_fallback_evaluator": bool(args.officeqa_allow_fallback_evaluator)}
+        ),
+    } if args.benchmark == "officeqa" else {}
 
     runtime = {
+        "benchmark": args.benchmark,
         "data_path": str(Path(args.data_path).resolve()),
+        "officeqa_docs_dir": [str(path) for path in officeqa_docs_dirs_resolved],
+        "officeqa_train_split": args.officeqa_train_split,
+        "officeqa_heldout_split": args.officeqa_heldout_split,
+        "officeqa_evaluator": args.officeqa_evaluator,
+        "officeqa_max_completion_tokens": int(args.officeqa_max_completion_tokens),
+        "officeqa_reward_path": str(officeqa_reward_path_resolved) if officeqa_reward_path_resolved else "",
+        "officeqa_reward_tolerance": float(args.officeqa_reward_tolerance),
+        "officeqa_allow_fallback_evaluator": bool(args.officeqa_allow_fallback_evaluator),
+        "officeqa_continue_on_infra_error": bool(args.officeqa_continue_on_infra_error),
+        "officeqa_use_oracle_context": bool(args.officeqa_use_oracle_context),
         "run_dir": str(run_dir),
         "train_artifact_dir": str(train_artifact_dir),
         "scenario_output_dir": str(scenario_dir),
@@ -1054,27 +1289,33 @@ def main() -> None:
     train_out = train_artifact_dir / "trace2skill_train_outputs"
     train_logs = train_artifact_dir / "trace2skill_train_logs"
     train_results = train_artifact_dir / "trace2skill_train_results.json"
-    train_collect_cmd = [
-        python_executable, "run_spreadsheetbench.py",
-        "--data_path", args.data_path,
-        "--output_dir", str(train_out),
-        "--agent", "cli_only",
-        "--model", args.model,
-        "--llm_client", args.rollout_llm_client,
-        "--temperature", str(args.rollout_temperature),
-        "--generation_config", str(train_gen_config_path),
-        "--llm_timeout_seconds", str(args.rollout_client_timeout_seconds),
-        "--llm_retry_wait_seconds", ",".join(str(value) for value in args.rollout_client_retry_wait_seconds),
-        "--num_random_seeds", str(args.rollout_num_random_seeds),
-        "--repeat", str(args.rollout_repeat),
-        "--max_turns", str(args.max_turns),
-        "--start_idx", str(args.train_start),
-        "--end_idx", str(args.train_end),
-        "--workers", str(args.workers),
-        "--results_file", str(train_results),
-        "--log_dir", str(train_logs),
-        "--log_format", "markdown",
-    ]
+    train_collect_cmd = adapter.run_rollout(RolloutCommandSpec(
+        python_executable=python_executable,
+        data_path=Path(args.data_path),
+        data_slice=train_slice,
+        output_dir=train_out,
+        results_file=train_results,
+        log_dir=train_logs,
+        generation_config=train_gen_config_path,
+        model=args.model,
+        openai_base_url=args.openai_base_url,
+        rollout_llm_client=args.rollout_llm_client,
+        rollout_temperature=float(args.rollout_temperature),
+        llm_timeout_seconds=float(args.rollout_client_timeout_seconds),
+        llm_retry_wait_seconds=list(args.rollout_client_retry_wait_seconds),
+        rollout_num_random_seeds=int(args.rollout_num_random_seeds),
+        rollout_repeat=int(args.rollout_repeat),
+        max_turns=int(args.max_turns),
+        workers=int(args.workers),
+        officeqa_docs_dirs=officeqa_docs_dirs_resolved,
+        officeqa_evaluator=args.officeqa_evaluator,
+        officeqa_max_completion_tokens=int(args.officeqa_max_completion_tokens),
+        officeqa_reward_path=officeqa_reward_path_resolved,
+        officeqa_reward_tolerance=float(args.officeqa_reward_tolerance),
+        officeqa_allow_fallback_evaluator=bool(args.officeqa_allow_fallback_evaluator),
+        officeqa_use_oracle_context=bool(args.officeqa_use_oracle_context),
+        officeqa_continue_on_infra_error=bool(args.officeqa_continue_on_infra_error),
+    ))
     if not skip_train_stages:
         run_stage(
             "01_train_collect",
@@ -1090,26 +1331,26 @@ def main() -> None:
                 "01_train_collect:v2",
                 train_collect_cmd,
                 dataset=dataset_fp,
+                officeqa_inputs=officeqa_inputs_fp,
                 rollout_protocol=rollout_protocol(args, generation_config=train_gen_config_path),
-                source={
-                    "runner": source_fp["runner"],
-                    "run_spreadsheetbench": source_fp["run_spreadsheetbench"],
-                    "spreadsheet_agent": source_fp["spreadsheet_agent"],
-                    "react_agent": source_fp["react_agent"],
-                },
-                split=[args.train_start, args.train_end],
+                source=benchmark_source_fingerprints(source_fp, benchmark=args.benchmark, stage="rollout"),
+                split=[train_slice.split, args.train_start, args.train_end],
             ),
         )
 
     train_eval = train_artifact_dir / "trace2skill_train_eval.json"
-    train_eval_cmd = [
-        python_executable, "evaluate_with_official.py",
-        "--data_path", args.data_path,
-        "--output_dir", str(train_out),
-        "--start_idx", str(args.train_start),
-        "--end_idx", str(args.train_end),
-        "--results_file", str(train_eval),
-    ]
+    train_eval_cmd = adapter.evaluate_results(EvalCommandSpec(
+        python_executable=python_executable,
+        data_path=Path(args.data_path),
+        data_slice=train_slice,
+        output_dir=train_out,
+        results_file=train_results,
+        eval_file=train_eval,
+        officeqa_evaluator=args.officeqa_evaluator,
+        officeqa_reward_path=officeqa_reward_path_resolved,
+        officeqa_reward_tolerance=float(args.officeqa_reward_tolerance),
+        officeqa_allow_fallback_evaluator=bool(args.officeqa_allow_fallback_evaluator),
+    ))
     if not skip_train_stages:
         run_stage(
             "02_train_eval",
@@ -1124,22 +1365,20 @@ def main() -> None:
                 "02_train_eval:v2",
                 train_eval_cmd,
                 dataset=dataset_fp,
+                officeqa_inputs=officeqa_inputs_fp,
                 train_outputs=path_fingerprint(train_out),
-                source={
-                    "runner": source_fp["runner"],
-                    "evaluate_with_official": source_fp["evaluate_with_official"],
-                    "spreadsheetbench_support": source_fp["spreadsheetbench_support"],
-                },
-                split=[args.train_start, args.train_end],
+                train_results=path_fingerprint(train_results),
+                source=benchmark_source_fingerprints(source_fp, benchmark=args.benchmark, stage="eval"),
+                split=[train_slice.split, args.train_start, args.train_end],
             ),
         )
 
-    extract_records_cmd = [
-        python_executable, "scripts/extract_trace2skill_logs.py",
-        "--log-dir", str(train_logs),
-        "--results-file", str(train_eval),
-        "--output", str(source_records),
-    ]
+    extract_records_cmd = adapter.extract_records(ExtractCommandSpec(
+        python_executable=python_executable,
+        log_dir=train_logs,
+        eval_file=train_eval,
+        records_file=source_records,
+    ))
     if not skip_train_stages:
         run_stage(
             "03_extract_records",
@@ -1155,28 +1394,25 @@ def main() -> None:
                 extract_records_cmd,
                 train_logs=path_fingerprint(train_logs),
                 train_eval=path_fingerprint(train_eval),
-                source={
-                    "runner": source_fp["runner"],
-                    "extract_trace2skill_logs": source_fp["extract_trace2skill_logs"],
-                },
+                source=benchmark_source_fingerprints(source_fp, benchmark=args.benchmark, stage="extract"),
             ),
         )
 
-    expected_train_records = int(args.train_end) - int(args.train_start)
+    expected_train_records = len(adapter.load_rows(Path(args.data_path), train_slice))
     observed_train_records = load_record_count(source_records)
     if observed_train_records != expected_train_records:
         raise RuntimeError(
             f"records.json count mismatch: expected {expected_train_records} "
             f"from train range [{args.train_start}, {args.train_end}), got {observed_train_records}"
         )
-    order_manifest = write_dataset_ordered_records(
+    order_manifest = adapter.write_ordered_records(
         source_records=source_records,
-        data_path=Path(args.data_path),
         output_path=ordered_records,
         manifest_path=records_order_manifest,
-        train_start=int(args.train_start),
-        train_end=int(args.train_end),
+        data_path=Path(args.data_path),
+        train_slice=train_slice,
     )
+    args._observed_train_records = observed_train_records
     if load_record_count(records) != expected_train_records:
         raise RuntimeError(f"ordered_records.json count mismatch after dataset-order rewrite: {records}")
     runtime["records_order_policy"] = order_manifest["policy"]
@@ -1186,12 +1422,10 @@ def main() -> None:
     tree_dir = scenario_dir / "dynamix_tree"
     config = {
         "scenario": args.tree_scenario,
+        "benchmark": args.benchmark,
         "output_dir": str(tree_dir),
         "records_path": str(records),
-        "dataset_path": str(Path(args.data_path).resolve()),
-        "train_start": int(args.train_start),
-        "train_end": int(args.train_end),
-        "enforce_dataset_order": True,
+        **tree_dataset_order_payload(args),
         "generation": {
             "base_url": args.openai_base_url,
             "model": args.model,
@@ -1378,28 +1612,36 @@ def main() -> None:
     heldout_out = scenario_dir / "trace2skill_heldout_outputs"
     heldout_logs = scenario_dir / "trace2skill_heldout_logs"
     heldout_results = scenario_dir / "trace2skill_heldout_results.json"
-    heldout_collect_cmd = [
-        python_executable, "run_spreadsheetbench.py",
-        "--data_path", args.data_path,
-        "--output_dir", str(heldout_out),
-        "--agent", "cli_skill_preloaded",
-        "--skills_dir", str(skills_root),
-        "--model", args.model,
-        "--llm_client", args.rollout_llm_client,
-        "--temperature", str(args.rollout_temperature),
-        "--generation_config", str(scenario_gen_config_path),
-        "--llm_timeout_seconds", str(args.rollout_client_timeout_seconds),
-        "--llm_retry_wait_seconds", ",".join(str(value) for value in args.rollout_client_retry_wait_seconds),
-        "--num_random_seeds", str(args.rollout_num_random_seeds),
-        "--repeat", str(args.rollout_repeat),
-        "--max_turns", str(args.max_turns),
-        "--start_idx", str(args.heldout_start),
-        "--end_idx", str(args.heldout_end),
-        "--workers", str(args.workers),
-        "--results_file", str(heldout_results),
-        "--log_dir", str(heldout_logs),
-        "--log_format", "markdown",
-    ]
+    heldout_collect_cmd = adapter.run_rollout(RolloutCommandSpec(
+        python_executable=python_executable,
+        data_path=Path(args.data_path),
+        data_slice=heldout_slice,
+        output_dir=heldout_out,
+        results_file=heldout_results,
+        log_dir=heldout_logs,
+        generation_config=scenario_gen_config_path,
+        model=args.model,
+        openai_base_url=args.openai_base_url,
+        rollout_llm_client=args.rollout_llm_client,
+        rollout_temperature=float(args.rollout_temperature),
+        llm_timeout_seconds=float(args.rollout_client_timeout_seconds),
+        llm_retry_wait_seconds=list(args.rollout_client_retry_wait_seconds),
+        rollout_num_random_seeds=int(args.rollout_num_random_seeds),
+        rollout_repeat=int(args.rollout_repeat),
+        max_turns=int(args.max_turns),
+        workers=int(args.workers),
+        skillbank_root=skills_root,
+        skillbank_top_k=int(args.skillbank_top_k),
+        selection_log=selection_log,
+        officeqa_docs_dirs=officeqa_docs_dirs_resolved,
+        officeqa_evaluator=args.officeqa_evaluator,
+        officeqa_max_completion_tokens=int(args.officeqa_max_completion_tokens),
+        officeqa_reward_path=officeqa_reward_path_resolved,
+        officeqa_reward_tolerance=float(args.officeqa_reward_tolerance),
+        officeqa_allow_fallback_evaluator=bool(args.officeqa_allow_fallback_evaluator),
+        officeqa_use_oracle_context=bool(args.officeqa_use_oracle_context),
+        officeqa_continue_on_infra_error=bool(args.officeqa_continue_on_infra_error),
+    ))
     run_stage(
         "06_heldout_collect",
         heldout_collect_cmd,
@@ -1418,32 +1660,31 @@ def main() -> None:
             "06_heldout_collect:v2",
             heldout_collect_cmd,
             dataset=dataset_fp,
+            officeqa_inputs=officeqa_inputs_fp,
             generation_config=path_fingerprint(scenario_gen_config_path),
             tree_summary=path_fingerprint(tree_dir / "summary.json"),
             node_bank_manifest=path_fingerprint(Path(summary["node_bank_manifest"])),
             skillbank_root=path_fingerprint(skillbank_root),
             rollout_protocol=rollout_protocol(args, generation_config=scenario_gen_config_path),
             skillbank_retrieval_protocol=skillbank_retrieval_protocol(args, cache_path=skillbank_cache_path, selection_log=selection_log),
-            source={
-                "runner": source_fp["runner"],
-                "run_spreadsheetbench": source_fp["run_spreadsheetbench"],
-                "spreadsheet_agent": source_fp["spreadsheet_agent"],
-                "react_agent": source_fp["react_agent"],
-                "dynamix_trace2skill": source_fp["dynamix_trace2skill"],
-            },
-            split=[args.heldout_start, args.heldout_end],
+            source=benchmark_source_fingerprints(source_fp, benchmark=args.benchmark, stage="rollout"),
+            split=[heldout_slice.split, args.heldout_start, args.heldout_end],
         ),
     )
 
     heldout_eval = scenario_dir / "trace2skill_heldout_eval.json"
-    heldout_eval_cmd = [
-        python_executable, "evaluate_with_official.py",
-        "--data_path", args.data_path,
-        "--output_dir", str(heldout_out),
-        "--start_idx", str(args.heldout_start),
-        "--end_idx", str(args.heldout_end),
-        "--results_file", str(heldout_eval),
-    ]
+    heldout_eval_cmd = adapter.evaluate_results(EvalCommandSpec(
+        python_executable=python_executable,
+        data_path=Path(args.data_path),
+        data_slice=heldout_slice,
+        output_dir=heldout_out,
+        results_file=heldout_results,
+        eval_file=heldout_eval,
+        officeqa_evaluator=args.officeqa_evaluator,
+        officeqa_reward_path=officeqa_reward_path_resolved,
+        officeqa_reward_tolerance=float(args.officeqa_reward_tolerance),
+        officeqa_allow_fallback_evaluator=bool(args.officeqa_allow_fallback_evaluator),
+    ))
     run_stage(
         "07_heldout_eval",
         heldout_eval_cmd,
@@ -1457,14 +1698,11 @@ def main() -> None:
             "07_heldout_eval:v2",
             heldout_eval_cmd,
             dataset=dataset_fp,
+            officeqa_inputs=officeqa_inputs_fp,
             heldout_outputs=path_fingerprint(heldout_out),
             heldout_results=path_fingerprint(heldout_results),
-            source={
-                "runner": source_fp["runner"],
-                "evaluate_with_official": source_fp["evaluate_with_official"],
-                "spreadsheetbench_support": source_fp["spreadsheetbench_support"],
-            },
-            split=[args.heldout_start, args.heldout_end],
+            source=benchmark_source_fingerprints(source_fp, benchmark=args.benchmark, stage="eval"),
+            split=[heldout_slice.split, args.heldout_start, args.heldout_end],
         ),
     )
 
