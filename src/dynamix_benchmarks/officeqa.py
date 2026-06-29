@@ -19,7 +19,7 @@ from typing import Any, Iterable
 
 from dynamix_trace2skill.schemas import RawTrajectoryRecord, TrajectoryStep
 from dynamix_trace2skill.skillbank import SkillBankSelector, selected_experience_to_system_content
-from react_agent import AgentConfig, OpenAIClient, ReActAgent
+from react_agent import OpenAIClient
 from react_agent.tools import Tool, ToolParameter
 
 
@@ -194,13 +194,19 @@ def resolve_reward_path(
 
 
 def strip_think_blocks(text: str) -> str:
-    return THINK_RE.sub("", text or "").strip()
+    stripped = THINK_RE.sub("", text or "").strip()
+    if "</think>" in stripped:
+        stripped = stripped.rsplit("</think>", 1)[-1].strip()
+    return stripped
 
 
 def extract_final_answer(text: str) -> str:
     stripped = strip_think_blocks(text)
     match = ANSWER_RE.search(stripped)
-    return match.group(1).strip() if match else ""
+    if match:
+        return match.group(1).strip()
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    return lines[-1] if lines else stripped.strip()
 
 
 def extract_official_or_answer(text: str) -> str:
@@ -282,7 +288,13 @@ def evaluate_officeqa_prediction(
 ) -> OfficeQAEvalResult:
     reward = Path(reward_path).expanduser() if reward_path else None
     evaluator_mode = str(evaluator or "skillopt").strip().lower()
-    answer = extract_official_or_answer(prediction_text) if evaluator_mode in {"official", "official_reward"} else extract_final_answer(prediction_text)
+    if evaluator_mode in {"official", "official_reward"}:
+        answer = extract_official_or_answer(prediction_text)
+    elif evaluator_mode == "skillopt":
+        match = ANSWER_RE.search(strip_think_blocks(prediction_text))
+        answer = match.group(1).strip() if match else ""
+    else:
+        answer = extract_final_answer(prediction_text)
     if evaluator_mode in {"official", "official_reward"}:
         if reward is None or not reward.is_file():
             raise FileNotFoundError("OfficeQA official_reward evaluator requires --reward-path")
@@ -459,15 +471,16 @@ class OfficeQADocTools:
         query = str(pattern or "").strip().lower()
         if not query:
             return "[grep error: empty pattern]"
-        targets = [self._resolve_user_path(path)] if str(path or "").strip() else self.resolve_candidate_files()
+        if not str(path or "").strip():
+            return "[grep error: path is required]"
+        resolved = self._resolve_user_path(path)
+        if resolved is None:
+            return f"[grep error: path not found or not allowed: {path}]"
         matches: list[str] = []
-        for resolved in [target for target in targets if target is not None]:
-            rel = _relative_to_any(resolved, self.roots)
-            for idx, line in enumerate(resolved.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
-                if query in line.lower():
-                    matches.append(f"{rel}:{idx}: {line}")
-                if len(matches) >= 30:
-                    break
+        rel = _relative_to_any(resolved, self.roots)
+        for idx, line in enumerate(resolved.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+            if query in line.lower():
+                matches.append(f"{rel}:{idx}: {line}")
             if len(matches) >= 30:
                 break
         return "\n".join(matches) if matches else "[no matches]"
@@ -486,7 +499,7 @@ class OfficeQADocTools:
                 func=self.grep,
                 parameters=[
                     ToolParameter("pattern", "string", "Literal text to search for"),
-                    ToolParameter("path", "string", "Optional relative path. Omit to search candidate source files.", required=False, default=""),
+                    ToolParameter("path", "string", "Relative file path to search in", required=True),
                 ],
             ),
             Tool(
@@ -500,6 +513,28 @@ class OfficeQADocTools:
                 ],
             ),
         ]
+
+    def to_openai_tool_schemas(self) -> list[dict[str, Any]]:
+        """Return OpenAI function-calling schemas aligned with SkillOpt."""
+        tool_map = {tool.name: tool for tool in self.to_tools()}
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.get_params_schema(),
+                },
+            }
+            for tool in [tool_map[name] for name in ("glob", "read", "grep")]
+        ]
+
+    def execute_tool(self, name: str, arguments: dict[str, Any]) -> str:
+        """Execute an OfficeQA document tool by OpenAI function-call name."""
+        tool = {tool.name: tool for tool in self.to_tools()}.get(name)
+        if tool:
+            return tool.execute(**arguments)
+        return f"[tool error: unknown tool {name}]"
 
 
 def _page_number_from_source_doc(value: str) -> int | None:
@@ -713,31 +748,35 @@ def build_oracle_context(item: OfficeQAItem, docs_dirs: Iterable[str | Path], *,
 
 
 def build_officeqa_system_prompt(*, retrieved_experience: str = "") -> str:
-    parts = [
-        "You are an expert OfficeQA agent working over local Treasury bulletin text files.",
-        "Use the provided local document tools to inspect evidence before answering.",
-        "Do not invent values that are not grounded in the retrieved text.",
-        "When arithmetic is required, extract exact operands first and then compute.",
-        "When ready, return the direct answer inside <answer>...</answer>, then finish with ACTION: TASK_COMPLETE.",
-    ]
-    if retrieved_experience.strip():
-        parts.append(retrieved_experience.strip())
-    return "\n\n".join(parts)
+    skill_section = f"{retrieved_experience.strip()}\n\n" if retrieved_experience.strip() else ""
+    return (
+        "You are an expert OfficeQA agent working over local Treasury bulletin text files.\n\n"
+        f"{skill_section}"
+        "## Rules\n"
+        "1. Use only the provided local document tools to inspect candidate files.\n"
+        "2. Narrow to the most relevant file before reading long passages.\n"
+        "3. Prefer short targeted searches, then small reads around matching evidence.\n"
+        "4. Do not invent values that are not grounded in the retrieved text.\n"
+        "5. When the question requires arithmetic, compute only after extracting the exact operands.\n"
+        "6. If you have enough evidence, return the final answer inside <answer>...</answer>.\n\n"
+        "## Tool Use\n"
+        "Use the provided function tools directly when you need them. Prefer searching and small reads "
+        "before answering. Do not ask the user for permission to use tools; just call the tools.\n\n"
+        "## Final Answer Format\n"
+        "When you are ready to answer, emit the final answer inside <answer>...</answer> "
+        "and do not request another tool."
+    )
 
 
 def build_officeqa_task_prompt(item: OfficeQAItem, *, candidate_files: list[Path], docs_tools: OfficeQADocTools, oracle_context: str = "") -> str:
     rel_files = [_relative_to_any(path, docs_tools.roots) for path in candidate_files[:20]]
-    parts = [f"Question:\n{item.question}", f"Task type: {item.category}"]
+    parts = [f"## Question\n{item.question}"]
     if oracle_context.strip():
-        parts.append(f"Oracle parsed page context:\n{oracle_context.strip()}")
-    parts.append("Candidate files:\n" + ("\n".join(f"- {path}" for path in rel_files) if rel_files else "- none resolved; use glob/grep to inspect the local corpus"))
+        parts.append(f"## Oracle Parsed Pages\n{oracle_context.strip()}")
+    file_block = "\n".join(f"- {path}" for path in rel_files) if rel_files else "- none resolved"
+    parts.append(f"## Candidate Files\n{file_block}")
     if item.source_docs:
-        parts.append("Source hints:\n" + "\n".join(f"- {hint}" for hint in item.source_docs))
-    parts.append(
-        "Answer format:\n"
-        "Return only the concise answer inside <answer>...</answer> before ACTION: TASK_COMPLETE. "
-        "Do not include citations or explanation inside the final answer tag."
-    )
+        parts.append("## Source Hints\n" + "\n".join(f"- {hint}" for hint in item.source_docs))
     return "\n\n".join(parts)
 
 
@@ -784,30 +823,6 @@ def select_retrieved_experience(
         "matches the spreadsheet operation",
         "matches the OfficeQA document-question task",
     )
-
-
-def _steps_to_record_steps(steps: Iterable[Any]) -> list[TrajectoryStep]:
-    out: list[TrajectoryStep] = []
-    for index, step in enumerate(steps, start=1):
-        action = getattr(step, "action", None)
-        action_payload = ""
-        tool_name = None
-        action_valid = None
-        if action is not None:
-            tool_name = getattr(action, "name", None)
-            action_payload = json.dumps({"name": tool_name or "", "arguments": getattr(action, "arguments", {})}, ensure_ascii=False)
-            action_valid = True
-        elif getattr(step, "is_format_error", False):
-            action_valid = False
-        out.append(TrajectoryStep(
-            step_id=index,
-            raw_model_output=str(getattr(step, "thought", "") or ""),
-            action=action_payload,
-            observation=str(getattr(step, "observation", "") or ""),
-            tool_name=tool_name,
-            action_valid=action_valid,
-        ))
-    return out
 
 
 def record_from_officeqa_result(row: dict[str, Any]) -> RawTrajectoryRecord:
@@ -872,12 +887,89 @@ def run_officeqa_item(
         retry_times=tuple(float(value) for value in llm_retry_wait_seconds),
         timeout=float(llm_timeout_seconds),
     )
-    agent = ReActAgent(client=client, tools=docs_tools.to_tools(), config=AgentConfig(max_turns=max_turns, verbose=verbose, system_instructions=system_prompt))
-    result = agent.run(task_prompt)
-    if is_infrastructure_agent_error(result.error):
-        raise OfficeQAInfrastructureError(result.error)
+    tool_schemas = docs_tools.to_openai_tool_schemas()
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": task_prompt},
+    ]
+    final_response = ""
+    final_answer = ""
+    fail_reason = ""
+    trajectory_steps: list[TrajectoryStep] = []
+    try:
+        for turn in range(1, int(max_turns) + 1):
+            response = client.chat_with_tools(
+                messages=messages,
+                tools=tool_schemas,
+                tool_choice="auto",
+            )
+            msg = response.choices[0].message
+            response_text = msg.content or ""
+            final_response = response_text
+
+            assistant_msg: dict[str, Any] = {"role": "assistant", "content": strip_think_blocks(response_text)}
+            tool_calls = getattr(msg, "tool_calls", None)
+            if tool_calls:
+                assistant_msg["tool_calls"] = [call.model_dump(mode="json") for call in tool_calls]
+            messages.append(assistant_msg)
+
+            if tool_calls:
+                action_parts: list[str] = []
+                observation_parts: list[str] = []
+                first_tool_name: str | None = None
+                for call in tool_calls:
+                    tool_name = str(call.function.name)
+                    if first_tool_name is None:
+                        first_tool_name = tool_name
+                    try:
+                        arguments = json.loads(call.function.arguments) if call.function.arguments else {}
+                    except json.JSONDecodeError:
+                        arguments = {}
+                    if not isinstance(arguments, dict):
+                        arguments = {}
+                    observation = docs_tools.execute_tool(tool_name, arguments)
+                    action_parts.append(json.dumps({"name": tool_name, "arguments": arguments}, ensure_ascii=False))
+                    observation_parts.append(observation)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": observation,
+                    })
+                trajectory_steps.append(TrajectoryStep(
+                    step_id=turn,
+                    raw_model_output=response_text,
+                    action="\n".join(action_parts),
+                    observation="\n".join(observation_parts),
+                    tool_name=first_tool_name,
+                    action_valid=True,
+                ))
+                if verbose:
+                    print(f"[officeqa turn {turn}] tool_calls={[call.function.name for call in tool_calls]}")
+                continue
+
+            trajectory_steps.append(TrajectoryStep(
+                step_id=turn,
+                raw_model_output=response_text,
+                action="",
+                observation="",
+                tool_name=None,
+                action_valid=None,
+            ))
+            if "<answer>" in response_text.lower():
+                final_answer = extract_final_answer(response_text)
+                break
+            fail_reason = "Model neither produced a tool request nor a final answer"
+            break
+    except Exception as exc:
+        err_msg = f"Exception during execution: {exc}"
+        if is_infrastructure_agent_error(err_msg):
+            raise OfficeQAInfrastructureError(err_msg) from exc
+        fail_reason = err_msg
+    if not fail_reason and not final_answer:
+        fail_reason = f"Exceeded tool-turn budget ({max_turns})"
+
     evaluation = evaluate_officeqa_prediction(
-        prediction_text=result.final_answer,
+        prediction_text=final_response,
         gold_answer=item.ground_truth,
         reward_path=reward_path,
         tolerance=reward_tolerance,
@@ -894,23 +986,24 @@ def run_officeqa_item(
         "question": item.question,
         "category": item.category,
         "candidate_files": [_relative_to_any(path, docs_tools.roots) for path in candidate_files],
-        "final_response": result.final_answer,
+        "final_response": final_response,
         "predicted_answer": evaluation.predicted_answer,
         "score": evaluation.score,
         "f1": evaluation.f1,
         "hard": evaluation.hard,
         "success": bool(evaluation.hard),
-        "fail_reason": result.error or evaluation.fail_reason,
+        "fail_reason": fail_reason or evaluation.fail_reason,
         "evaluator": evaluation.evaluator,
-        "agent_success": bool(result.success),
-        "total_turns": result.total_turns,
+        "agent_success": not fail_reason,
+        "total_turns": len(trajectory_steps),
         "elapsed_seconds": time.monotonic() - started,
-        "steps": [step.to_dict() for step in _steps_to_record_steps(result.steps)],
+        "steps": [step.to_dict() for step in trajectory_steps],
         "service_metadata": {
             "model": model,
             "base_url": openai_base_url,
             "generation_config": generation_config,
             "evaluator": evaluator,
+            "agent_mode": "function_calling",
             "officeqa_context_variant": "skillopt_oracle_source_pages" if use_oracle_context else "local_docs_without_oracle_context",
             "use_oracle_context": bool(use_oracle_context),
         },

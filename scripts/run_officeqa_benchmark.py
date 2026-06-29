@@ -26,7 +26,7 @@ from dynamix_benchmarks.officeqa import (  # noqa: E402
 
 
 SKILLOPT_QWEN_DEFAULT_TEMPERATURE = 0.7
-SKILLOPT_QWEN_DEFAULT_ENABLE_THINKING = False
+SKILLOPT_QWEN_DEFAULT_ENABLE_THINKING = True
 
 
 def parse_float_csv(value: str) -> tuple[float, ...]:

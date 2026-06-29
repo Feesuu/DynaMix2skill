@@ -113,7 +113,7 @@ OPENAI_BASE_URL="${OPENAI_BASE_URL:-http://asmiatbrqksz.10.27.127.9.nip.io/v1}"
 OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
 
 # Thinking mode for train/heldout rollout and static DynaMix analyst calls.
-# Dynamic patch analyst calls force enable_thinking=false while using guided_json.
+# DynaMix analyst calls follow the global thinking setting.
 # Allowed: true, false, null.
 THINKING="${THINKING:-true}"
 
@@ -261,7 +261,7 @@ ANALYST_ALLOW_REGEX_TOKENIZER_FALLBACK="${ANALYST_ALLOW_REGEX_TOKENIZER_FALLBACK
 # -1 means derive analyst max prompt tokens from summary budget.
 ANALYST_MAX_PROMPT_TOKENS="${ANALYST_MAX_PROMPT_TOKENS:--1}"
 
-# Analyst JSON completion caps.  These prevent guided_json calls from running
+# Analyst JSON completion caps.  These prevent JSON analyst calls from running
 # unbounded when the model keeps expanding a patch.  -1 disables the explicit cap.
 ANALYST_MAX_OUTPUT_TOKENS="${ANALYST_MAX_OUTPUT_TOKENS:-4096}"
 ANALYST_DYNAMIC_MAX_OUTPUT_TOKENS="${ANALYST_DYNAMIC_MAX_OUTPUT_TOKENS:-8192}"

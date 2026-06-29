@@ -135,11 +135,15 @@ class GenerationClient:
         metadata = dict(debug_metadata or {})
         metadata.setdefault("schema_name", schema_name)
         request_extra_body = dict(extra_body or {})
-        response_format = _json_schema_response_format(schema_name, guided_json) if guided_json is not None else None
+        # Keep JSON schemas in the prompt/local-parse contract.  We deliberately
+        # do not pass response_format/json_schema to vLLM because thinking output
+        # is part of the current experiment protocol.
+        request_messages = _messages_with_json_schema(messages, schema_name=schema_name, schema=guided_json)
+        response_format = None
         for attempt in range(max(1, retries + 1)):
             attempt_metadata = {**metadata, "json_parse_attempt": attempt + 1}
             text = await self.chat_text(
-                messages,
+                request_messages,
                 timeout=timeout,
                 max_tokens=max_tokens,
                 extra_body=request_extra_body,
@@ -147,12 +151,12 @@ class GenerationClient:
                 debug_metadata=attempt_metadata,
             )
             try:
-                if guided_json is not None:
-                    return _extract_strict_json_object(text)
-                return _extract_json_object(text)
+                obj = _extract_json_object(text)
+                _validate_top_level_json_schema(obj, guided_json)
+                return obj
             except Exception as exc:
                 last_error = exc
-                messages = list(messages) + [{"role": "user", "content": f"Return valid JSON only for schema {schema_name}. Previous parse error: {exc}"}]
+                request_messages = list(request_messages) + [{"role": "user", "content": f"Return valid JSON only for schema {schema_name}. Previous parse error: {exc}"}]
         raise ValueError(f"failed to parse JSON for {schema_name}: {last_error}")
 
     async def _chat_text_with_app_timeout(
@@ -687,35 +691,85 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     raise ValueError("no JSON object found")
 
 
-def _extract_strict_json_object(text: str) -> dict[str, Any]:
-    text = _strip_think_blocks(text).strip()
-    candidates = [text]
-    if text.startswith("```") and text.endswith("```"):
-        candidates.append(re_sub_fence(text))
-    for candidate in candidates:
-        candidate = candidate.strip()
-        if not candidate:
-            continue
-        try:
-            obj = json.loads(candidate)
-        except Exception:
-            continue
-        if isinstance(obj, dict):
-            return obj
-    raise ValueError("guided JSON response was not a strict JSON object")
+def _validate_top_level_json_schema(obj: dict[str, Any], schema: dict[str, Any] | None) -> None:
+    if not schema:
+        return
+    _validate_json_schema_value(obj, schema, "$")
 
 
-def _json_schema_response_format(schema_name: str, schema: dict[str, Any] | None) -> dict[str, Any] | None:
+def _validate_json_schema_value(value: Any, schema: dict[str, Any], path: str) -> None:
+    expected_type = schema.get("type")
+    if expected_type is not None and not _json_type_matches(value, expected_type):
+        raise ValueError(f"JSON value at {path} expected type {expected_type!r}")
+
+    if "enum" in schema and value not in schema.get("enum", []):
+        raise ValueError(f"JSON value at {path} not in enum {schema.get('enum')!r}")
+
+    if "minimum" in schema and isinstance(value, (int, float)) and not isinstance(value, bool):
+        if value < schema["minimum"]:
+            raise ValueError(f"JSON value at {path} below minimum {schema['minimum']!r}")
+    if "maximum" in schema and isinstance(value, (int, float)) and not isinstance(value, bool):
+        if value > schema["maximum"]:
+            raise ValueError(f"JSON value at {path} above maximum {schema['maximum']!r}")
+
+    if isinstance(value, dict):
+        required = schema.get("required")
+        if isinstance(required, list):
+            missing = [key for key in required if isinstance(key, str) and key not in value]
+            if missing:
+                if path == "$":
+                    raise ValueError(f"JSON object missing required top-level keys: {missing}")
+                raise ValueError(f"JSON object at {path} missing required keys: {missing}")
+        properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        if schema.get("additionalProperties") is False:
+            extra = sorted(key for key in value if key not in properties)
+            if extra:
+                raise ValueError(f"JSON object at {path} has unexpected keys: {extra}")
+        for key, child_schema in properties.items():
+            if key in value and isinstance(child_schema, dict):
+                _validate_json_schema_value(value[key], child_schema, f"{path}.{key}")
+
+    if isinstance(value, list):
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                _validate_json_schema_value(item, item_schema, f"{path}[{index}]")
+
+
+def _json_type_matches(value: Any, expected: Any) -> bool:
+    if isinstance(expected, list):
+        return any(_json_type_matches(value, item) for item in expected)
+    if expected == "object":
+        return isinstance(value, dict)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "null":
+        return value is None
+    return True
+
+
+def _messages_with_json_schema(messages: list[dict[str, str]], *, schema_name: str, schema: dict[str, Any] | None) -> list[dict[str, str]]:
     if schema is None:
-        return None
-    return {
-        "type": "json_schema",
-        "json_schema": {
-            "name": schema_name,
-            "strict": True,
-            "schema": schema,
-        },
-    }
+        return list(messages)
+    schema_text = json.dumps(schema, ensure_ascii=False, sort_keys=True)
+    contract = (
+        f"\n\nJSON output contract for {schema_name}: return exactly one JSON object "
+        f"that satisfies this schema. Do not wrap the JSON in markdown.\n{schema_text}"
+    )
+    if messages and messages[0].get("role") == "system":
+        patched = [dict(messages[0])]
+        patched[0]["content"] = str(patched[0].get("content", "")) + contract
+        patched.extend(dict(message) for message in messages[1:])
+        return patched
+    return [{"role": "system", "content": contract.strip()}, *[dict(message) for message in messages]]
 
 
 def _strip_think_blocks(text: str) -> str:
@@ -723,7 +777,11 @@ def _strip_think_blocks(text: str) -> str:
     while True:
         start = out.find("<think>")
         end = out.find("</think>", start + len("<think>")) if start >= 0 else -1
-        if start < 0 or end < 0:
+        if start < 0:
+            if "</think>" in out:
+                out = out.rsplit("</think>", 1)[-1]
+            return out
+        if end < 0:
             return out
         out = out[:start] + out[end + len("</think>") :]
 
