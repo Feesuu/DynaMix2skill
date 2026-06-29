@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from dynamix_trace2skill.clients import EmbeddingClient, EmbeddingConfig, GenerationClient, GenerationConfig
@@ -120,13 +121,14 @@ def test_generation_debug_records_effective_timeout(tmp_path):
     assert payload["request"]["timeout_seconds"] == 12.5
 
 
-def test_chat_json_uses_response_format_json_schema():
-    client = GenerationClient(GenerationConfig(base_url="mock://deterministic"))
+def test_chat_json_keeps_guided_schema_in_prompt_not_response_format():
+    client = GenerationClient(GenerationConfig(base_url="mock://deterministic", thinking_mode=False))
     seen = {}
     schema = {"type": "object", "properties": {"cards": {"type": "array"}}, "required": ["cards"]}
 
     async def fake_chat_text(messages, **kwargs):
         seen.update(kwargs)
+        seen["messages"] = messages
         return '{"cards": []}'
 
     client.chat_text = fake_chat_text
@@ -142,14 +144,10 @@ def test_chat_json_uses_response_format_json_schema():
 
     assert result == {"cards": []}
     assert seen["extra_body"] == {}
-    assert seen["response_format"] == {
-        "type": "json_schema",
-        "json_schema": {
-            "name": "MinimalClusterExperienceCards",
-            "strict": True,
-            "schema": schema,
-        },
-    }
+    assert seen["response_format"] is None
+    assert seen["messages"][0]["role"] == "system"
+    assert "JSON output contract for MinimalClusterExperienceCards" in seen["messages"][0]["content"]
+    assert '"required": ["cards"]' in seen["messages"][0]["content"]
     assert seen["max_tokens"] == 1234
 
 
@@ -170,23 +168,138 @@ def test_generation_debug_marks_outer_timeout(tmp_path, monkeypatch):
     assert payload["request"]["timeout_seconds"] == 0.01
 
 
-def test_chat_json_rejects_embedded_json_when_guided_schema_is_requested():
-    client = GenerationClient(GenerationConfig(base_url="mock://deterministic"))
+def test_chat_json_extracts_embedded_json_with_prompt_schema():
+    client = GenerationClient(GenerationConfig(base_url="mock://deterministic", thinking_mode=True))
     schema = {"type": "object", "properties": {"cards": {"type": "array"}}, "required": ["cards"]}
 
     async def fake_chat_text(messages, **kwargs):
         return 'Here is the JSON you requested:\n{"cards": []}'
 
     client.chat_text = fake_chat_text
-    with pytest.raises(ValueError, match="failed to parse JSON"):
-        asyncio.run(
-            client.chat_json(
-                [{"role": "user", "content": "return cards"}],
-                schema_name="MinimalClusterExperienceCards",
-                guided_json=schema,
-                retries=0,
-            )
+    result = asyncio.run(
+        client.chat_json(
+            [{"role": "user", "content": "return cards"}],
+            schema_name="MinimalClusterExperienceCards",
+            guided_json=schema,
+            retries=0,
         )
+    )
+    assert result == {"cards": []}
+
+
+def test_chat_json_retries_when_embedded_json_misses_required_key():
+    client = GenerationClient(GenerationConfig(base_url="mock://deterministic", thinking_mode=True))
+    schema = {"type": "object", "properties": {"cards": {"type": "array"}}, "required": ["cards"]}
+    calls = []
+
+    async def fake_chat_text(messages, **kwargs):
+        calls.append(messages)
+        if len(calls) == 1:
+            return 'Reasoning with unrelated JSON:\n{"notes": []}'
+        return '{"cards": []}'
+
+    client.chat_text = fake_chat_text
+    result = asyncio.run(
+        client.chat_json(
+            [{"role": "user", "content": "return cards"}],
+            schema_name="MinimalClusterExperienceCards",
+            guided_json=schema,
+            retries=1,
+        )
+    )
+
+    assert result == {"cards": []}
+    assert "missing required top-level keys" in calls[1][-1]["content"]
+
+
+def test_chat_json_strips_dangling_qwen_think_suffix_before_json():
+    client = GenerationClient(GenerationConfig(base_url="mock://deterministic", thinking_mode=True))
+    schema = {"type": "object", "properties": {"cards": {"type": "array"}}, "required": ["cards"]}
+
+    async def fake_chat_text(messages, **kwargs):
+        return 'Thinking Process with distracting JSON {"notes": []}\n</think>\n{"cards": []}'
+
+    client.chat_text = fake_chat_text
+    result = asyncio.run(
+        client.chat_json(
+            [{"role": "user", "content": "return cards"}],
+            schema_name="MinimalClusterExperienceCards",
+            guided_json=schema,
+            retries=0,
+        )
+    )
+
+    assert result == {"cards": []}
+
+
+def test_chat_json_retries_when_nested_schema_is_invalid():
+    client = GenerationClient(GenerationConfig(base_url="mock://deterministic", thinking_mode=True))
+    schema = {
+        "type": "object",
+        "properties": {
+            "cards": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "name": {"type": "string"},
+                        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    },
+                    "required": ["name", "confidence"],
+                },
+            }
+        },
+        "required": ["cards"],
+    }
+    calls = []
+
+    async def fake_chat_text(messages, **kwargs):
+        calls.append(messages)
+        if len(calls) == 1:
+            return '{"cards": [{"name": "missing confidence"}]}'
+        if len(calls) == 2:
+            return '{"cards": [{"name": "bad confidence", "confidence": 2.0}]}'
+        return '{"cards": [{"name": "ok", "confidence": 0.7}]}'
+
+    client.chat_text = fake_chat_text
+    result = asyncio.run(
+        client.chat_json(
+            [{"role": "user", "content": "return cards"}],
+            schema_name="MinimalClusterExperienceCards",
+            guided_json=schema,
+            retries=2,
+        )
+    )
+
+    assert result == {"cards": [{"name": "ok", "confidence": 0.7}]}
+    assert "missing required keys" in calls[1][-1]["content"]
+    assert "above maximum" in calls[2][-1]["content"]
+
+
+def test_chat_json_retries_local_parse_after_invalid_json():
+    client = GenerationClient(GenerationConfig(base_url="mock://deterministic", thinking_mode=False))
+    schema = {"type": "object", "properties": {"cards": {"type": "array"}}, "required": ["cards"]}
+    calls = []
+
+    async def fake_chat_text(messages, **kwargs):
+        calls.append(messages)
+        if len(calls) == 1:
+            return "not json"
+        return '{"cards": []}'
+
+    client.chat_text = fake_chat_text
+    result = asyncio.run(
+        client.chat_json(
+            [{"role": "user", "content": "return cards"}],
+            schema_name="MinimalClusterExperienceCards",
+            guided_json=schema,
+            retries=1,
+        )
+    )
+    assert result == {"cards": []}
+    assert len(calls) == 2
+    assert "Previous parse error" in calls[1][-1]["content"]
 
 
 def test_generation_debug_reuses_succeeded_response_and_continues_numbering(tmp_path, monkeypatch):
@@ -1406,7 +1519,7 @@ def test_cluster_prompt_uses_minimal_experience_schema():
     assert "Do not output fields except cards and each card's name, trigger, content, placement, confidence" in constraints
 
 
-def test_static_cluster_analyst_uses_guided_json_without_forcing_thinking():
+def test_static_cluster_analyst_passes_guided_json_schema_without_forcing_thinking():
     class DummyGeneration:
         def __init__(self):
             self.kwargs = None
@@ -1529,8 +1642,9 @@ def test_dynamic_analyst_adds_new_cards_without_position_matching_old_cards():
     assert all("support_mass" not in member for member in payload["members"])
     assert all("support_mass" not in card for card in payload["previous_generated_experiences"])
     assert generation.kwargs["guided_json"]["required"] == ["updates", "new_cards"]
+    assert "new_cards" in generation.kwargs["guided_json"]["properties"]
     assert generation.kwargs["max_tokens"] == 7777
-    assert generation.kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+    assert "extra_body" not in generation.kwargs
 
 
 def test_dynamic_analyst_updates_only_explicit_previous_card_ids():
@@ -1633,6 +1747,8 @@ def test_dynamic_analyst_higher_level_prompt_is_updates_only_and_skips_unrepaira
         assert embedding.calls == 0
         assert len(generation.messages) == 3
         assert all(call["retries"] == 0 for call in generation.kwargs)
+        assert all(call["guided_json"]["required"] == ["updates"] for call in generation.kwargs)
+        assert all("new_cards" not in json.dumps(call["guided_json"]) for call in generation.kwargs)
         assert analyst.config.token_report[-1]["event"] == "dynamic_schema_repair"
         assert analyst.config.token_report[-1]["status"] == "ignored_invalid_llm_output"
         assert analyst.config.token_report[-1]["action"] == "skip_invalid_dynamic_update"
@@ -1711,6 +1827,8 @@ def test_dynamic_analyst_higher_level_repairs_legacy_schema_and_accepts_update()
     assert patches[0].metadata["dynamic_patch_operation"] == "update"
     assert len(generation.messages) == 2
     assert all(call["retries"] == 0 for call in generation.kwargs)
+    assert all(call["guided_json"]["required"] == ["updates"] for call in generation.kwargs)
+    assert all("new_cards" not in json.dumps(call["guided_json"]) for call in generation.kwargs)
     assert generation.messages[1][-1]["role"] == "user"
     assert "required_top_level_schema" in generation.messages[1][-1]["content"]
     assert "new_cards" not in generation.messages[1][-1]["content"]
@@ -1822,7 +1940,7 @@ def test_dynamic_analyst_higher_level_accepts_explicit_updates():
     assert patches[0].metadata["higher_level_single_card_enforced"] is True
 
 
-def test_dynamic_analyst_rejects_invalid_patch_ids():
+def test_dynamic_analyst_retries_then_ignores_invalid_patch_ids():
     from dynamix_trace2skill.summary import ClusterAnalyst, ClusterAnalystConfig
 
     class DummyEmbedding:
@@ -1831,18 +1949,23 @@ def test_dynamic_analyst_rejects_invalid_patch_ids():
 
     async def run_payload(payload):
         class DummyGeneration:
+            def __init__(self):
+                self.calls = 0
+
             async def chat_json(self, messages, *, schema_name, **kwargs):
+                self.calls += 1
                 return payload
 
+        generation = DummyGeneration()
         analyst = ClusterAnalyst(
-            DummyGeneration(),
+            generation,
             DummyEmbedding(),
             ClusterAnalystConfig(tokenizer_required=False, allow_regex_tokenizer_fallback=True),
         )
         community = ExperienceCommunity(community_id="C0", level=0, member_weights={"t0": 1.0})
         member = ExperienceItem(item_id="t0", level=0, kind=ITEM_KIND_TRAJECTORY, text="trace", embedding=[1.0])
         previous = [{"item_id": "old_a", "metadata": {"name": "Old", "trigger": "old", "content": "old", "confidence": 0.9}}]
-        return await analyst.summarize_dynamic_update(community, [member], previous)
+        return await analyst.summarize_dynamic_update(community, [member], previous), generation.calls
 
     valid_card = {
         "name": "Card",
@@ -1851,12 +1974,15 @@ def test_dynamic_analyst_rejects_invalid_patch_ids():
         "placement": {"target": "skill_md", "reference_kind": "procedure"},
         "confidence": 0.8,
     }
-    with pytest.raises(ValueError, match="unknown previous ExperienceCard"):
-        asyncio.run(run_payload({"updates": [{"item_id": "missing", **valid_card}], "new_cards": []}))
-    with pytest.raises(ValueError, match="duplicate ExperienceCard"):
-        asyncio.run(run_payload({"updates": [{"item_id": "old_a", **valid_card}, {"item_id": "old_a", **valid_card}], "new_cards": []}))
-    with pytest.raises(ValueError, match="new_cards must not include item_id"):
-        asyncio.run(run_payload({"updates": [], "new_cards": [{"item_id": "illegal", **valid_card}]}))
+    result, calls = asyncio.run(run_payload({"updates": [{"item_id": "missing", **valid_card}], "new_cards": []}))
+    assert result == []
+    assert calls == 3
+    result, calls = asyncio.run(run_payload({"updates": [{"item_id": "old_a", **valid_card}, {"item_id": "old_a", **valid_card}], "new_cards": []}))
+    assert result == []
+    assert calls == 3
+    result, calls = asyncio.run(run_payload({"updates": [], "new_cards": [{"item_id": "illegal", **valid_card}]}))
+    assert result == []
+    assert calls == 3
 
 
 def test_dynamic_state_reallocates_support_mass_after_update_and_add():
@@ -2468,6 +2594,320 @@ def test_l1_singleton_community_is_summarized_by_analyst():
     assert [item.item_id for item in generated] == ["e2"]
 
 
+def test_default_hierarchy_config_passes_static_ablation_tree_policy():
+    cfg = default_hierarchy_config({"tree_policy": "identity_singleton"})
+    assert cfg.tree_policy == "identity_singleton"
+
+
+def test_identity_singleton_tree_policy_creates_one_l0_community_per_fit_item():
+    from dynamix_core.tree_builder import ProjectedGmmTreeBuilder
+
+    cfg = default_hierarchy_config({
+        "tree_policy": "identity_singleton",
+        "summary_budget": {"max_model_tokens": 100, "budget_ratio": 0.5},
+    })
+    items = [
+        ExperienceItem(item_id="fit_a", level=0, kind=ITEM_KIND_TRAJECTORY, text="a", embedding=[1.0, 0.0], metadata={"analysis_token_count": 10}),
+        ExperienceItem(item_id="fit_b", level=0, kind=ITEM_KIND_TRAJECTORY, text="b", embedding=[0.0, 1.0], metadata={"analysis_token_count": 20}),
+        ExperienceItem(item_id="too_big", level=0, kind=ITEM_KIND_TRAJECTORY, text="big", embedding=[0.5, 0.5], metadata={"analysis_token_count": 60}),
+    ]
+
+    clustering = asyncio.run(ProjectedGmmTreeBuilder(cfg).cluster_layer(items, level=0))
+
+    assert clustering.stop_reason == ""
+    assert [community.clustering_method for community in clustering.communities] == ["identity_singleton", "identity_singleton"]
+    assert [list(community.member_weights) for community in clustering.communities] == [["fit_a"], ["fit_b"]]
+    assert clustering.excluded_input_item_ids == ["too_big"]
+    assert clustering.summary_budget["excluded_oversize_singletons"][0]["reason"] == "oversize_singleton"
+
+
+def test_projected_kmeans_elbow_selects_hard_two_cluster_split():
+    from dynamix_core.tree_builder import ProjectedGmmTreeBuilder
+
+    cfg = default_hierarchy_config({
+        "tree_policy": "projected_kmeans_elbow",
+        "gmm_bic": {
+            "min_split_size": 2,
+            "min_effective_samples_per_component": 1,
+            "abs_kmax": 4,
+            "num_restarts": 3,
+        },
+        "summary_budget": {"max_model_tokens": 100000, "budget_ratio": 0.8},
+    })
+    items = [
+        ExperienceItem(item_id="a0", level=0, kind=ITEM_KIND_TRAJECTORY, text="a0", embedding=[1.0, 0.0], metadata={"analysis_token_count": 1}),
+        ExperienceItem(item_id="a1", level=0, kind=ITEM_KIND_TRAJECTORY, text="a1", embedding=[0.98, 0.02], metadata={"analysis_token_count": 1}),
+        ExperienceItem(item_id="a2", level=0, kind=ITEM_KIND_TRAJECTORY, text="a2", embedding=[0.96, 0.04], metadata={"analysis_token_count": 1}),
+        ExperienceItem(item_id="b0", level=0, kind=ITEM_KIND_TRAJECTORY, text="b0", embedding=[0.0, 1.0], metadata={"analysis_token_count": 1}),
+        ExperienceItem(item_id="b1", level=0, kind=ITEM_KIND_TRAJECTORY, text="b1", embedding=[0.02, 0.98], metadata={"analysis_token_count": 1}),
+        ExperienceItem(item_id="b2", level=0, kind=ITEM_KIND_TRAJECTORY, text="b2", embedding=[0.04, 0.96], metadata={"analysis_token_count": 1}),
+    ]
+
+    clustering = asyncio.run(ProjectedGmmTreeBuilder(cfg).cluster_layer(items, level=0))
+    memberships = {item_id: 0 for item_id in [item.item_id for item in items]}
+    for community in clustering.communities:
+        for item_id in community.member_weights:
+            memberships[item_id] += 1
+
+    assert clustering.chosen_k == 2
+    assert {community.clustering_method for community in clustering.communities} == {"kmeans_elbow"}
+    assert set(memberships.values()) == {1}
+
+
+def test_local_pca_project_async_returns_quickly_for_small_matrix():
+    from dynamix_core.config import ProjectionConfig
+    from dynamix_core.projection import local_pca_project_async
+
+    matrix = np.asarray(
+        [
+            [1.0, 0.0],
+            [0.98, 0.02],
+            [0.0, 1.0],
+            [0.02, 0.98],
+        ],
+        dtype=float,
+    )
+
+    projection = asyncio.run(asyncio.wait_for(local_pca_project_async(matrix, ProjectionConfig(max_dim=2)), timeout=5.0))
+
+    assert projection.projected.shape[0] == 4
+    assert projection.dim >= 1
+
+
+def test_primary_argmax_gmm_uses_one_hot_member_weights():
+    from dynamix_core.gmm_bic import GmmCandidateFit
+    from dynamix_core.tree_builder import _candidate_layer_parts
+
+    cfg = default_hierarchy_config({"soft_membership": {"recursive_assignment": "primary_argmax"}})
+    item_ids = ["a", "b"]
+    items_by_id = {
+        item_id: ExperienceItem(
+            item_id=item_id,
+            level=0,
+            kind=ITEM_KIND_TRAJECTORY,
+            text=item_id,
+            embedding=[1.0, 0.0],
+            metadata={"analysis_token_count": 1},
+        )
+        for item_id in item_ids
+    }
+    fit = GmmCandidateFit(
+        k=2,
+        valid=True,
+        bic=1.0,
+        log_likelihood=-1.0,
+        pi=np.asarray([0.5, 0.5], dtype=float),
+        means=np.asarray([[0.0], [1.0]], dtype=float),
+        variances=np.asarray([[1.0], [1.0]], dtype=float),
+        responsibilities=np.asarray([[0.7, 0.3], [0.2, 0.8]], dtype=float),
+        primary_labels=np.asarray([0, 1], dtype=int),
+        component_masses=[1.0, 1.0],
+        child_sizes=[1, 1],
+    )
+
+    parts = _candidate_layer_parts(
+        fit,
+        level=0,
+        input_ids=item_ids,
+        items_by_id=items_by_id,
+        token_counts={item_id: 1 for item_id in item_ids},
+        soft_config=cfg.soft_membership,
+    )
+
+    assert parts is not None
+    weights_by_child = {community.community_id: community.member_weights for community in parts["communities"]}
+    assert weights_by_child == {"L0_C0": {"a": 1.0}, "L0_C1": {"b": 1.0}}
+    posterior_by_child = {community.community_id: community.posterior_member_weights for community in parts["communities"]}
+    assert posterior_by_child == {"L0_C0": {"a": 1.0}, "L0_C1": {"b": 1.0}}
+    assert all("raw_posterior_member_weights" not in community.metadata for community in parts["communities"])
+
+
+def test_projected_kmeans_elbow_budget_refinement_stays_kmeans_only():
+    from dynamix_core.tree_builder import ProjectedGmmTreeBuilder
+
+    cfg = default_hierarchy_config({
+        "tree_policy": "projected_kmeans_elbow",
+        "gmm_bic": {
+            "min_split_size": 2,
+            "min_effective_samples_per_component": 1,
+            "abs_kmax": 4,
+            "num_restarts": 3,
+        },
+        "summary_budget": {"max_model_tokens": 100, "budget_ratio": 0.5, "prompt_overhead_reserve_tokens": 0},
+        "budget_refinement": {"enabled": True, "apply_to_level": 0, "min_token_reduction_fraction": 0.0},
+    })
+    items = [
+        ExperienceItem(item_id="a0", level=0, kind=ITEM_KIND_TRAJECTORY, text="a0", embedding=[1.0, 0.0], metadata={"analysis_token_count": 20}),
+        ExperienceItem(item_id="a1", level=0, kind=ITEM_KIND_TRAJECTORY, text="a1", embedding=[0.99, 0.01], metadata={"analysis_token_count": 20}),
+        ExperienceItem(item_id="a2", level=0, kind=ITEM_KIND_TRAJECTORY, text="a2", embedding=[0.98, 0.02], metadata={"analysis_token_count": 20}),
+        ExperienceItem(item_id="b0", level=0, kind=ITEM_KIND_TRAJECTORY, text="b0", embedding=[0.0, 1.0], metadata={"analysis_token_count": 20}),
+        ExperienceItem(item_id="b1", level=0, kind=ITEM_KIND_TRAJECTORY, text="b1", embedding=[0.01, 0.99], metadata={"analysis_token_count": 20}),
+        ExperienceItem(item_id="b2", level=0, kind=ITEM_KIND_TRAJECTORY, text="b2", embedding=[0.02, 0.98], metadata={"analysis_token_count": 20}),
+    ]
+
+    clustering = asyncio.run(ProjectedGmmTreeBuilder(cfg).cluster_layer(items, level=0))
+    refinement = clustering.summary_budget["refinement_routing_tree"]
+    node_kinds = {node["kind"] for node in refinement["nodes"].values()}
+    split_events = clustering.summary_budget["split_events"]
+
+    assert "gmm_split" not in node_kinds
+    assert "kmeans_elbow_split" in node_kinds
+    assert all("bic_by_k" not in event for event in split_events)
+    assert any("inertia_by_k" in event for event in split_events)
+    assert all(
+        event.get("selected_k") == event.get("elbow_selected_k")
+        for event in split_events
+        if event.get("split_reason") == "budget_forced_kmeans_elbow_progress"
+    )
+    assert clustering.bic_by_k == {}
+    assert "inertia_by_k" in clustering.summary_budget
+
+
+def test_nodebank_export_level_filter_keeps_requested_experience_levels(tmp_path):
+    from dynamix_core.skill_export import SkillExportConfig, export_skill_files_from_payload
+
+    def card(item_id: str, level: int) -> dict:
+        return {
+            "item_id": item_id,
+            "level": level,
+            "kind": ITEM_KIND_EXPERIENCE_CARD,
+            "text": "card",
+            "support_mass": 1.0,
+            "metadata": {
+                "name": f"name {item_id}",
+                "trigger": "trigger",
+                "content": "content",
+                "confidence": 0.9,
+            },
+        }
+
+    payload = {
+        "items": {
+            "l1": card("l1", 1),
+            "l2": card("l2", 2),
+            "raw": {"item_id": "raw", "level": 0, "kind": ITEM_KIND_TRAJECTORY},
+        }
+    }
+
+    l1 = export_skill_files_from_payload(payload, tmp_path / "l1", config=SkillExportConfig(min_level=1, max_level=1))
+    l1_manifest = json.loads(Path(l1.manifest_path).read_text(encoding="utf-8"))
+    l2plus = export_skill_files_from_payload(payload, tmp_path / "l2plus", config=SkillExportConfig(min_level=2))
+    l2_manifest = json.loads(Path(l2plus.manifest_path).read_text(encoding="utf-8"))
+
+    assert [node["item_id"] for node in l1_manifest["nodes"]] == ["l1"]
+    assert l1_manifest["export_policy"]["level_filter"] == {"min_level": 1, "max_level": 1}
+    assert [node["item_id"] for node in l2_manifest["nodes"]] == ["l2"]
+
+
+def test_reuse_tree_protocol_rejects_filtered_source_tree(tmp_path):
+    runner = _load_experiment_runner_module()
+    reuse_tree = tmp_path / "source_tree"
+    (reuse_tree / "analysis").mkdir(parents=True)
+    records = tmp_path / "ordered_records.json"
+    records.write_text('[{"task_id": "0-0"}]', encoding="utf-8")
+    source_runtime = {
+        "scenario": "static_build",
+        "dataset_path": str(tmp_path / "data"),
+        "train_start": 0,
+        "train_end": 1,
+        "enforce_dataset_order": True,
+        "records_path": str(records),
+        "generation": {"base_url": "mock://deterministic", "model": "mock", "temperature": 0.0, "thinking_mode": False, "extra_body": {}},
+        "embedding": {"base_url": "mock://deterministic", "model": "embed", "max_model_len": 8192, "max_input_tokens": 8000, "truncate_long_texts": True, "tokenizer_model": "tok", "tokenizer_required": False, "truncation_strategy": "head"},
+        "chunked_embedding": {
+            "enabled": True,
+            "tokenizer_model": "tok",
+            "chunk_tokens": 7600,
+            "overlap_tokens": 512,
+            "pooling": "mean",
+            "add_special_tokens": False,
+            "normalize_after_pooling": True,
+            "fail_if_chunk_exceeds_model_limit": True,
+        },
+        "hierarchy": {"tree_policy": "projected_gmm_bic", "dynamic_update": {"ignored_for_static": True}},
+        "analyst": {"prompt_style": "default"},
+        "max_levels": 8,
+    }
+    (reuse_tree / "analysis" / "runtime_config.json").write_text(json.dumps(source_runtime, ensure_ascii=False, indent=2), encoding="utf-8")
+    current_config = {
+        **source_runtime,
+        "records_path": str(tmp_path / "current_ordered_records.json"),
+        "benchmark": "spreadsheetbench",
+        "chunked_embedding": {
+            "enabled": True,
+            "chunk_tokens": 7600,
+            "overlap_tokens": 512,
+            "pooling": "mean",
+            "add_special_tokens": False,
+            "normalize_after_pooling": True,
+            "fail_if_chunk_exceeds_model_limit": True,
+        },
+        "skill_export": {"min_level": 1, "max_level": 1, "max_node_count": None},
+    }
+
+    runner.validate_reused_tree_protocol(
+        reuse_tree_dir=reuse_tree,
+        current_config=current_config,
+        source_summary={"skill_export": {"min_level": None, "max_level": None, "max_node_count": None}},
+        current_records_sha256=runner.file_sha256(records),
+    )
+    runner.validate_reused_tree_protocol(
+        reuse_tree_dir=reuse_tree,
+        current_config=current_config,
+        source_summary={},
+        current_records_sha256=runner.file_sha256(records),
+    )
+    with pytest.raises(RuntimeError, match="already level/max-node filtered"):
+        runner.validate_reused_tree_protocol(
+            reuse_tree_dir=reuse_tree,
+            current_config=current_config,
+            source_summary={"skill_export": {"min_level": 1, "max_level": 1, "max_node_count": None}},
+            current_records_sha256=runner.file_sha256(records),
+        )
+
+
+def test_materialize_reused_tree_rejects_overlapping_source_and_output_dir(tmp_path):
+    runner = _load_experiment_runner_module()
+    reuse_tree = tmp_path / "same_tree"
+    reuse_tree.mkdir()
+    (reuse_tree / "hierarchy_state.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must not overlap the output tree dir"):
+        runner.materialize_reused_tree_nodebank(
+            reuse_tree_dir=reuse_tree,
+            tree_dir=reuse_tree,
+            args=SimpleNamespace(),
+            current_config={},
+            fingerprint={},
+            marker_dir=tmp_path / "markers",
+            log_path=tmp_path / "log.txt",
+        )
+
+    nested_reuse_tree = tmp_path / "output_tree" / "nested_source"
+    nested_reuse_tree.mkdir(parents=True)
+    (nested_reuse_tree / "hierarchy_state.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="must not overlap the output tree dir"):
+        runner.materialize_reused_tree_nodebank(
+            reuse_tree_dir=nested_reuse_tree,
+            tree_dir=tmp_path / "output_tree",
+            args=SimpleNamespace(),
+            current_config={},
+            fingerprint={},
+            marker_dir=tmp_path / "markers",
+            log_path=tmp_path / "log.txt",
+        )
+
+
+def test_spreadsheet_heldout_rollout_fingerprint_includes_skillbank_code():
+    runner = _load_experiment_runner_module()
+    repo = Path(__file__).resolve().parents[1]
+    source_fp = runner.stage_source_fingerprints(repo)
+
+    rollout_fp = runner.benchmark_source_fingerprints(source_fp, benchmark="spreadsheetbench", stage="rollout")
+
+    assert "dynamix_trace2skill" in rollout_fp
+
+
 def test_officeqa_loader_and_query_exclude_gold_answer(tmp_path):
     from dynamix_benchmarks.officeqa import load_officeqa_items, officeqa_skillbank_query
 
@@ -2498,8 +2938,8 @@ def test_officeqa_loader_and_query_exclude_gold_answer(tmp_path):
     assert "tb1984" not in query
 
 
-def test_officeqa_skillopt_evaluator_is_default_and_requires_answer_tag():
-    from dynamix_benchmarks.officeqa import evaluate_officeqa_prediction
+def test_officeqa_skillopt_evaluator_requires_answer_tag_but_parser_has_fallback():
+    from dynamix_benchmarks.officeqa import evaluate_officeqa_prediction, extract_final_answer
 
     result = evaluate_officeqa_prediction(
         prediction_text="<think>hidden</think>\n<answer>$42 million</answer>",
@@ -2509,6 +2949,8 @@ def test_officeqa_skillopt_evaluator_is_default_and_requires_answer_tag():
     assert result.hard == 1
     assert result.predicted_answer == "$42 million"
     assert result.evaluator == "skillopt_normalized_em_f1"
+    assert extract_final_answer("<think>hidden</think>\n42") == "42"
+    assert extract_final_answer("Thinking Process: hidden\n</think>\n<answer>42</answer>") == "42"
 
     missing_tag = evaluate_officeqa_prediction(
         prediction_text="<think>hidden</think>\n42",
@@ -2667,8 +3109,165 @@ def test_officeqa_doc_tools_do_not_follow_symlink_outside_root(tmp_path):
     os.symlink(outside, docs / "secret.txt")
 
     tools = OfficeQADocTools([docs], source_files=["secret.txt"])
-    assert "SECRET_VALUE" not in tools.grep("SECRET")
+    assert "path is required" in tools.grep("SECRET")
     assert "secret.txt" not in tools.glob("*")
+
+
+def test_officeqa_doc_tools_expose_openai_function_schemas_and_execute(tmp_path):
+    from dynamix_benchmarks.officeqa import OfficeQADocTools
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "tb.txt").write_text("1: header\n2: Answer is 42\n", encoding="utf-8")
+
+    tools = OfficeQADocTools([docs])
+    schemas = tools.to_openai_tool_schemas()
+
+    assert [schema["function"]["name"] for schema in schemas] == ["glob", "read", "grep"]
+    assert "path is required" in tools.execute_tool("grep", {"pattern": "answer"})
+    assert "Answer is 42" in tools.execute_tool("grep", {"pattern": "answer", "path": "tb.txt"})
+    assert "1: 1: header" in tools.execute_tool("read", {"path": "tb.txt", "start": 1, "limit": 1})
+
+
+def test_officeqa_run_item_uses_function_calling_tools(tmp_path, monkeypatch):
+    from dynamix_benchmarks import officeqa
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "tb.txt").write_text("Answer is 42\n", encoding="utf-8")
+
+    class FakeToolCall:
+        id = "call_1"
+        function = SimpleNamespace(name="grep", arguments=json.dumps({"pattern": "answer", "path": "tb.txt"}))
+
+        def model_dump(self, mode="json"):
+            return {
+                "id": self.id,
+                "type": "function",
+                "function": {
+                    "name": self.function.name,
+                    "arguments": self.function.arguments,
+                },
+            }
+
+    class FakeOpenAIClient:
+        instances: list["FakeOpenAIClient"] = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.calls = 0
+            self.seen_messages: list[list[dict]] = []
+            self.seen_tools: list[list[dict]] = []
+            FakeOpenAIClient.instances.append(self)
+
+        def chat_with_tools(self, *, messages, tools, tool_choice="auto"):
+            self.calls += 1
+            self.seen_messages.append(list(messages))
+            self.seen_tools.append(list(tools))
+            assert tool_choice == "auto"
+            if self.calls == 1:
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(
+                        message=SimpleNamespace(content="<think>hidden</think>\n", tool_calls=[FakeToolCall()]),
+                    )]
+                )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(
+                    message=SimpleNamespace(content="<answer>42</answer>", tool_calls=None),
+                )]
+            )
+
+    monkeypatch.setattr(officeqa, "OpenAIClient", FakeOpenAIClient)
+    item = officeqa.OfficeQAItem(
+        id="q1",
+        uid="q1",
+        question="What is the answer?",
+        ground_truth="42",
+        category="numeric",
+        source_files=["tb.txt"],
+    )
+
+    row = officeqa.run_officeqa_item(
+        item,
+        docs_dirs=[docs],
+        model="mock-model",
+        openai_base_url="mock://officeqa",
+        openai_api_key="EMPTY",
+        generation_config={"temperature": 0.0},
+        max_turns=3,
+        llm_timeout_seconds=30.0,
+        llm_retry_wait_seconds=(0.0,),
+        reward_path=None,
+        reward_tolerance=0.0,
+        evaluator="skillopt",
+        allow_fallback_evaluator=False,
+        output_dir=tmp_path / "out",
+        use_oracle_context=False,
+    )
+
+    client = FakeOpenAIClient.instances[0]
+    assert client.calls == 2
+    assert row["success"] is True
+    assert row["predicted_answer"] == "42"
+    assert row["service_metadata"]["agent_mode"] == "function_calling"
+    assert row["steps"][0]["tool_name"] == "grep"
+    assert "<think>hidden</think>" in row["steps"][0]["raw_model_output"]
+    assert "Answer is 42" in row["steps"][0]["observation"]
+    assert client.seen_tools[0][0]["function"]["name"] == "glob"
+    assert any(message["role"] == "tool" for message in client.seen_messages[1])
+    assert "<think>" not in client.seen_messages[1][2]["content"]
+
+
+def test_officeqa_run_item_requires_answer_tag_for_final_response(tmp_path, monkeypatch):
+    from dynamix_benchmarks import officeqa
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "tb.txt").write_text("Answer is 42\n", encoding="utf-8")
+
+    class FakeOpenAIClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def chat_with_tools(self, *, messages, tools, tool_choice="auto"):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(
+                    message=SimpleNamespace(content="I should search first.", tool_calls=None),
+                )]
+            )
+
+    monkeypatch.setattr(officeqa, "OpenAIClient", FakeOpenAIClient)
+    item = officeqa.OfficeQAItem(
+        id="q1",
+        uid="q1",
+        question="What is the answer?",
+        ground_truth="42",
+        category="numeric",
+        source_files=["tb.txt"],
+    )
+
+    row = officeqa.run_officeqa_item(
+        item,
+        docs_dirs=[docs],
+        model="mock-model",
+        openai_base_url="mock://officeqa",
+        openai_api_key="EMPTY",
+        generation_config={"temperature": 0.0},
+        max_turns=3,
+        llm_timeout_seconds=30.0,
+        llm_retry_wait_seconds=(0.0,),
+        reward_path=None,
+        reward_tolerance=0.0,
+        evaluator="skillopt",
+        allow_fallback_evaluator=False,
+        output_dir=tmp_path / "out",
+        use_oracle_context=False,
+    )
+
+    assert row["agent_success"] is False
+    assert row["success"] is False
+    assert row["predicted_answer"] == ""
+    assert "neither produced a tool request nor a final answer" in row["fail_reason"]
 
 
 def test_officeqa_oracle_context_does_not_follow_symlink_outside_root(tmp_path):
@@ -2891,7 +3490,7 @@ def test_officeqa_default_ranges_use_named_split_sizes(tmp_path):
     assert args.dynamic_arrival_count == 2
     assert args.rollout_temperature == 0.7
     assert args.generation_temperature == 0.7
-    assert args.thinking == "false"
+    assert args.thinking == "true"
 
 
 def test_officeqa_skillopt_qwen_temperature_defaults_do_not_override_explicit_cli(tmp_path):
@@ -2977,7 +3576,7 @@ def test_officeqa_runner_generation_config_follows_skillopt_qwen_defaults():
 
     assert config["max_tokens"] == 16384
     assert config["temperature"] == 0.7
-    assert config["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+    assert config["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}
 
     explicit = runner.apply_skillopt_qwen_generation_defaults(
         {"temperature": 0.0, "max_tokens": 128, "extra_body": {"chat_template_kwargs": {"enable_thinking": True}}},
@@ -2992,7 +3591,7 @@ def test_officeqa_runner_generation_config_follows_skillopt_qwen_defaults():
         max_completion_tokens=16384,
     )
     assert partial_extra["extra_body"]["top_k"] == 20
-    assert partial_extra["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+    assert partial_extra["extra_body"]["chat_template_kwargs"]["enable_thinking"] is True
 
 
 def test_react_stop_settings_do_not_override_generation_temperature():
@@ -3005,6 +3604,71 @@ def test_react_stop_settings_do_not_override_generation_temperature():
     assert request_config["max_tokens"] == 128
     assert request_config["stop"] == ["Observation:"]
     assert ModelSettings(temperature=0.7).to_dict()["temperature"] == 0.7
+
+
+def test_react_usage_payload_preserves_non_empty_usage():
+    from react_agent.models import _response_usage_payload
+
+    assert _response_usage_payload({"usage": {"prompt_tokens": 1, "total_tokens": 2}}) == {
+        "prompt_tokens": 1,
+        "total_tokens": 2,
+    }
+    assert _response_usage_payload(SimpleNamespace(usage=SimpleNamespace(prompt_tokens=3, completion_tokens=4))) == {
+        "prompt_tokens": 3,
+        "completion_tokens": 4,
+    }
+
+
+def test_openai_client_chat_with_tools_uses_disk_cache(tmp_path, monkeypatch):
+    from react_agent.models import OpenAIClient
+
+    class FakeToolCall:
+        id = "call_1"
+        function = SimpleNamespace(name="grep", arguments=json.dumps({"pattern": "answer", "path": "tb.txt"}))
+
+        def model_dump(self, mode="json"):
+            return {
+                "id": self.id,
+                "type": "function",
+                "function": {
+                    "name": self.function.name,
+                    "arguments": self.function.arguments,
+                },
+            }
+
+    client = OpenAIClient(
+        model="mock-model",
+        api_key="EMPTY",
+        base_url="http://example.invalid/v1",
+        cache_path=str(tmp_path / "officeqa_tools.diskcache"),
+        use_cache=True,
+        generation_config={"temperature": 0.0},
+        retry_times=(0,),
+        timeout=1.0,
+    )
+    calls = {"count": 0}
+
+    def fake_send(messages, config):
+        calls["count"] += 1
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="", tool_calls=[FakeToolCall()]),
+            )],
+            usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        )
+
+    monkeypatch.setattr(client, "_send_request_with_retry", fake_send)
+    messages = [{"role": "user", "content": "search"}]
+    tools = [{"type": "function", "function": {"name": "grep", "parameters": {"type": "object"}}}]
+
+    first = client.chat_with_tools(messages=messages, tools=tools)
+    second = client.chat_with_tools(messages=messages, tools=tools)
+
+    assert calls["count"] == 1
+    assert first.choices[0].message.tool_calls[0].function.name == "grep"
+    assert second.choices[0].message.tool_calls[0].function.name == "grep"
+    assert second.choices[0].message.tool_calls[0].model_dump()["function"]["arguments"]
+    assert second.usage == {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
 
 
 def test_officeqa_tree_config_disables_dataset_json_ordering(tmp_path):
