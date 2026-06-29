@@ -31,6 +31,8 @@ class SkillExportConfig:
 
     output_dir_name: str = "skills"
     max_node_count: int | None = None
+    min_level: int | None = None
+    max_level: int | None = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +78,7 @@ def export_skill_files_from_payload(
     config: SkillExportConfig | None = None,
 ) -> SkillExportResult:
     config = config or SkillExportConfig()
+    _validate_export_level_filter(config)
     out = Path(output_dir) / config.output_dir_name
     out.mkdir(parents=True, exist_ok=True)
 
@@ -87,6 +90,7 @@ def export_skill_files_from_payload(
         _node_from_payload(item)
         for item in items.values()
         if _is_exportable_experience_card(item)
+        and _level_allowed(int(item.get("level", 0) or 0), config)
     ])
     if config.max_node_count is not None:
         nodes = nodes[: max(0, int(config.max_node_count))]
@@ -107,6 +111,10 @@ def export_skill_files_from_payload(
             "diagnostic_oversize_nodes_exported": False,
             "skill_md_files_generated": False,
             "heldout_retrieval": "dense_top_k_nodes",
+            "level_filter": {
+                "min_level": config.min_level,
+                "max_level": config.max_level,
+            },
         },
         "output_dir": str(out),
         "node_count": len(nodes),
@@ -141,6 +149,23 @@ def _is_exportable_experience_card(item: Mapping[str, Any] | dict[str, Any]) -> 
     if metadata.get("llm_summary_skipped") or metadata.get("oversize_singleton"):
         return False
     if str(metadata.get("name", "")).strip() == "Oversize Trajectory Reference":
+        return False
+    return True
+
+
+def _validate_export_level_filter(config: SkillExportConfig) -> None:
+    if config.min_level is not None and int(config.min_level) < 0:
+        raise ValueError("SkillExportConfig.min_level must be >= 0 when set")
+    if config.max_level is not None and int(config.max_level) < 0:
+        raise ValueError("SkillExportConfig.max_level must be >= 0 when set")
+    if config.min_level is not None and config.max_level is not None and int(config.min_level) > int(config.max_level):
+        raise ValueError("SkillExportConfig.min_level must be <= max_level")
+
+
+def _level_allowed(level: int, config: SkillExportConfig) -> bool:
+    if config.min_level is not None and level < int(config.min_level):
+        return False
+    if config.max_level is not None and level > int(config.max_level):
         return False
     return True
 

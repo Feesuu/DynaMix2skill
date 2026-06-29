@@ -257,8 +257,9 @@ class ProjectedGmmDynamicTreeConfig:
         return config
 
     def validate(self) -> None:
-        if self.tree_policy != "projected_gmm_bic":
-            raise ValueError("tree_policy must be 'projected_gmm_bic'")
+        allowed_tree_policies = {"projected_gmm_bic", "identity_singleton", "projected_kmeans_elbow"}
+        if self.tree_policy not in allowed_tree_policies:
+            raise ValueError(f"tree_policy must be one of {sorted(allowed_tree_policies)}")
         if self.graph_kind not in {"overlapping_experience_hierarchy", "overlapping_hierarchy_dag"}:
             raise ValueError("graph_kind must be overlapping_experience_hierarchy or overlapping_hierarchy_dag")
         if not self.allow_overlap:

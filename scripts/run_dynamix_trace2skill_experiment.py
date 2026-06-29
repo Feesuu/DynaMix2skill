@@ -19,6 +19,10 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from dynamix_benchmarks.adapters import BenchmarkSlice, EvalCommandSpec, ExtractCommandSpec, RolloutCommandSpec, get_benchmark_adapter
 from dynamix_benchmarks.officeqa import resolve_reward_path
+from dynamix_core.skill_export import SkillExportConfig, export_skill_files_from_payload
+from dynamix_trace2skill.pipeline import default_hierarchy_config
+from dynamix_trace2skill.skillbank import SkillBankSelector
+from dynamix_trace2skill.summary import ClusterAnalystConfig
 
 
 SKILLOPT_QWEN_DEFAULT_TEMPERATURE = 0.7
@@ -123,6 +127,29 @@ def run_stage(
         running.unlink()
 
 
+def write_done_marker(
+    name: str,
+    *,
+    marker_dir: Path,
+    outputs: list[Path],
+    fingerprint: dict | None,
+    log_path: Path,
+    started_at: str,
+    elapsed_seconds: float,
+) -> None:
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker = marker_dir / f"{name}.done"
+    marker.write_text(json.dumps({
+        "stage": name,
+        "outputs": [str(p) for p in outputs],
+        "fingerprint": fingerprint,
+        "started_at": started_at,
+        "ended_at": utc_now_iso(),
+        "elapsed_seconds": elapsed_seconds,
+        "log": str(log_path),
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def write_generation_config(path: Path, *, thinking: bool | None, temperature: float = 0.0) -> None:
     payload: dict = {"temperature": temperature}
     if thinking is not None:
@@ -164,8 +191,6 @@ def apply_officeqa_default_ranges(args: argparse.Namespace, adapter: Any, data_p
         args.rollout_temperature = SKILLOPT_QWEN_DEFAULT_TEMPERATURE
     if not arg_was_provided(argv, "--generation-temperature"):
         args.generation_temperature = SKILLOPT_QWEN_DEFAULT_TEMPERATURE
-    if not arg_was_provided(argv, "--thinking"):
-        args.thinking = "false"
     train_total = len(adapter.load_rows(data_path, BenchmarkSlice(split=args.officeqa_train_split, start=0, end=None)))
     heldout_total = len(adapter.load_rows(data_path, BenchmarkSlice(split=args.officeqa_heldout_split, start=0, end=None)))
     if train_total <= 0:
@@ -310,6 +335,308 @@ def path_fingerprint(path: Path, *, source_only: bool = False) -> dict[str, str 
     return {"exists": True, "kind": "other"}
 
 
+def skill_export_config_from_args(args: argparse.Namespace) -> SkillExportConfig:
+    min_level = None if int(args.skill_export_min_level) < 0 else int(args.skill_export_min_level)
+    max_level = None if int(args.skill_export_max_level) < 0 else int(args.skill_export_max_level)
+    return SkillExportConfig(
+        output_dir_name=args.skill_output_dir_name,
+        max_node_count=None if int(args.skill_export_max_node_count) < 0 else int(args.skill_export_max_node_count),
+        min_level=min_level,
+        max_level=max_level,
+    )
+
+
+def skill_export_payload_from_args(args: argparse.Namespace) -> dict[str, int | None]:
+    export = skill_export_config_from_args(args)
+    return {
+        "max_node_count": export.max_node_count,
+        "min_level": export.min_level,
+        "max_level": export.max_level,
+    }
+
+
+def _protocol_path(value: Any) -> str:
+    return str(Path(str(value)).expanduser().resolve()) if value else ""
+
+
+def _selected_protocol_generation(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: payload.get(key)
+        for key in ("base_url", "model", "temperature", "thinking_mode", "extra_body")
+    }
+
+
+def _selected_protocol_embedding(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: payload.get(key)
+        for key in (
+            "base_url",
+            "model",
+            "max_model_len",
+            "max_input_tokens",
+            "truncate_long_texts",
+            "tokenizer_model",
+            "tokenizer_required",
+            "truncation_strategy",
+        )
+    }
+
+
+def _selected_protocol_chunked_embedding(payload: dict[str, Any], embedding: dict[str, Any]) -> dict[str, Any]:
+    data = dict(payload or {})
+    enabled = bool(data.get("enabled", False))
+    if not enabled:
+        return {"enabled": False}
+    tokenizer_model = data.get("tokenizer_model") or embedding.get("tokenizer_model") or embedding.get("model")
+    return {
+        "enabled": True,
+        "tokenizer_model": tokenizer_model,
+        "chunk_tokens": int(data.get("chunk_tokens", 10000)),
+        "overlap_tokens": int(data.get("overlap_tokens", 2000)),
+        "pooling": str(data.get("pooling", "mean")),
+        "add_special_tokens": bool(data.get("add_special_tokens", False)),
+        "normalize_after_pooling": bool(data.get("normalize_after_pooling", False)),
+        "fail_if_chunk_exceeds_model_limit": bool(data.get("fail_if_chunk_exceeds_model_limit", True)),
+    }
+
+
+def _selected_protocol_hierarchy(payload: dict[str, Any]) -> dict[str, Any]:
+    canonical = default_hierarchy_config(payload or {}).to_dict()
+    canonical.pop("dynamic_update", None)
+    return canonical
+
+
+def _selected_protocol_analyst(payload: dict[str, Any]) -> dict[str, Any]:
+    allowed = ClusterAnalystConfig.__dataclass_fields__
+    cleaned = {key: value for key, value in (payload or {}).items() if key in allowed}
+    canonical = ClusterAnalystConfig(**cleaned).__dict__
+    return {
+        key: canonical.get(key)
+        for key in (
+            "prompt_style",
+            "confidence_floor",
+            "tokenizer_model",
+            "tokenizer_required",
+            "allow_regex_tokenizer_fallback",
+            "max_prompt_tokens",
+            "max_output_tokens",
+            "dynamic_max_output_tokens",
+            "multi_card_max_level",
+            "max_cards_l0",
+            "max_cards_higher",
+            "higher_level_mode",
+            "truncate_higher_level_extra_cards",
+        )
+    }
+
+
+def _source_export_filter_status(source_summary: dict[str, Any], source_runtime: dict[str, Any]) -> str:
+    export = source_summary.get("skill_export")
+    if not isinstance(export, dict):
+        export = source_runtime.get("skill_export")
+    if not isinstance(export, dict):
+        # Legacy full-tree runs predate level-filtered nodebank export metadata.
+        # Since those versions could not encode filtered exports, treat absence
+        # as an auditable unfiltered source rather than rejecting valid baselines.
+        return "legacy_missing_skill_export_assumed_unfiltered"
+    is_unfiltered = (
+        export.get("min_level") is None
+        and export.get("max_level") is None
+        and export.get("max_node_count") is None
+    )
+    return "unfiltered" if is_unfiltered else "filtered"
+
+
+def _source_export_is_unfiltered(source_summary: dict[str, Any], source_runtime: dict[str, Any]) -> bool:
+    return _source_export_filter_status(source_summary, source_runtime) in {
+        "unfiltered",
+        "legacy_missing_skill_export_assumed_unfiltered",
+    }
+
+
+def _path_contains(parent: Path, child: Path) -> bool:
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def validate_reused_tree_protocol(
+    *,
+    reuse_tree_dir: Path,
+    current_config: dict[str, Any],
+    source_summary: dict[str, Any],
+    current_records_sha256: str,
+) -> None:
+    runtime_path = reuse_tree_dir / "analysis" / "runtime_config.json"
+    if not runtime_path.is_file():
+        raise FileNotFoundError(f"--reuse-tree-dir missing analysis/runtime_config.json: {runtime_path}")
+    source_runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+    errors: list[str] = []
+
+    def compare(label: str, source: Any, current: Any) -> None:
+        if source != current:
+            errors.append(f"{label} mismatch: source={source!r}, current={current!r}")
+
+    compare("scenario", source_runtime.get("scenario"), "static_build")
+    compare("current scenario", current_config.get("scenario"), "static_build")
+    if source_runtime.get("benchmark") is not None:
+        compare("benchmark", source_runtime.get("benchmark"), current_config.get("benchmark"))
+    compare("dataset_path", _protocol_path(source_runtime.get("dataset_path")), _protocol_path(current_config.get("dataset_path")))
+    compare("train_start", source_runtime.get("train_start"), current_config.get("train_start"))
+    compare("train_end", source_runtime.get("train_end"), current_config.get("train_end"))
+    compare("enforce_dataset_order", source_runtime.get("enforce_dataset_order"), current_config.get("enforce_dataset_order"))
+    compare("max_levels", source_runtime.get("max_levels"), current_config.get("max_levels"))
+    compare("generation", _selected_protocol_generation(source_runtime.get("generation") or {}), _selected_protocol_generation(current_config.get("generation") or {}))
+    compare("embedding", _selected_protocol_embedding(source_runtime.get("embedding") or {}), _selected_protocol_embedding(current_config.get("embedding") or {}))
+    compare(
+        "chunked_embedding",
+        _selected_protocol_chunked_embedding(source_runtime.get("chunked_embedding") or {}, source_runtime.get("embedding") or {}),
+        _selected_protocol_chunked_embedding(current_config.get("chunked_embedding") or {}, current_config.get("embedding") or {}),
+    )
+    compare("hierarchy", _selected_protocol_hierarchy(source_runtime.get("hierarchy") or {}), _selected_protocol_hierarchy(current_config.get("hierarchy") or {}))
+    compare("analyst", _selected_protocol_analyst(source_runtime.get("analyst") or {}), _selected_protocol_analyst(current_config.get("analyst") or {}))
+
+    source_records = Path(str(source_runtime.get("records_path") or ""))
+    if not source_records.is_file():
+        errors.append(f"source records_path is not readable: {source_records}")
+    elif file_sha256(source_records) != current_records_sha256:
+        errors.append("records_sha256 mismatch between reused tree source records and current records")
+
+    if not _source_export_is_unfiltered(source_summary, source_runtime):
+        errors.append("source tree was already level/max-node filtered; retrieval ablations require an unfiltered full static tree")
+
+    if errors:
+        raise RuntimeError(
+            "Rejected --reuse-tree-dir because its source protocol does not match the current retrieval ablation:\n"
+            + "\n".join(f"- {error}" for error in errors)
+        )
+
+
+def clear_reuse_tree_outputs(tree_dir: Path, *, skill_output_dir_name: str, usage_logs: list[Path]) -> None:
+    for path in [
+        tree_dir / "analysis",
+        tree_dir / "dynamic_snapshots",
+        tree_dir / skill_output_dir_name,
+    ]:
+        if path.exists() and path.is_dir():
+            shutil.rmtree(path)
+    for path in [
+        tree_dir / "summary.json",
+        tree_dir / "hierarchy_state.json",
+        tree_dir / "hierarchy_layers.json",
+    ]:
+        if path.exists() and path.is_file():
+            path.unlink()
+    for path in usage_logs:
+        if path.exists() and path.is_file():
+            path.unlink()
+
+
+def materialize_reused_tree_nodebank(
+    *,
+    reuse_tree_dir: Path,
+    tree_dir: Path,
+    args: argparse.Namespace,
+    current_config: dict[str, Any],
+    fingerprint: dict,
+    marker_dir: Path,
+    log_path: Path,
+    usage_logs: list[Path] | None = None,
+) -> dict[str, Any]:
+    started_at = utc_now_iso()
+    started = time.monotonic()
+    state_path = reuse_tree_dir / "hierarchy_state.json"
+    if not state_path.is_file():
+        raise FileNotFoundError(f"--reuse-tree-dir missing hierarchy_state.json: {state_path}")
+    resolved_tree_dir = tree_dir.resolve()
+    resolved_reuse_tree_dir = reuse_tree_dir.resolve()
+    if (
+        resolved_tree_dir == resolved_reuse_tree_dir
+        or _path_contains(resolved_tree_dir, resolved_reuse_tree_dir)
+        or _path_contains(resolved_reuse_tree_dir, resolved_tree_dir)
+    ):
+        raise ValueError(
+            "--reuse-tree-dir must not overlap the output tree dir: "
+            f"reuse={resolved_reuse_tree_dir}, output={resolved_tree_dir}"
+        )
+    tree_dir.mkdir(parents=True, exist_ok=True)
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    source_summary_path = reuse_tree_dir / "summary.json"
+    source_summary = json.loads(source_summary_path.read_text(encoding="utf-8")) if source_summary_path.is_file() else {}
+    source_export_status = _source_export_filter_status(source_summary, json.loads((reuse_tree_dir / "analysis" / "runtime_config.json").read_text(encoding="utf-8")))
+    validate_reused_tree_protocol(
+        reuse_tree_dir=reuse_tree_dir,
+        current_config=current_config,
+        source_summary=source_summary,
+        current_records_sha256=str(fingerprint.get("records_sha256") or ""),
+    )
+    clear_reuse_tree_outputs(tree_dir, skill_output_dir_name=args.skill_output_dir_name, usage_logs=list(usage_logs or []))
+    tree_dir.mkdir(parents=True, exist_ok=True)
+    analysis_dir = tree_dir / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    runtime_payload = {
+        **current_config,
+        "output_dir": str(tree_dir),
+        "reuse_tree_dir": str(reuse_tree_dir),
+        "reuse_materialization": True,
+        "source_tree_summary": str(source_summary_path) if source_summary_path.is_file() else "",
+        "source_export_filter_status": source_export_status,
+    }
+    (analysis_dir / "runtime_config.json").write_text(json.dumps(runtime_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    (analysis_dir / "reuse_tree_audit.json").write_text(json.dumps({
+        "reuse_tree_dir": str(reuse_tree_dir.resolve()),
+        "output_tree_dir": str(tree_dir.resolve()),
+        "source_export_filter_status": source_export_status,
+        "source_summary": str(source_summary_path) if source_summary_path.is_file() else "",
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    (tree_dir / "hierarchy_state.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    export = export_skill_files_from_payload(payload, tree_dir, config=skill_export_config_from_args(args))
+    selector = SkillBankSelector(
+        skillbank_root=export.output_dir,
+        base_url=args.embedding_base_url,
+        model=args.embedding_model,
+        api_key="EMPTY",
+        cache_path=Path(export.output_dir) / ".dynamix_skillbank_index.json",
+    )
+    selector._load_or_build_index()
+    summary = {
+        **source_summary,
+        "scenario": "static_build",
+        "reuse_tree_dir": str(reuse_tree_dir),
+        "node_count": export.node_count,
+        "node_bank_dir": export.output_dir,
+        "node_bank_manifest": export.manifest_path,
+        "skillbank_index": str(Path(export.output_dir) / ".dynamix_skillbank_index.json"),
+        "skill_export": {
+            "output_dir_name": args.skill_output_dir_name,
+            **skill_export_payload_from_args(args),
+        },
+    }
+    (tree_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        "\n".join([
+            f"reused_tree_dir={reuse_tree_dir}",
+            f"state_path={state_path}",
+            f"node_bank_manifest={export.manifest_path}",
+            f"node_count={export.node_count}",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    write_done_marker(
+        "04_build_tree",
+        marker_dir=marker_dir,
+        outputs=[tree_dir / "summary.json"],
+        fingerprint=fingerprint,
+        log_path=log_path,
+        started_at=started_at,
+        elapsed_seconds=time.monotonic() - started,
+    )
+    return summary
+
+
 def dataset_json_path(data_path: str) -> Path:
     path = Path(data_path)
     return path / "dataset.json" if path.is_dir() else path
@@ -372,6 +699,7 @@ def benchmark_source_fingerprints(source_fp: dict[str, dict[str, str | bool | in
             "run_spreadsheetbench": source_fp["run_spreadsheetbench"],
             "spreadsheet_agent": source_fp["spreadsheet_agent"],
             "react_agent": source_fp["react_agent"],
+            "dynamix_trace2skill": source_fp["dynamix_trace2skill"],
         },
         "eval": {
             "evaluate_with_official": source_fp["evaluate_with_official"],
@@ -961,6 +1289,7 @@ def main() -> None:
     parser.add_argument("--reuse-train-run-dir", default=None, help="Existing run dir containing records.json; when set, skip train rollout/eval/extraction")
     parser.add_argument("--train-artifact-dir", default=None, help="Directory for train rollout/eval/extraction artifacts; default: --run-dir")
     parser.add_argument("--scenario-output-dir", default=None, help="Directory for tree, nodebank, heldout, and final reports; default: --run-dir")
+    parser.add_argument("--reuse-tree-dir", default=None, help="Existing dynamix_tree directory with hierarchy_state.json; skip tree rebuild and re-export a filtered nodebank")
     parser.add_argument("--train-start", type=int, default=0)
     parser.add_argument("--train-end", type=int, default=200)
     parser.add_argument("--heldout-start", type=int, default=200)
@@ -974,7 +1303,7 @@ def main() -> None:
     parser.add_argument("--embedding-tokenizer", default=os.environ.get("EMBED_TOKENIZER", "/mnt/data/grouph_share/models/modelscope/models/Qwen/Qwen3-Embedding-0___6B"))
     parser.add_argument("--python-executable", default=os.environ.get("DYNAMIX_PYTHON", sys.executable), help="Python executable used for all experiment stages; its bin dir is prepended to PATH so agent bash actions can call bare python")
     parser.add_argument("--max-turns", type=int, default=100)
-    parser.add_argument("--thinking", choices=["true", "false", "null"], default="true", help="Qwen thinking setting for Trace2Skill rollout and static DynaMix analyst; dynamic patch analyst forces enable_thinking=false")
+    parser.add_argument("--thinking", choices=["true", "false", "null"], default="true", help="Qwen thinking setting for Trace2Skill rollout and DynaMix analyst calls")
     parser.add_argument("--skillbank-top-k", type=int, default=10, help="Select top-k DynaMix nodebank nodes by embedding before each heldout task")
     parser.add_argument("--tree-scenario", choices=["dynamic_update", "static_build"], default="dynamic_update", help="DynaMix build mode before heldout; default is the train200 60/40 dynamic protocol")
     parser.add_argument("--random-seed", type=int, default=42)
@@ -991,6 +1320,9 @@ def main() -> None:
     parser.add_argument("--dynamic-resume-from-snapshots", type=parse_bool, default=False, help="Dynamic mode: resume from latest dynamic_snapshots/batch_* snapshot when present; default false until fingerprint validation is enabled")
     parser.add_argument("--max-levels", type=int, default=8)
     parser.add_argument("--skill-output-dir-name", default="skills")
+    parser.add_argument("--skill-export-min-level", type=int, default=-1, help="-1 exports all lower levels; 1 exports only ExperienceCards at level >= 1")
+    parser.add_argument("--skill-export-max-level", type=int, default=-1, help="-1 exports all higher levels; set 1 for L1-only retrieval nodebank")
+    parser.add_argument("--skill-export-max-node-count", type=int, default=-1, help="-1 exports all matching nodes")
     parser.add_argument("--rollout-temperature", type=float, default=0.0)
     parser.add_argument("--rollout-client-timeout-seconds", type=float, default=600.0)
     parser.add_argument("--rollout-client-retry-wait-seconds", type=parse_float_csv, default=[5.0, 10.0, 30.0])
@@ -1078,6 +1410,11 @@ def main() -> None:
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     argv = sys.argv[1:]
     args = parser.parse_args(argv)
+    if args.tree_scenario == "dynamic_update":
+        if args.tree_policy != "projected_gmm_bic":
+            parser.error("--tree-policy ablations are static_build-only; dynamic_update requires projected_gmm_bic")
+        if int(args.skill_export_min_level) >= 0 or int(args.skill_export_max_level) >= 0 or int(args.skill_export_max_node_count) >= 0:
+            parser.error("--skill-export-* level/count filters are static_build retrieval ablations only")
 
     adapter = get_benchmark_adapter(args.benchmark)
     try:
@@ -1124,6 +1461,7 @@ def main() -> None:
     run_dir = Path(args.run_dir).resolve()
     records_path_arg = resolved_optional_path(args.records_path)
     reuse_train_run_dir = resolved_optional_path(args.reuse_train_run_dir)
+    reuse_tree_dir = resolved_optional_path(args.reuse_tree_dir)
     train_artifact_dir = resolved_optional_path(args.train_artifact_dir) or run_dir
     scenario_dir = resolved_optional_path(args.scenario_output_dir) or run_dir
     if records_path_arg is not None and reuse_train_run_dir is not None:
@@ -1228,6 +1566,7 @@ def main() -> None:
         "trace2skill_generation_config": str(scenario_gen_config_path),
         "skillbank_top_k": int(args.skillbank_top_k),
         "tree_scenario": args.tree_scenario,
+        "reuse_tree_dir": str(reuse_tree_dir) if reuse_tree_dir else "",
         "dynamic_initial_count": int(args.dynamic_initial_count),
         "dynamic_arrival_count": int(args.dynamic_arrival_count),
         "dynamic_update_batch_size": int(args.dynamic_update_batch_size),
@@ -1236,6 +1575,7 @@ def main() -> None:
         "dynamic_resume_from_snapshots": bool(args.dynamic_resume_from_snapshots),
         "max_levels": int(args.max_levels),
         "skill_output_dir_name": args.skill_output_dir_name,
+        "skill_export": skill_export_payload_from_args(args),
         "rollout_temperature": float(args.rollout_temperature),
         "rollout_client_timeout_seconds": float(args.rollout_client_timeout_seconds),
         "rollout_client_retry_wait_seconds": list(args.rollout_client_retry_wait_seconds),
@@ -1550,6 +1890,7 @@ def main() -> None:
         },
         "max_levels": int(args.max_levels),
         "skill_output_dir_name": args.skill_output_dir_name,
+        "skill_export": skill_export_payload_from_args(args),
     }
     config_path = scenario_dir / "dynamix_config.json"
     config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1574,20 +1915,41 @@ def main() -> None:
         "DYNAMIX_EMBEDDING_USAGE_LOG": str(usage_logs_by_stage["04_build_tree"][1]),
         "DYNAMIX_SKILLBANK_USAGE_LOG": str(usage_logs_by_stage["04_build_tree"][2]),
     }
-    run_stage(
-        "04_build_tree",
-        build_tree_cmd,
-        cwd=repo,
-        env=build_tree_usage_env,
-        log_path=logs / "04_build_tree.log",
-        marker_dir=markers,
-        outputs=[tree_dir / "summary.json"],
-        resume=args.resume,
-        clear_outputs_before_run=list(usage_logs_by_stage["04_build_tree"]),
-        fingerprint=build_tree_fingerprint,
-    )
-
-    summary = json.loads((tree_dir / "summary.json").read_text(encoding="utf-8"))
+    if reuse_tree_dir is not None:
+        reuse_fingerprint = {
+            **build_tree_fingerprint,
+            "stage_contract": "04_build_tree:reuse_tree_filtered_nodebank:v1",
+            "reuse_tree_dir": path_fingerprint(reuse_tree_dir),
+            "skill_export": skill_export_payload_from_args(args),
+        }
+        if args.resume and stage_done(markers / "04_build_tree.done", [tree_dir / "summary.json"], fingerprint=reuse_fingerprint):
+            print("[resume] skip stage 04_build_tree", flush=True)
+            summary = json.loads((tree_dir / "summary.json").read_text(encoding="utf-8"))
+        else:
+            summary = materialize_reused_tree_nodebank(
+                reuse_tree_dir=reuse_tree_dir,
+                tree_dir=tree_dir,
+                args=args,
+                current_config=config,
+                fingerprint=reuse_fingerprint,
+                marker_dir=markers,
+                log_path=logs / "04_build_tree.log",
+                usage_logs=usage_logs_by_stage["04_build_tree"],
+            )
+    else:
+        run_stage(
+            "04_build_tree",
+            build_tree_cmd,
+            cwd=repo,
+            env=build_tree_usage_env,
+            log_path=logs / "04_build_tree.log",
+            marker_dir=markers,
+            outputs=[tree_dir / "summary.json"],
+            resume=args.resume,
+            clear_outputs_before_run=list(usage_logs_by_stage["04_build_tree"]),
+            fingerprint=build_tree_fingerprint,
+        )
+        summary = json.loads((tree_dir / "summary.json").read_text(encoding="utf-8"))
     validate_tree_summary_for_heldout(summary, args)
     manifest = json.loads(Path(summary["node_bank_manifest"]).read_text(encoding="utf-8"))
     if int(manifest.get("node_count", 0)) <= 0:

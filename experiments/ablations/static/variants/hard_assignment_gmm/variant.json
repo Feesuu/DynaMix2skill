@@ -1,0 +1,16 @@
+{
+  "variant_name": "hard_assignment_gmm",
+  "scenario": "static_build",
+  "tree_policy": "projected_gmm_bic",
+  "max_levels": 8,
+  "hierarchy_override": {
+    "soft_membership": {
+      "recursive_assignment": "primary_argmax"
+    }
+  },
+  "skill_export": {
+    "min_level": null,
+    "max_level": null,
+    "max_node_count": null
+  }
+}

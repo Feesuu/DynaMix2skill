@@ -1,0 +1,13 @@
+{
+  "variant_name": "retrieve_l2plus_only",
+  "scenario": "static_build",
+  "tree_policy": "projected_gmm_bic",
+  "max_levels": 8,
+  "reuse_tree_required": true,
+  "hierarchy_override": {},
+  "skill_export": {
+    "min_level": 2,
+    "max_level": null,
+    "max_node_count": null
+  }
+}
