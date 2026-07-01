@@ -15,7 +15,6 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from types import SimpleNamespace
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -64,15 +63,13 @@ class Message:
 @dataclass
 class ModelSettings:
     """Settings for LLM generation."""
-    temperature: float | None = None
+    temperature: float = 0.7
     max_tokens: int | None = None
     stop: list[str] = field(default_factory=list)
     extra_body: dict = field(default_factory=dict)
     
     def to_dict(self) -> dict:
-        result = {}
-        if self.temperature is not None:
-            result["temperature"] = self.temperature
+        result = {"temperature": self.temperature}
         if self.max_tokens:
             result["max_tokens"] = self.max_tokens
         if self.stop:
@@ -131,67 +128,6 @@ def _response_usage_payload(value: Any) -> dict[str, Any]:
         if token_value is not None:
             payload[key] = token_value
     return payload
-
-
-class _CachedToolCall(SimpleNamespace):
-    def model_dump(self, mode: str = "json") -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "type": getattr(self, "type", "function"),
-            "function": {
-                "name": self.function.name,
-                "arguments": self.function.arguments,
-            },
-        }
-
-
-def _tool_call_to_payload(call: Any) -> dict[str, Any]:
-    if hasattr(call, "model_dump"):
-        payload = call.model_dump(mode="json")
-        if isinstance(payload, dict):
-            return payload
-    function = getattr(call, "function", None)
-    return {
-        "id": str(getattr(call, "id", "")),
-        "type": str(getattr(call, "type", "function")),
-        "function": {
-            "name": str(getattr(function, "name", "")),
-            "arguments": str(getattr(function, "arguments", "{}")),
-        },
-    }
-
-
-def _tool_call_from_payload(payload: dict[str, Any]) -> _CachedToolCall:
-    function = payload.get("function") if isinstance(payload.get("function"), dict) else {}
-    return _CachedToolCall(
-        id=str(payload.get("id") or ""),
-        type=str(payload.get("type") or "function"),
-        function=SimpleNamespace(
-            name=str(function.get("name") or ""),
-            arguments=str(function.get("arguments") or "{}"),
-        ),
-    )
-
-
-def _tool_response_to_cache_payload(response: Any) -> dict[str, Any]:
-    message = response.choices[0].message
-    tool_calls = getattr(message, "tool_calls", None) or []
-    return {
-        "content": getattr(message, "content", "") or "",
-        "tool_calls": [_tool_call_to_payload(call) for call in tool_calls],
-        "usage": _response_usage_payload(response),
-    }
-
-
-def _tool_response_from_cache_payload(payload: dict[str, Any]) -> Any:
-    message = SimpleNamespace(
-        content=str(payload.get("content") or ""),
-        tool_calls=[_tool_call_from_payload(call) for call in payload.get("tool_calls", []) if isinstance(call, dict)] or None,
-    )
-    return SimpleNamespace(
-        choices=[SimpleNamespace(message=message)],
-        usage=payload.get("usage") or None,
-    )
 
 
 def _append_usage_record(env_var: str, payload: dict[str, Any]) -> None:
@@ -366,13 +302,13 @@ class OpenAIClient(LLMClient):
                 )
             self._cache = _create_disk_cache(cache_path)
     
-    def _get_from_cache(self, cache_key: tuple) -> Any | None:
+    def _get_from_cache(self, cache_key: tuple) -> tuple[str, str] | None:
         """Get response from cache if available. Returns (reply, reasoning_content)."""
         if self._cache is None:
             return None
         return self._cache.get(cache_key, None)
     
-    def _save_to_cache(self, cache_key: tuple, response: Any):
+    def _save_to_cache(self, cache_key: tuple, response: tuple[str, str]):
         """Save response to cache. Response is (reply, reasoning_content)."""
         if self._cache is None:
             return
@@ -542,67 +478,6 @@ class OpenAIClient(LLMClient):
         self._save_to_cache(cache_key, (reply, reasoning_content))
         
         return (reply, reasoning_content) if return_reasoning else reply
-
-    def chat_with_tools(
-        self,
-        messages: list[dict],
-        tools: list[dict],
-        tool_choice: str = "auto",
-        settings: ModelSettings | None = None,
-    ) -> Any:
-        """Send raw OpenAI-format messages with function tools.
-
-        OfficeQA follows SkillOpt's function-calling agent loop, which needs
-        access to ``tool_calls`` instead of only text content.  Keep this as a
-        narrow escape hatch so the existing spreadsheet ReAct text parser is
-        untouched.
-        """
-        config = self.generation_config.copy()
-        if settings:
-            settings_dict = settings.to_dict()
-            config.update(settings_dict)
-        config["tools"] = tools
-        config["tool_choice"] = tool_choice
-
-        cache_key = _make_cache_key(
-            self.model,
-            messages,
-            protocol={
-                "client": "openai_tools",
-                "base_url": self.base_url or "",
-                "api_key": _secret_fingerprint(self.api_key),
-                "generation_config": config,
-                "retry_times": self.retry_times,
-                "timeout": self.timeout,
-            },
-        )
-        cached = self._get_from_cache(cache_key)
-        if isinstance(cached, dict):
-            _record_react_usage(
-                client="openai",
-                model=self.model,
-                endpoint=self.base_url or "",
-                cache_hit=True,
-                request={"message_count": len(messages), "tools": True},
-            )
-            return _tool_response_from_cache_payload(cached)
-
-        response = self._send_request_with_retry(messages, config)
-        _record_react_usage(
-            client="openai",
-            model=self.model,
-            endpoint=self.base_url or "",
-            cache_hit=False,
-            response=response,
-            request={
-                "message_count": len(messages),
-                "temperature": config.get("temperature"),
-                "max_tokens": config.get("max_tokens"),
-                "tools": True,
-            },
-        )
-        self._save_to_cache(cache_key, _tool_response_to_cache_payload(response))
-        return response
     
     async def chat_async(
         self,

@@ -129,6 +129,10 @@ class ClusterAnalyst:
         self.config = config or ClusterAnalystConfig()
         self._templates = _load_trace2skill_templates(self.config.trace2skill_analysis_dir)
 
+    @staticmethod
+    def _analyst_extra_body() -> dict[str, Any]:
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+
     async def summarize(self, community: ExperienceCommunity, members: Sequence[ExperienceItem], clustering: Any | None = None) -> list[ExperienceItem]:
         if _is_diagnostic_community(community):
             return []
@@ -236,17 +240,16 @@ class ClusterAnalyst:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ]
-        schema = (
-            DYNAMIC_EXPERIENCE_CARD_UPDATE_ONLY_SCHEMA
-            if analyst_mode == "experience_abstractor"
-            else DYNAMIC_EXPERIENCE_CARD_PATCH_SET_SCHEMA
-        )
-        schema_name = "DynamicExperienceCardUpdateOnly" if analyst_mode == "experience_abstractor" else "DynamicExperienceCardPatchSet"
-        max_attempts = 3
+        max_attempts = 3 if analyst_mode == "experience_abstractor" else 1
         last_error: Exception | None = None
         rendered_texts: list[str] = []
         patch_specs: list[tuple[str, str, dict[str, Any], str]] = []
         extra_patches_truncated = 0
+        guided_schema = (
+            DYNAMIC_EXPERIENCE_CARD_UPDATE_ONLY_SCHEMA
+            if analyst_mode == "experience_abstractor"
+            else DYNAMIC_EXPERIENCE_CARD_PATCH_SET_SCHEMA
+        )
         for attempt in range(1, max_attempts + 1):
             try:
                 attempt_token_event = token_event
@@ -262,16 +265,17 @@ class ClusterAnalyst:
                     )
                 payload = await self.generation.chat_json(
                     messages,
-                    schema_name=schema_name,
-                    guided_json=schema,
+                    schema_name="DynamicExperienceCardPatchSet",
+                    guided_json=guided_schema,
                     max_tokens=self.config.dynamic_max_output_tokens,
-                    retries=0,
+                    retries=0 if analyst_mode == "experience_abstractor" else 2,
+                    extra_body=self._analyst_extra_body(),
                     debug_metadata={
                         **self._generation_debug_metadata(
                             community,
                             members,
                             analyst_mode,
-                            schema_name,
+                            "DynamicExperienceCardPatchSet",
                             attempt_token_event,
                         ),
                         "dynamic_schema_attempt": attempt,
@@ -286,6 +290,8 @@ class ClusterAnalyst:
                 last_error = None
                 break
             except (KeyError, TypeError, ValueError) as exc:
+                if analyst_mode != "experience_abstractor":
+                    raise
                 last_error = exc
                 status = "retry" if attempt < max_attempts else "ignored_invalid_llm_output"
                 self._record_dynamic_schema_repair_event(
@@ -303,7 +309,7 @@ class ClusterAnalyst:
                     *messages,
                     {
                         "role": "user",
-                        "content": _dynamic_repair_prompt(analyst_mode, previous_by_id),
+                        "content": _dynamic_update_repair_prompt(previous_by_id),
                     },
                 ]
         if last_error is not None:
@@ -908,62 +914,36 @@ def _extract_dynamic_update_only_payload(payload: dict[str, Any]) -> tuple[list[
     return update_items, 0
 
 
-def _dynamic_repair_prompt(analyst_mode: str, previous_by_id: dict[str, dict[str, Any]]) -> str:
-    update_shape = {
-        "item_id": "must exactly equal one allowed_previous_item_ids value",
-        "name": "string",
-        "trigger": "string",
-        "content": "string",
-        "placement": {
-            "target": "skill_md | reference | script",
-            "reference_kind": "procedure | example | edge_case | note",
-        },
-        "confidence": "float in (0,1]",
-    }
-    card_shape = {
-        "name": "string",
-        "trigger": "string",
-        "content": "string",
-        "placement": {
-            "target": "skill_md | reference | script",
-            "reference_kind": "procedure | example | edge_case | note",
-        },
-        "confidence": "float in (0,1]",
-    }
-    if analyst_mode == "experience_abstractor":
-        repair_instruction = (
+def _dynamic_update_repair_prompt(previous_by_id: dict[str, dict[str, Any]]) -> str:
+    return json.dumps({
+        "repair_instruction": (
             "Your previous JSON did not satisfy the L1+ dynamic update schema. "
             "Return valid JSON using only the update-only schema below. "
             "If no existing ExperienceCard should change, return an empty updates list."
-        )
-        required_schema = {"updates": [update_shape]}
-        hard_constraints = [
+        ),
+        "allowed_previous_item_ids": sorted(previous_by_id),
+        "required_top_level_schema": {
+            "updates": [
+                {
+                    "item_id": "must exactly equal one allowed_previous_item_ids value",
+                    "name": "string",
+                    "trigger": "string",
+                    "content": "string",
+                    "placement": {
+                        "target": "skill_md | reference | script",
+                        "reference_kind": "procedure | example | edge_case | note"
+                    },
+                    "confidence": "float in (0,1]"
+                }
+            ]
+        },
+        "hard_constraints": [
             "Use no top-level field except updates.",
             "Every update must revise an existing ExperienceCard by explicit item_id.",
             "Do not infer update targets from list order, rank, or confidence.",
             "Do not output support_mass.",
             "Return valid JSON only.",
-        ]
-    else:
-        repair_instruction = (
-            "Your previous JSON did not satisfy the L0 dynamic patch schema. "
-            "Return valid JSON with explicit updates and new_cards lists. "
-            "Use updates only for existing ExperienceCards and new_cards only for independent new lessons."
-        )
-        required_schema = {"updates": [update_shape], "new_cards": [card_shape]}
-        hard_constraints = [
-            "Use no top-level field except updates and new_cards.",
-            "Every updates[].item_id must revise an existing ExperienceCard by explicit item_id.",
-            "Do not output item_id inside new_cards.",
-            "Do not infer update targets from list order, rank, or confidence.",
-            "Do not output support_mass.",
-            "Return valid JSON only.",
-        ]
-    return json.dumps({
-        "repair_instruction": repair_instruction,
-        "allowed_previous_item_ids": sorted(previous_by_id),
-        "required_top_level_schema": required_schema,
-        "hard_constraints": hard_constraints,
+        ],
     }, ensure_ascii=False, indent=2)
 
 

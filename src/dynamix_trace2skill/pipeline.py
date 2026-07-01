@@ -56,7 +56,6 @@ class DynaMixRunConfig:
     dynamic: DynamicPipelineConfig = field(default_factory=DynamicPipelineConfig)
     max_levels: int = 8
     skill_output_dir_name: str = "skills"
-    skill_export: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_json(cls, path: str | Path) -> "DynaMixRunConfig":
@@ -77,7 +76,6 @@ class DynaMixRunConfig:
             dynamic=DynamicPipelineConfig(**payload.get("dynamic", {})),
             max_levels=int(payload.get("max_levels", 8)),
             skill_output_dir_name=str(payload.get("skill_output_dir_name", "skills")),
-            skill_export=dict(payload.get("skill_export", {})),
         )
 
 
@@ -89,11 +87,6 @@ def default_hierarchy_config(payload: dict[str, Any] | None = None) -> Projected
     """
     data = dict(payload or {})
     return ProjectedGmmDynamicTreeConfig.from_mapping({
-        "tree_policy": data.get("tree_policy", "projected_gmm_bic"),
-        "graph_kind": data.get("graph_kind", "overlapping_experience_hierarchy"),
-        "allow_overlap": data.get("allow_overlap", True),
-        "allow_multi_parent": data.get("allow_multi_parent", True),
-        "use_support_mass": data.get("use_support_mass", True),
         "projection": data.get("projection", {"variance_ratio": 0.90, "max_dim": 32, "min_dim": 2, "whiten": False}),
         "gmm_bic": data.get("gmm_bic", {
             "covariance_type": "spherical",
@@ -131,18 +124,6 @@ def default_hierarchy_config(payload: dict[str, Any] | None = None) -> Projected
     })
 
 
-def _dynamic_hierarchy_config(config: DynaMixRunConfig) -> ProjectedGmmDynamicTreeConfig:
-    """Keep dynamic runs on the official hierarchy policy.
-
-    Static ablations may set ``hierarchy.tree_policy`` to alternatives such as
-    identity singleton or KMeans elbow.  Those variants are intentionally scoped
-    to static_build experiments and must not change dynamic_update runs.
-    """
-    payload = dict(config.hierarchy or {})
-    payload["tree_policy"] = "projected_gmm_bic"
-    return default_hierarchy_config(payload)
-
-
 async def build_tree_from_records(config: DynaMixRunConfig) -> dict[str, Any]:
     out = Path(config.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -172,7 +153,7 @@ async def build_tree_from_records(config: DynaMixRunConfig) -> dict[str, Any]:
     layers_payload = _layers_payload(result.layers)
     (out / "hierarchy_layers.json").write_text(json.dumps(layers_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    skill_result = await export_skill_files(result.state, out, config=_skill_export_config(config))
+    skill_result = await export_skill_files(result.state, out, config=SkillExportConfig(output_dir_name=config.skill_output_dir_name))
     skillbank_index = _refresh_skillbank_index(skill_result.output_dir, config)
     summary = {
         "scenario": "static_build",
@@ -185,7 +166,6 @@ async def build_tree_from_records(config: DynaMixRunConfig) -> dict[str, Any]:
         "node_bank_manifest": skill_result.manifest_path,
         "skillbank_index": skillbank_index,
         "embedding_truncation_events": len(embedding_client.truncation_events),
-        "skill_export": _skill_export_summary(config),
         "layers": layers_payload,
     }
     (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -235,7 +215,7 @@ async def build_dynamic_tree_from_records(config: DynaMixRunConfig) -> dict[str,
     arrival_items = list(remaining)
 
     analyst = ClusterAnalyst(generation_client, embedding_client, config.analyst)
-    hierarchy_config = _dynamic_hierarchy_config(config)
+    hierarchy_config = default_hierarchy_config(config.hierarchy)
     builder = ProjectedGmmTreeBuilder(hierarchy_config)
     resume = await _load_dynamic_snapshot(
         out=out,
@@ -284,11 +264,7 @@ async def build_dynamic_tree_from_records(config: DynaMixRunConfig) -> dict[str,
         snap_dir = out / "dynamic_snapshots" / f"batch_{batch_index:03d}"
         snap_dir.mkdir(parents=True, exist_ok=True)
         (snap_dir / "hierarchy_state.json").write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
-        skill_result = await export_skill_files(
-            state,
-            snap_dir,
-            config=SkillExportConfig(output_dir_name=config.skill_output_dir_name),
-        )
+        skill_result = await export_skill_files(state, snap_dir, config=SkillExportConfig(output_dir_name=config.skill_output_dir_name))
         skillbank_index = _refresh_skillbank_index(skill_result.output_dir, config)
         from dynamix_core.skill_export import affected_node_refs
         affected_refs = affected_node_refs(update_result.changed_item_ids, skill_result.manifest_path)
@@ -322,11 +298,7 @@ async def build_dynamic_tree_from_records(config: DynaMixRunConfig) -> dict[str,
     analyst.save_prompt_token_report(out / "analysis" / "cluster_prompt_token_report.json")
     final_state = await state.to_dict(include_embeddings=False, validate=True)
     (out / "hierarchy_state.json").write_text(json.dumps(final_state, ensure_ascii=False, indent=2), encoding="utf-8")
-    final_skill = await export_skill_files(
-        state,
-        out,
-        config=SkillExportConfig(output_dir_name=config.skill_output_dir_name),
-    )
+    final_skill = await export_skill_files(state, out, config=SkillExportConfig(output_dir_name=config.skill_output_dir_name))
     final_skillbank_index = _refresh_skillbank_index(final_skill.output_dir, config)
     summary = {
         "scenario": "dynamic_update",
@@ -434,26 +406,6 @@ def _refresh_skillbank_index(skillbank_root: str | Path, config: DynaMixRunConfi
     )
     selector._load_or_build_index()
     return str(index_path)
-
-
-def _skill_export_config(config: DynaMixRunConfig) -> SkillExportConfig:
-    payload = dict(config.skill_export or {})
-    return SkillExportConfig(
-        output_dir_name=str(payload.get("output_dir_name", config.skill_output_dir_name)),
-        max_node_count=None if payload.get("max_node_count") is None else int(payload["max_node_count"]),
-        min_level=None if payload.get("min_level") is None else int(payload["min_level"]),
-        max_level=None if payload.get("max_level") is None else int(payload["max_level"]),
-    )
-
-
-def _skill_export_summary(config: DynaMixRunConfig) -> dict[str, Any]:
-    export = _skill_export_config(config)
-    return {
-        "output_dir_name": export.output_dir_name,
-        "max_node_count": export.max_node_count,
-        "min_level": export.min_level,
-        "max_level": export.max_level,
-    }
 
 
 def _prepare_analyst_tokenizer_config(config: DynaMixRunConfig, out: Path) -> None:

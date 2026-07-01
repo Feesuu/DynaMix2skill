@@ -71,11 +71,12 @@ EMBEDDING_TOKENIZER="${EMBEDDING_TOKENIZER:-/mnt/data/grouph_share/models/models
 # Maximum ReAct turns per train/heldout spreadsheet task.
 MAX_TURNS="${MAX_TURNS:-30}"
 
-# Qwen thinking flag for Trace2Skill rollout and DynaMix analyst calls.
-# Allowed values: true, false, null.
-THINKING="${THINKING:-true}"
+# Qwen thinking flag for Trace2Skill rollout and static DynaMix analyst calls.
+# Dynamic patch analyst calls force enable_thinking=false while using guided_json.
+# Allowed values: true, false, null.  Use false for faster non-thinking tests.
+THINKING="${THINKING:-false}"
 
-# Analyst JSON completion caps.  These prevent JSON analyst calls from running
+# Analyst JSON completion caps.  These prevent guided_json calls from running
 # unbounded when a model keeps expanding an experience card or dynamic patch.
 ANALYST_MAX_OUTPUT_TOKENS="${ANALYST_MAX_OUTPUT_TOKENS:-4096}"
 ANALYST_DYNAMIC_MAX_OUTPUT_TOKENS="${ANALYST_DYNAMIC_MAX_OUTPUT_TOKENS:-8192}"

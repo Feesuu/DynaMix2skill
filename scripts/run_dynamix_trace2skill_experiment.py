@@ -12,20 +12,6 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urlparse
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT / "src"))
-
-from dynamix_benchmarks.adapters import BenchmarkSlice, EvalCommandSpec, ExtractCommandSpec, RolloutCommandSpec, get_benchmark_adapter
-from dynamix_benchmarks.officeqa import resolve_reward_path
-from dynamix_core.skill_export import SkillExportConfig, export_skill_files_from_payload
-from dynamix_trace2skill.pipeline import default_hierarchy_config
-from dynamix_trace2skill.skillbank import SkillBankSelector
-from dynamix_trace2skill.summary import ClusterAnalystConfig
-
-
-SKILLOPT_QWEN_DEFAULT_TEMPERATURE = 0.7
 
 
 def run(cmd: list[str], *, cwd: Path, env: dict[str, str], log_path: Path | None = None) -> None:
@@ -127,29 +113,6 @@ def run_stage(
         running.unlink()
 
 
-def write_done_marker(
-    name: str,
-    *,
-    marker_dir: Path,
-    outputs: list[Path],
-    fingerprint: dict | None,
-    log_path: Path,
-    started_at: str,
-    elapsed_seconds: float,
-) -> None:
-    marker_dir.mkdir(parents=True, exist_ok=True)
-    marker = marker_dir / f"{name}.done"
-    marker.write_text(json.dumps({
-        "stage": name,
-        "outputs": [str(p) for p in outputs],
-        "fingerprint": fingerprint,
-        "started_at": started_at,
-        "ended_at": utc_now_iso(),
-        "elapsed_seconds": elapsed_seconds,
-        "log": str(log_path),
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 def write_generation_config(path: Path, *, thinking: bool | None, temperature: float = 0.0) -> None:
     payload: dict = {"temperature": temperature}
     if thinking is not None:
@@ -178,93 +141,6 @@ def parse_str_csv(value: str) -> list[str]:
     if not parts:
         raise argparse.ArgumentTypeError("expected at least one comma-separated string")
     return parts
-
-
-def arg_was_provided(argv: list[str], flag: str) -> bool:
-    return any(arg == flag or arg.startswith(flag + "=") for arg in argv)
-
-
-def apply_officeqa_default_ranges(args: argparse.Namespace, adapter: Any, data_path: Path, argv: list[str]) -> None:
-    if args.benchmark != "officeqa":
-        return
-    if not arg_was_provided(argv, "--rollout-temperature"):
-        args.rollout_temperature = SKILLOPT_QWEN_DEFAULT_TEMPERATURE
-    if not arg_was_provided(argv, "--generation-temperature"):
-        args.generation_temperature = SKILLOPT_QWEN_DEFAULT_TEMPERATURE
-    train_total = len(adapter.load_rows(data_path, BenchmarkSlice(split=args.officeqa_train_split, start=0, end=None)))
-    heldout_total = len(adapter.load_rows(data_path, BenchmarkSlice(split=args.officeqa_heldout_split, start=0, end=None)))
-    if train_total <= 0:
-        raise ValueError(f"OfficeQA train split {args.officeqa_train_split!r} is empty under {data_path}")
-    if heldout_total <= 0:
-        raise ValueError(f"OfficeQA heldout split {args.officeqa_heldout_split!r} is empty under {data_path}")
-    if not arg_was_provided(argv, "--train-start"):
-        args.train_start = 0
-    if not arg_was_provided(argv, "--train-end"):
-        args.train_end = train_total
-    if not arg_was_provided(argv, "--heldout-start"):
-        args.heldout_start = 0
-    if not arg_was_provided(argv, "--heldout-end"):
-        args.heldout_end = heldout_total
-    if not (0 <= int(args.train_start) < int(args.train_end) <= train_total):
-        raise ValueError(
-            f"Invalid OfficeQA train range [{args.train_start}, {args.train_end}) "
-            f"for split {args.officeqa_train_split!r} with {train_total} items"
-        )
-    if not (0 <= int(args.heldout_start) < int(args.heldout_end) <= heldout_total):
-        raise ValueError(
-            f"Invalid OfficeQA heldout range [{args.heldout_start}, {args.heldout_end}) "
-            f"for split {args.officeqa_heldout_split!r} with {heldout_total} items"
-        )
-    train_count = max(0, int(args.train_end) - int(args.train_start))
-    if args.tree_scenario == "dynamic_update" and train_count > 0:
-        if not arg_was_provided(argv, "--dynamic-initial-count"):
-            args.dynamic_initial_count = max(1, int(train_count * 0.6))
-        if not arg_was_provided(argv, "--dynamic-arrival-count"):
-            args.dynamic_arrival_count = max(0, train_count - int(args.dynamic_initial_count))
-
-
-def _host_from_url(value: str) -> str:
-    try:
-        return urlparse(value).hostname or ""
-    except Exception:
-        return ""
-
-
-def _proxy_bypass_host(host: str) -> bool:
-    normalized = host.strip().lower()
-    if not normalized:
-        return False
-    if normalized in {"localhost", "127.0.0.1", "0.0.0.0"} or normalized.endswith(".nip.io"):
-        return True
-    if normalized.startswith("10.") or normalized.startswith("192.168."):
-        return True
-    if normalized.startswith("172."):
-        parts = normalized.split(".")
-        return len(parts) >= 2 and parts[1].isdigit() and 16 <= int(parts[1]) <= 31
-    return False
-
-
-def append_no_proxy_hosts(env: dict[str, str], urls: Iterable[str]) -> None:
-    hosts = [host for host in (_host_from_url(url) for url in urls) if _proxy_bypass_host(host)]
-    if not hosts:
-        return
-    existing = [part.strip() for part in env.get("NO_PROXY", env.get("no_proxy", "")).split(",") if part.strip()]
-    merged = existing[:]
-    for host in hosts:
-        if host not in merged:
-            merged.append(host)
-    value = ",".join(merged)
-    env["NO_PROXY"] = value
-    env["no_proxy"] = value
-
-
-def tree_dataset_order_payload(args: argparse.Namespace) -> dict[str, object]:
-    return {
-        "dataset_path": str(Path(args.data_path).resolve()),
-        "train_start": int(args.train_start),
-        "train_end": int(args.train_end),
-        "enforce_dataset_order": args.benchmark == "spreadsheetbench",
-    }
 
 
 def resolve_python_executable(value: str) -> str:
@@ -335,308 +211,6 @@ def path_fingerprint(path: Path, *, source_only: bool = False) -> dict[str, str 
     return {"exists": True, "kind": "other"}
 
 
-def skill_export_config_from_args(args: argparse.Namespace) -> SkillExportConfig:
-    min_level = None if int(args.skill_export_min_level) < 0 else int(args.skill_export_min_level)
-    max_level = None if int(args.skill_export_max_level) < 0 else int(args.skill_export_max_level)
-    return SkillExportConfig(
-        output_dir_name=args.skill_output_dir_name,
-        max_node_count=None if int(args.skill_export_max_node_count) < 0 else int(args.skill_export_max_node_count),
-        min_level=min_level,
-        max_level=max_level,
-    )
-
-
-def skill_export_payload_from_args(args: argparse.Namespace) -> dict[str, int | None]:
-    export = skill_export_config_from_args(args)
-    return {
-        "max_node_count": export.max_node_count,
-        "min_level": export.min_level,
-        "max_level": export.max_level,
-    }
-
-
-def _protocol_path(value: Any) -> str:
-    return str(Path(str(value)).expanduser().resolve()) if value else ""
-
-
-def _selected_protocol_generation(payload: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: payload.get(key)
-        for key in ("base_url", "model", "temperature", "thinking_mode", "extra_body")
-    }
-
-
-def _selected_protocol_embedding(payload: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: payload.get(key)
-        for key in (
-            "base_url",
-            "model",
-            "max_model_len",
-            "max_input_tokens",
-            "truncate_long_texts",
-            "tokenizer_model",
-            "tokenizer_required",
-            "truncation_strategy",
-        )
-    }
-
-
-def _selected_protocol_chunked_embedding(payload: dict[str, Any], embedding: dict[str, Any]) -> dict[str, Any]:
-    data = dict(payload or {})
-    enabled = bool(data.get("enabled", False))
-    if not enabled:
-        return {"enabled": False}
-    tokenizer_model = data.get("tokenizer_model") or embedding.get("tokenizer_model") or embedding.get("model")
-    return {
-        "enabled": True,
-        "tokenizer_model": tokenizer_model,
-        "chunk_tokens": int(data.get("chunk_tokens", 10000)),
-        "overlap_tokens": int(data.get("overlap_tokens", 2000)),
-        "pooling": str(data.get("pooling", "mean")),
-        "add_special_tokens": bool(data.get("add_special_tokens", False)),
-        "normalize_after_pooling": bool(data.get("normalize_after_pooling", False)),
-        "fail_if_chunk_exceeds_model_limit": bool(data.get("fail_if_chunk_exceeds_model_limit", True)),
-    }
-
-
-def _selected_protocol_hierarchy(payload: dict[str, Any]) -> dict[str, Any]:
-    canonical = default_hierarchy_config(payload or {}).to_dict()
-    canonical.pop("dynamic_update", None)
-    return canonical
-
-
-def _selected_protocol_analyst(payload: dict[str, Any]) -> dict[str, Any]:
-    allowed = ClusterAnalystConfig.__dataclass_fields__
-    cleaned = {key: value for key, value in (payload or {}).items() if key in allowed}
-    canonical = ClusterAnalystConfig(**cleaned).__dict__
-    return {
-        key: canonical.get(key)
-        for key in (
-            "prompt_style",
-            "confidence_floor",
-            "tokenizer_model",
-            "tokenizer_required",
-            "allow_regex_tokenizer_fallback",
-            "max_prompt_tokens",
-            "max_output_tokens",
-            "dynamic_max_output_tokens",
-            "multi_card_max_level",
-            "max_cards_l0",
-            "max_cards_higher",
-            "higher_level_mode",
-            "truncate_higher_level_extra_cards",
-        )
-    }
-
-
-def _source_export_filter_status(source_summary: dict[str, Any], source_runtime: dict[str, Any]) -> str:
-    export = source_summary.get("skill_export")
-    if not isinstance(export, dict):
-        export = source_runtime.get("skill_export")
-    if not isinstance(export, dict):
-        # Legacy full-tree runs predate level-filtered nodebank export metadata.
-        # Since those versions could not encode filtered exports, treat absence
-        # as an auditable unfiltered source rather than rejecting valid baselines.
-        return "legacy_missing_skill_export_assumed_unfiltered"
-    is_unfiltered = (
-        export.get("min_level") is None
-        and export.get("max_level") is None
-        and export.get("max_node_count") is None
-    )
-    return "unfiltered" if is_unfiltered else "filtered"
-
-
-def _source_export_is_unfiltered(source_summary: dict[str, Any], source_runtime: dict[str, Any]) -> bool:
-    return _source_export_filter_status(source_summary, source_runtime) in {
-        "unfiltered",
-        "legacy_missing_skill_export_assumed_unfiltered",
-    }
-
-
-def _path_contains(parent: Path, child: Path) -> bool:
-    try:
-        child.relative_to(parent)
-        return True
-    except ValueError:
-        return False
-
-
-def validate_reused_tree_protocol(
-    *,
-    reuse_tree_dir: Path,
-    current_config: dict[str, Any],
-    source_summary: dict[str, Any],
-    current_records_sha256: str,
-) -> None:
-    runtime_path = reuse_tree_dir / "analysis" / "runtime_config.json"
-    if not runtime_path.is_file():
-        raise FileNotFoundError(f"--reuse-tree-dir missing analysis/runtime_config.json: {runtime_path}")
-    source_runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
-    errors: list[str] = []
-
-    def compare(label: str, source: Any, current: Any) -> None:
-        if source != current:
-            errors.append(f"{label} mismatch: source={source!r}, current={current!r}")
-
-    compare("scenario", source_runtime.get("scenario"), "static_build")
-    compare("current scenario", current_config.get("scenario"), "static_build")
-    if source_runtime.get("benchmark") is not None:
-        compare("benchmark", source_runtime.get("benchmark"), current_config.get("benchmark"))
-    compare("dataset_path", _protocol_path(source_runtime.get("dataset_path")), _protocol_path(current_config.get("dataset_path")))
-    compare("train_start", source_runtime.get("train_start"), current_config.get("train_start"))
-    compare("train_end", source_runtime.get("train_end"), current_config.get("train_end"))
-    compare("enforce_dataset_order", source_runtime.get("enforce_dataset_order"), current_config.get("enforce_dataset_order"))
-    compare("max_levels", source_runtime.get("max_levels"), current_config.get("max_levels"))
-    compare("generation", _selected_protocol_generation(source_runtime.get("generation") or {}), _selected_protocol_generation(current_config.get("generation") or {}))
-    compare("embedding", _selected_protocol_embedding(source_runtime.get("embedding") or {}), _selected_protocol_embedding(current_config.get("embedding") or {}))
-    compare(
-        "chunked_embedding",
-        _selected_protocol_chunked_embedding(source_runtime.get("chunked_embedding") or {}, source_runtime.get("embedding") or {}),
-        _selected_protocol_chunked_embedding(current_config.get("chunked_embedding") or {}, current_config.get("embedding") or {}),
-    )
-    compare("hierarchy", _selected_protocol_hierarchy(source_runtime.get("hierarchy") or {}), _selected_protocol_hierarchy(current_config.get("hierarchy") or {}))
-    compare("analyst", _selected_protocol_analyst(source_runtime.get("analyst") or {}), _selected_protocol_analyst(current_config.get("analyst") or {}))
-
-    source_records = Path(str(source_runtime.get("records_path") or ""))
-    if not source_records.is_file():
-        errors.append(f"source records_path is not readable: {source_records}")
-    elif file_sha256(source_records) != current_records_sha256:
-        errors.append("records_sha256 mismatch between reused tree source records and current records")
-
-    if not _source_export_is_unfiltered(source_summary, source_runtime):
-        errors.append("source tree was already level/max-node filtered; retrieval ablations require an unfiltered full static tree")
-
-    if errors:
-        raise RuntimeError(
-            "Rejected --reuse-tree-dir because its source protocol does not match the current retrieval ablation:\n"
-            + "\n".join(f"- {error}" for error in errors)
-        )
-
-
-def clear_reuse_tree_outputs(tree_dir: Path, *, skill_output_dir_name: str, usage_logs: list[Path]) -> None:
-    for path in [
-        tree_dir / "analysis",
-        tree_dir / "dynamic_snapshots",
-        tree_dir / skill_output_dir_name,
-    ]:
-        if path.exists() and path.is_dir():
-            shutil.rmtree(path)
-    for path in [
-        tree_dir / "summary.json",
-        tree_dir / "hierarchy_state.json",
-        tree_dir / "hierarchy_layers.json",
-    ]:
-        if path.exists() and path.is_file():
-            path.unlink()
-    for path in usage_logs:
-        if path.exists() and path.is_file():
-            path.unlink()
-
-
-def materialize_reused_tree_nodebank(
-    *,
-    reuse_tree_dir: Path,
-    tree_dir: Path,
-    args: argparse.Namespace,
-    current_config: dict[str, Any],
-    fingerprint: dict,
-    marker_dir: Path,
-    log_path: Path,
-    usage_logs: list[Path] | None = None,
-) -> dict[str, Any]:
-    started_at = utc_now_iso()
-    started = time.monotonic()
-    state_path = reuse_tree_dir / "hierarchy_state.json"
-    if not state_path.is_file():
-        raise FileNotFoundError(f"--reuse-tree-dir missing hierarchy_state.json: {state_path}")
-    resolved_tree_dir = tree_dir.resolve()
-    resolved_reuse_tree_dir = reuse_tree_dir.resolve()
-    if (
-        resolved_tree_dir == resolved_reuse_tree_dir
-        or _path_contains(resolved_tree_dir, resolved_reuse_tree_dir)
-        or _path_contains(resolved_reuse_tree_dir, resolved_tree_dir)
-    ):
-        raise ValueError(
-            "--reuse-tree-dir must not overlap the output tree dir: "
-            f"reuse={resolved_reuse_tree_dir}, output={resolved_tree_dir}"
-        )
-    tree_dir.mkdir(parents=True, exist_ok=True)
-    payload = json.loads(state_path.read_text(encoding="utf-8"))
-    source_summary_path = reuse_tree_dir / "summary.json"
-    source_summary = json.loads(source_summary_path.read_text(encoding="utf-8")) if source_summary_path.is_file() else {}
-    source_export_status = _source_export_filter_status(source_summary, json.loads((reuse_tree_dir / "analysis" / "runtime_config.json").read_text(encoding="utf-8")))
-    validate_reused_tree_protocol(
-        reuse_tree_dir=reuse_tree_dir,
-        current_config=current_config,
-        source_summary=source_summary,
-        current_records_sha256=str(fingerprint.get("records_sha256") or ""),
-    )
-    clear_reuse_tree_outputs(tree_dir, skill_output_dir_name=args.skill_output_dir_name, usage_logs=list(usage_logs or []))
-    tree_dir.mkdir(parents=True, exist_ok=True)
-    analysis_dir = tree_dir / "analysis"
-    analysis_dir.mkdir(parents=True, exist_ok=True)
-    runtime_payload = {
-        **current_config,
-        "output_dir": str(tree_dir),
-        "reuse_tree_dir": str(reuse_tree_dir),
-        "reuse_materialization": True,
-        "source_tree_summary": str(source_summary_path) if source_summary_path.is_file() else "",
-        "source_export_filter_status": source_export_status,
-    }
-    (analysis_dir / "runtime_config.json").write_text(json.dumps(runtime_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    (analysis_dir / "reuse_tree_audit.json").write_text(json.dumps({
-        "reuse_tree_dir": str(reuse_tree_dir.resolve()),
-        "output_tree_dir": str(tree_dir.resolve()),
-        "source_export_filter_status": source_export_status,
-        "source_summary": str(source_summary_path) if source_summary_path.is_file() else "",
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
-    (tree_dir / "hierarchy_state.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    export = export_skill_files_from_payload(payload, tree_dir, config=skill_export_config_from_args(args))
-    selector = SkillBankSelector(
-        skillbank_root=export.output_dir,
-        base_url=args.embedding_base_url,
-        model=args.embedding_model,
-        api_key="EMPTY",
-        cache_path=Path(export.output_dir) / ".dynamix_skillbank_index.json",
-    )
-    selector._load_or_build_index()
-    summary = {
-        **source_summary,
-        "scenario": "static_build",
-        "reuse_tree_dir": str(reuse_tree_dir),
-        "node_count": export.node_count,
-        "node_bank_dir": export.output_dir,
-        "node_bank_manifest": export.manifest_path,
-        "skillbank_index": str(Path(export.output_dir) / ".dynamix_skillbank_index.json"),
-        "skill_export": {
-            "output_dir_name": args.skill_output_dir_name,
-            **skill_export_payload_from_args(args),
-        },
-    }
-    (tree_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text(
-        "\n".join([
-            f"reused_tree_dir={reuse_tree_dir}",
-            f"state_path={state_path}",
-            f"node_bank_manifest={export.manifest_path}",
-            f"node_count={export.node_count}",
-        ]) + "\n",
-        encoding="utf-8",
-    )
-    write_done_marker(
-        "04_build_tree",
-        marker_dir=marker_dir,
-        outputs=[tree_dir / "summary.json"],
-        fingerprint=fingerprint,
-        log_path=log_path,
-        started_at=started_at,
-        elapsed_seconds=time.monotonic() - started,
-    )
-    return summary
-
-
 def dataset_json_path(data_path: str) -> Path:
     path = Path(data_path)
     return path / "dataset.json" if path.is_dir() else path
@@ -661,60 +235,17 @@ def stage_source_fingerprints(repo: Path) -> dict[str, dict[str, str | bool | in
         "run_spreadsheetbench": path_fingerprint(repo / "run_spreadsheetbench.py"),
         "evaluate_with_official": path_fingerprint(repo / "evaluate_with_official.py"),
         "extract_trace2skill_logs": path_fingerprint(repo / "scripts" / "extract_trace2skill_logs.py"),
-        "run_officeqa_benchmark": path_fingerprint(repo / "scripts" / "run_officeqa_benchmark.py"),
-        "evaluate_officeqa_results": path_fingerprint(repo / "scripts" / "evaluate_officeqa_results.py"),
-        "extract_officeqa_records": path_fingerprint(repo / "scripts" / "extract_officeqa_records.py"),
         "build_dynamix_tree": path_fingerprint(repo / "scripts" / "build_dynamix_tree.py"),
         "spreadsheetbench_support": path_fingerprint(repo / "spreadsheetbench_support.py"),
         "spreadsheet_agent": path_fingerprint(repo / "spreadsheet_agent", source_only=True),
         "react_agent": path_fingerprint(repo / "src" / "react_agent", source_only=True),
-        "dynamix_benchmarks": path_fingerprint(repo / "src" / "dynamix_benchmarks", source_only=True),
         "dynamix_core": path_fingerprint(repo / "src" / "dynamix_core", source_only=True),
         "dynamix_trace2skill": path_fingerprint(repo / "src" / "dynamix_trace2skill", source_only=True),
     }
 
 
-def benchmark_source_fingerprints(source_fp: dict[str, dict[str, str | bool | int]], *, benchmark: str, stage: str) -> dict[str, dict[str, str | bool | int]]:
-    base = {"runner": source_fp["runner"]}
-    if benchmark == "officeqa":
-        by_stage = {
-            "rollout": {
-                "run_officeqa_benchmark": source_fp["run_officeqa_benchmark"],
-                "react_agent": source_fp["react_agent"],
-                "dynamix_benchmarks": source_fp["dynamix_benchmarks"],
-                "dynamix_trace2skill": source_fp["dynamix_trace2skill"],
-            },
-            "eval": {
-                "evaluate_officeqa_results": source_fp["evaluate_officeqa_results"],
-                "dynamix_benchmarks": source_fp["dynamix_benchmarks"],
-            },
-            "extract": {
-                "extract_officeqa_records": source_fp["extract_officeqa_records"],
-                "dynamix_benchmarks": source_fp["dynamix_benchmarks"],
-            },
-        }
-        return {**base, **by_stage[stage]}
-    by_stage = {
-        "rollout": {
-            "run_spreadsheetbench": source_fp["run_spreadsheetbench"],
-            "spreadsheet_agent": source_fp["spreadsheet_agent"],
-            "react_agent": source_fp["react_agent"],
-            "dynamix_trace2skill": source_fp["dynamix_trace2skill"],
-        },
-        "eval": {
-            "evaluate_with_official": source_fp["evaluate_with_official"],
-            "spreadsheetbench_support": source_fp["spreadsheetbench_support"],
-        },
-        "extract": {
-            "extract_trace2skill_logs": source_fp["extract_trace2skill_logs"],
-        },
-    }
-    return {**base, **by_stage[stage]}
-
-
 def rollout_protocol(args: argparse.Namespace, *, generation_config: Path) -> dict[str, object]:
     return {
-        "benchmark": args.benchmark,
         "model": args.model,
         "openai_base_url": args.openai_base_url,
         "openai_api_key": api_key_fingerprint(args.openai_api_key),
@@ -732,25 +263,12 @@ def rollout_protocol(args: argparse.Namespace, *, generation_config: Path) -> di
         "shuffle_seed": str(args.rollout_shuffle_seed),
         "sample": int(args.rollout_sample),
         "generation_config": path_fingerprint(generation_config),
-        "officeqa": {
-            "docs_dir": list(getattr(args, "_officeqa_docs_dirs_resolved", getattr(args, "officeqa_docs_dir", []))),
-            "train_split": getattr(args, "officeqa_train_split", ""),
-            "heldout_split": getattr(args, "officeqa_heldout_split", ""),
-            "evaluator": getattr(args, "officeqa_evaluator", "skillopt"),
-            "max_completion_tokens": int(getattr(args, "officeqa_max_completion_tokens", 16384)),
-            "reward_path": getattr(args, "_officeqa_reward_path_resolved", getattr(args, "officeqa_reward_path", "")),
-            "reward_tolerance": float(getattr(args, "officeqa_reward_tolerance", 0.0)),
-            "allow_fallback_evaluator": bool(getattr(args, "officeqa_allow_fallback_evaluator", False)),
-            "continue_on_infra_error": bool(getattr(args, "officeqa_continue_on_infra_error", False)),
-            "use_oracle_context": bool(getattr(args, "officeqa_use_oracle_context", True)),
-        } if getattr(args, "benchmark", "spreadsheetbench") == "officeqa" else {},
     }
 
 
 def skillbank_retrieval_protocol(args: argparse.Namespace, *, cache_path: Path, selection_log: Path) -> dict[str, object]:
     return {
-        "benchmark": args.benchmark,
-        "query_policy": "instruction/question + Task type; answer_position/gold answer/source_docs excluded",
+        "query_policy": "instruction + Task type; answer_position excluded",
         "top_k": int(args.skillbank_top_k),
         "embedding_base_url": args.embedding_base_url,
         "embedding_model": args.embedding_model,
@@ -874,9 +392,7 @@ def validate_tree_summary_for_heldout(summary: dict, args: argparse.Namespace) -
         raise RuntimeError(f"DynaMix tree summary scenario mismatch: expected {args.tree_scenario!r}, got {scenario!r}")
     if args.tree_scenario != "dynamic_update":
         return
-    if getattr(args, "benchmark", "spreadsheetbench") == "officeqa":
-        train_count = int(summary.get("record_count", 0))
-    elif hasattr(args, "train_start") and hasattr(args, "train_end"):
+    if hasattr(args, "train_start") and hasattr(args, "train_end"):
         train_count = int(args.train_end) - int(args.train_start)
     else:
         train_count = int(summary.get("record_count", 0))
@@ -1115,7 +631,7 @@ def runtime_dead_corner_findings(args: argparse.Namespace) -> list[dict[str, str
             "finding": "each embedding item is under the model limit, but a large batch of long chunks can still overload an embedding service by aggregate tokens.",
             "evidence": f"batch_size={args.embedding_batch_size}, chunk_tokens={args.chunked_embedding_chunk_tokens}, max_model_len={args.embedding_max_model_len}",
         })
-    train_count = int(getattr(args, "_observed_train_records", int(args.train_end) - int(args.train_start)))
+    train_count = int(args.train_end) - int(args.train_start)
     expected_dynamic = expected_dynamic_counts(
         record_count=train_count,
         initial_count=int(args.dynamic_initial_count),
@@ -1272,24 +788,12 @@ def write_split_manifest(data_path: Path, run_dir: Path, *, train_start: int, tr
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Trace2Skill train collection -> nodebank build -> heldout experiment")
-    parser.add_argument("--benchmark", choices=["spreadsheetbench", "officeqa"], default="spreadsheetbench", help="Benchmark adapter. spreadsheetbench preserves the original Trace2Skill flow; officeqa uses local OfficeQA document ReAct rollout.")
     parser.add_argument("--data-path", required=True)
-    parser.add_argument("--officeqa-docs-dir", action="append", default=[], help="OfficeQA docs root; repeatable. Defaults to OFFICEQA_DOCS_DIR in run_officeqa_benchmark.py.")
-    parser.add_argument("--officeqa-train-split", default="train")
-    parser.add_argument("--officeqa-heldout-split", default="test")
-    parser.add_argument("--officeqa-evaluator", choices=["skillopt", "official_reward", "fallback"], default="skillopt")
-    parser.add_argument("--officeqa-max-completion-tokens", type=int, default=16384)
-    parser.add_argument("--officeqa-reward-path", default="")
-    parser.add_argument("--officeqa-reward-tolerance", type=float, default=0.0)
-    parser.add_argument("--officeqa-allow-fallback-evaluator", action="store_true", help="Debug only: allow simplified OfficeQA numeric/text evaluator when official reward.py is missing.")
-    parser.add_argument("--officeqa-continue-on-infra-error", action="store_true", help="Debug only: convert OfficeQA infra/config exceptions into failed rows instead of failing the stage.")
-    parser.add_argument("--officeqa-use-oracle-context", type=parse_bool, default=True)
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--records-path", default=None, help="Existing extracted records.json; when set, skip train rollout/eval/extraction and build from this file")
     parser.add_argument("--reuse-train-run-dir", default=None, help="Existing run dir containing records.json; when set, skip train rollout/eval/extraction")
     parser.add_argument("--train-artifact-dir", default=None, help="Directory for train rollout/eval/extraction artifacts; default: --run-dir")
     parser.add_argument("--scenario-output-dir", default=None, help="Directory for tree, nodebank, heldout, and final reports; default: --run-dir")
-    parser.add_argument("--reuse-tree-dir", default=None, help="Existing dynamix_tree directory with hierarchy_state.json; skip tree rebuild and re-export a filtered nodebank")
     parser.add_argument("--train-start", type=int, default=0)
     parser.add_argument("--train-end", type=int, default=200)
     parser.add_argument("--heldout-start", type=int, default=200)
@@ -1303,7 +807,7 @@ def main() -> None:
     parser.add_argument("--embedding-tokenizer", default=os.environ.get("EMBED_TOKENIZER", "/mnt/data/grouph_share/models/modelscope/models/Qwen/Qwen3-Embedding-0___6B"))
     parser.add_argument("--python-executable", default=os.environ.get("DYNAMIX_PYTHON", sys.executable), help="Python executable used for all experiment stages; its bin dir is prepended to PATH so agent bash actions can call bare python")
     parser.add_argument("--max-turns", type=int, default=100)
-    parser.add_argument("--thinking", choices=["true", "false", "null"], default="true", help="Qwen thinking setting for Trace2Skill rollout and DynaMix analyst calls")
+    parser.add_argument("--thinking", choices=["true", "false", "null"], default="true", help="Qwen thinking setting for Trace2Skill rollout and static DynaMix analyst; dynamic patch analyst forces enable_thinking=false")
     parser.add_argument("--skillbank-top-k", type=int, default=10, help="Select top-k DynaMix nodebank nodes by embedding before each heldout task")
     parser.add_argument("--tree-scenario", choices=["dynamic_update", "static_build"], default="dynamic_update", help="DynaMix build mode before heldout; default is the train200 60/40 dynamic protocol")
     parser.add_argument("--random-seed", type=int, default=42)
@@ -1320,9 +824,6 @@ def main() -> None:
     parser.add_argument("--dynamic-resume-from-snapshots", type=parse_bool, default=False, help="Dynamic mode: resume from latest dynamic_snapshots/batch_* snapshot when present; default false until fingerprint validation is enabled")
     parser.add_argument("--max-levels", type=int, default=8)
     parser.add_argument("--skill-output-dir-name", default="skills")
-    parser.add_argument("--skill-export-min-level", type=int, default=-1, help="-1 exports all lower levels; 1 exports only ExperienceCards at level >= 1")
-    parser.add_argument("--skill-export-max-level", type=int, default=-1, help="-1 exports all higher levels; set 1 for L1-only retrieval nodebank")
-    parser.add_argument("--skill-export-max-node-count", type=int, default=-1, help="-1 exports all matching nodes")
     parser.add_argument("--rollout-temperature", type=float, default=0.0)
     parser.add_argument("--rollout-client-timeout-seconds", type=float, default=600.0)
     parser.add_argument("--rollout-client-retry-wait-seconds", type=parse_float_csv, default=[5.0, 10.0, 30.0])
@@ -1408,29 +909,7 @@ def main() -> None:
     parser.add_argument("--analyst-higher-level-mode", default="single_abstraction")
     parser.add_argument("--analyst-truncate-higher-level-extra-cards", type=parse_bool, default=True)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
-    argv = sys.argv[1:]
-    args = parser.parse_args(argv)
-    if args.tree_scenario == "dynamic_update":
-        if args.tree_policy != "projected_gmm_bic":
-            parser.error("--tree-policy ablations are static_build-only; dynamic_update requires projected_gmm_bic")
-        if int(args.skill_export_min_level) >= 0 or int(args.skill_export_max_level) >= 0 or int(args.skill_export_max_node_count) >= 0:
-            parser.error("--skill-export-* level/count filters are static_build retrieval ablations only")
-
-    adapter = get_benchmark_adapter(args.benchmark)
-    try:
-        apply_officeqa_default_ranges(args, adapter, Path(args.data_path), argv)
-    except ValueError as exc:
-        parser.error(str(exc))
-    train_slice = BenchmarkSlice(
-        split=args.officeqa_train_split if args.benchmark == "officeqa" else "dataset",
-        start=int(args.train_start),
-        end=int(args.train_end),
-    )
-    heldout_slice = BenchmarkSlice(
-        split=args.officeqa_heldout_split if args.benchmark == "officeqa" else "dataset",
-        start=int(args.heldout_start),
-        end=int(args.heldout_end),
-    )
+    args = parser.parse_args()
 
     if args.dynamic_update_mode != "budget_constrained_online_gmm":
         parser.error("--dynamic-update-mode is currently fixed to budget_constrained_online_gmm; this is not a tunable protocol knob")
@@ -1461,7 +940,6 @@ def main() -> None:
     run_dir = Path(args.run_dir).resolve()
     records_path_arg = resolved_optional_path(args.records_path)
     reuse_train_run_dir = resolved_optional_path(args.reuse_train_run_dir)
-    reuse_tree_dir = resolved_optional_path(args.reuse_tree_dir)
     train_artifact_dir = resolved_optional_path(args.train_artifact_dir) or run_dir
     scenario_dir = resolved_optional_path(args.scenario_output_dir) or run_dir
     if records_path_arg is not None and reuse_train_run_dir is not None:
@@ -1486,68 +964,17 @@ def main() -> None:
     env["DYNAMIX_PYTHON"] = python_executable
     env["OPENAI_API_KEY"] = args.openai_api_key
     env["OPENAI_BASE_URL"] = args.openai_base_url
-    append_no_proxy_hosts(env, [args.openai_base_url, args.embedding_base_url])
-
-    officeqa_docs_dirs_resolved: list[Path] = []
-    officeqa_reward_path_resolved: Path | None = None
-    if args.benchmark == "officeqa":
-        if args.officeqa_evaluator == "fallback" and not args.officeqa_allow_fallback_evaluator:
-            parser.error("--officeqa-evaluator fallback requires --officeqa-allow-fallback-evaluator")
-        docs_values = list(args.officeqa_docs_dir)
-        if not docs_values:
-            docs_values = [part for part in env.get("OFFICEQA_DOCS_DIR", "").split(os.pathsep) if part]
-        if not docs_values:
-            parser.error("--officeqa-docs-dir or OFFICEQA_DOCS_DIR is required for --benchmark officeqa")
-        for value in docs_values:
-            docs_dir = Path(value).expanduser().resolve()
-            if not docs_dir.is_dir():
-                parser.error(f"OfficeQA docs directory does not exist: {docs_dir}")
-            officeqa_docs_dirs_resolved.append(docs_dir)
-        officeqa_reward_path_resolved = (
-            resolve_reward_path(args.data_path, args.officeqa_reward_path or None, required=args.officeqa_evaluator == "official_reward")
-            if args.officeqa_evaluator == "official_reward" or args.officeqa_reward_path
-            else None
-        )
-        args._officeqa_docs_dirs_resolved = [str(path) for path in officeqa_docs_dirs_resolved]
-        args._officeqa_reward_path_resolved = str(officeqa_reward_path_resolved) if officeqa_reward_path_resolved else ""
 
     train_gen_config_path = train_artifact_dir / "trace2skill_generation_config.json"
     write_generation_config(train_gen_config_path, thinking=thinking, temperature=args.rollout_temperature)
     scenario_gen_config_path = scenario_dir / "trace2skill_generation_config.json"
     write_generation_config(scenario_gen_config_path, thinking=thinking, temperature=args.rollout_temperature)
-    split_manifest = adapter.write_split_manifest(
-        data_path=Path(args.data_path),
-        run_dir=scenario_dir,
-        train_slice=train_slice,
-        heldout_slice=heldout_slice,
-    )
-    dataset_fp = path_fingerprint(dataset_json_path(args.data_path) if args.benchmark == "spreadsheetbench" else Path(args.data_path))
+    split_manifest = write_split_manifest(Path(args.data_path), scenario_dir, train_start=args.train_start, train_end=args.train_end, heldout_start=args.heldout_start, heldout_end=args.heldout_end)
+    dataset_fp = path_fingerprint(dataset_json_path(args.data_path))
     source_fp = stage_source_fingerprints(repo)
-    officeqa_inputs_fp = {
-        "docs_dirs": [
-            {"path": str(path), "fingerprint": path_fingerprint(path)}
-            for path in officeqa_docs_dirs_resolved
-        ],
-        "reward": (
-            {"path": str(officeqa_reward_path_resolved), "fingerprint": path_fingerprint(officeqa_reward_path_resolved)}
-            if officeqa_reward_path_resolved is not None
-            else {"exists": False, "allow_fallback_evaluator": bool(args.officeqa_allow_fallback_evaluator)}
-        ),
-    } if args.benchmark == "officeqa" else {}
 
     runtime = {
-        "benchmark": args.benchmark,
         "data_path": str(Path(args.data_path).resolve()),
-        "officeqa_docs_dir": [str(path) for path in officeqa_docs_dirs_resolved],
-        "officeqa_train_split": args.officeqa_train_split,
-        "officeqa_heldout_split": args.officeqa_heldout_split,
-        "officeqa_evaluator": args.officeqa_evaluator,
-        "officeqa_max_completion_tokens": int(args.officeqa_max_completion_tokens),
-        "officeqa_reward_path": str(officeqa_reward_path_resolved) if officeqa_reward_path_resolved else "",
-        "officeqa_reward_tolerance": float(args.officeqa_reward_tolerance),
-        "officeqa_allow_fallback_evaluator": bool(args.officeqa_allow_fallback_evaluator),
-        "officeqa_continue_on_infra_error": bool(args.officeqa_continue_on_infra_error),
-        "officeqa_use_oracle_context": bool(args.officeqa_use_oracle_context),
         "run_dir": str(run_dir),
         "train_artifact_dir": str(train_artifact_dir),
         "scenario_output_dir": str(scenario_dir),
@@ -1566,7 +993,6 @@ def main() -> None:
         "trace2skill_generation_config": str(scenario_gen_config_path),
         "skillbank_top_k": int(args.skillbank_top_k),
         "tree_scenario": args.tree_scenario,
-        "reuse_tree_dir": str(reuse_tree_dir) if reuse_tree_dir else "",
         "dynamic_initial_count": int(args.dynamic_initial_count),
         "dynamic_arrival_count": int(args.dynamic_arrival_count),
         "dynamic_update_batch_size": int(args.dynamic_update_batch_size),
@@ -1575,7 +1001,6 @@ def main() -> None:
         "dynamic_resume_from_snapshots": bool(args.dynamic_resume_from_snapshots),
         "max_levels": int(args.max_levels),
         "skill_output_dir_name": args.skill_output_dir_name,
-        "skill_export": skill_export_payload_from_args(args),
         "rollout_temperature": float(args.rollout_temperature),
         "rollout_client_timeout_seconds": float(args.rollout_client_timeout_seconds),
         "rollout_client_retry_wait_seconds": list(args.rollout_client_retry_wait_seconds),
@@ -1629,33 +1054,27 @@ def main() -> None:
     train_out = train_artifact_dir / "trace2skill_train_outputs"
     train_logs = train_artifact_dir / "trace2skill_train_logs"
     train_results = train_artifact_dir / "trace2skill_train_results.json"
-    train_collect_cmd = adapter.run_rollout(RolloutCommandSpec(
-        python_executable=python_executable,
-        data_path=Path(args.data_path),
-        data_slice=train_slice,
-        output_dir=train_out,
-        results_file=train_results,
-        log_dir=train_logs,
-        generation_config=train_gen_config_path,
-        model=args.model,
-        openai_base_url=args.openai_base_url,
-        rollout_llm_client=args.rollout_llm_client,
-        rollout_temperature=float(args.rollout_temperature),
-        llm_timeout_seconds=float(args.rollout_client_timeout_seconds),
-        llm_retry_wait_seconds=list(args.rollout_client_retry_wait_seconds),
-        rollout_num_random_seeds=int(args.rollout_num_random_seeds),
-        rollout_repeat=int(args.rollout_repeat),
-        max_turns=int(args.max_turns),
-        workers=int(args.workers),
-        officeqa_docs_dirs=officeqa_docs_dirs_resolved,
-        officeqa_evaluator=args.officeqa_evaluator,
-        officeqa_max_completion_tokens=int(args.officeqa_max_completion_tokens),
-        officeqa_reward_path=officeqa_reward_path_resolved,
-        officeqa_reward_tolerance=float(args.officeqa_reward_tolerance),
-        officeqa_allow_fallback_evaluator=bool(args.officeqa_allow_fallback_evaluator),
-        officeqa_use_oracle_context=bool(args.officeqa_use_oracle_context),
-        officeqa_continue_on_infra_error=bool(args.officeqa_continue_on_infra_error),
-    ))
+    train_collect_cmd = [
+        python_executable, "run_spreadsheetbench.py",
+        "--data_path", args.data_path,
+        "--output_dir", str(train_out),
+        "--agent", "cli_only",
+        "--model", args.model,
+        "--llm_client", args.rollout_llm_client,
+        "--temperature", str(args.rollout_temperature),
+        "--generation_config", str(train_gen_config_path),
+        "--llm_timeout_seconds", str(args.rollout_client_timeout_seconds),
+        "--llm_retry_wait_seconds", ",".join(str(value) for value in args.rollout_client_retry_wait_seconds),
+        "--num_random_seeds", str(args.rollout_num_random_seeds),
+        "--repeat", str(args.rollout_repeat),
+        "--max_turns", str(args.max_turns),
+        "--start_idx", str(args.train_start),
+        "--end_idx", str(args.train_end),
+        "--workers", str(args.workers),
+        "--results_file", str(train_results),
+        "--log_dir", str(train_logs),
+        "--log_format", "markdown",
+    ]
     if not skip_train_stages:
         run_stage(
             "01_train_collect",
@@ -1671,26 +1090,26 @@ def main() -> None:
                 "01_train_collect:v2",
                 train_collect_cmd,
                 dataset=dataset_fp,
-                officeqa_inputs=officeqa_inputs_fp,
                 rollout_protocol=rollout_protocol(args, generation_config=train_gen_config_path),
-                source=benchmark_source_fingerprints(source_fp, benchmark=args.benchmark, stage="rollout"),
-                split=[train_slice.split, args.train_start, args.train_end],
+                source={
+                    "runner": source_fp["runner"],
+                    "run_spreadsheetbench": source_fp["run_spreadsheetbench"],
+                    "spreadsheet_agent": source_fp["spreadsheet_agent"],
+                    "react_agent": source_fp["react_agent"],
+                },
+                split=[args.train_start, args.train_end],
             ),
         )
 
     train_eval = train_artifact_dir / "trace2skill_train_eval.json"
-    train_eval_cmd = adapter.evaluate_results(EvalCommandSpec(
-        python_executable=python_executable,
-        data_path=Path(args.data_path),
-        data_slice=train_slice,
-        output_dir=train_out,
-        results_file=train_results,
-        eval_file=train_eval,
-        officeqa_evaluator=args.officeqa_evaluator,
-        officeqa_reward_path=officeqa_reward_path_resolved,
-        officeqa_reward_tolerance=float(args.officeqa_reward_tolerance),
-        officeqa_allow_fallback_evaluator=bool(args.officeqa_allow_fallback_evaluator),
-    ))
+    train_eval_cmd = [
+        python_executable, "evaluate_with_official.py",
+        "--data_path", args.data_path,
+        "--output_dir", str(train_out),
+        "--start_idx", str(args.train_start),
+        "--end_idx", str(args.train_end),
+        "--results_file", str(train_eval),
+    ]
     if not skip_train_stages:
         run_stage(
             "02_train_eval",
@@ -1705,20 +1124,22 @@ def main() -> None:
                 "02_train_eval:v2",
                 train_eval_cmd,
                 dataset=dataset_fp,
-                officeqa_inputs=officeqa_inputs_fp,
                 train_outputs=path_fingerprint(train_out),
-                train_results=path_fingerprint(train_results),
-                source=benchmark_source_fingerprints(source_fp, benchmark=args.benchmark, stage="eval"),
-                split=[train_slice.split, args.train_start, args.train_end],
+                source={
+                    "runner": source_fp["runner"],
+                    "evaluate_with_official": source_fp["evaluate_with_official"],
+                    "spreadsheetbench_support": source_fp["spreadsheetbench_support"],
+                },
+                split=[args.train_start, args.train_end],
             ),
         )
 
-    extract_records_cmd = adapter.extract_records(ExtractCommandSpec(
-        python_executable=python_executable,
-        log_dir=train_logs,
-        eval_file=train_eval,
-        records_file=source_records,
-    ))
+    extract_records_cmd = [
+        python_executable, "scripts/extract_trace2skill_logs.py",
+        "--log-dir", str(train_logs),
+        "--results-file", str(train_eval),
+        "--output", str(source_records),
+    ]
     if not skip_train_stages:
         run_stage(
             "03_extract_records",
@@ -1734,25 +1155,28 @@ def main() -> None:
                 extract_records_cmd,
                 train_logs=path_fingerprint(train_logs),
                 train_eval=path_fingerprint(train_eval),
-                source=benchmark_source_fingerprints(source_fp, benchmark=args.benchmark, stage="extract"),
+                source={
+                    "runner": source_fp["runner"],
+                    "extract_trace2skill_logs": source_fp["extract_trace2skill_logs"],
+                },
             ),
         )
 
-    expected_train_records = len(adapter.load_rows(Path(args.data_path), train_slice))
+    expected_train_records = int(args.train_end) - int(args.train_start)
     observed_train_records = load_record_count(source_records)
     if observed_train_records != expected_train_records:
         raise RuntimeError(
             f"records.json count mismatch: expected {expected_train_records} "
             f"from train range [{args.train_start}, {args.train_end}), got {observed_train_records}"
         )
-    order_manifest = adapter.write_ordered_records(
+    order_manifest = write_dataset_ordered_records(
         source_records=source_records,
+        data_path=Path(args.data_path),
         output_path=ordered_records,
         manifest_path=records_order_manifest,
-        data_path=Path(args.data_path),
-        train_slice=train_slice,
+        train_start=int(args.train_start),
+        train_end=int(args.train_end),
     )
-    args._observed_train_records = observed_train_records
     if load_record_count(records) != expected_train_records:
         raise RuntimeError(f"ordered_records.json count mismatch after dataset-order rewrite: {records}")
     runtime["records_order_policy"] = order_manifest["policy"]
@@ -1762,10 +1186,12 @@ def main() -> None:
     tree_dir = scenario_dir / "dynamix_tree"
     config = {
         "scenario": args.tree_scenario,
-        "benchmark": args.benchmark,
         "output_dir": str(tree_dir),
         "records_path": str(records),
-        **tree_dataset_order_payload(args),
+        "dataset_path": str(Path(args.data_path).resolve()),
+        "train_start": int(args.train_start),
+        "train_end": int(args.train_end),
+        "enforce_dataset_order": True,
         "generation": {
             "base_url": args.openai_base_url,
             "model": args.model,
@@ -1890,7 +1316,6 @@ def main() -> None:
         },
         "max_levels": int(args.max_levels),
         "skill_output_dir_name": args.skill_output_dir_name,
-        "skill_export": skill_export_payload_from_args(args),
     }
     config_path = scenario_dir / "dynamix_config.json"
     config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1915,41 +1340,20 @@ def main() -> None:
         "DYNAMIX_EMBEDDING_USAGE_LOG": str(usage_logs_by_stage["04_build_tree"][1]),
         "DYNAMIX_SKILLBANK_USAGE_LOG": str(usage_logs_by_stage["04_build_tree"][2]),
     }
-    if reuse_tree_dir is not None:
-        reuse_fingerprint = {
-            **build_tree_fingerprint,
-            "stage_contract": "04_build_tree:reuse_tree_filtered_nodebank:v1",
-            "reuse_tree_dir": path_fingerprint(reuse_tree_dir),
-            "skill_export": skill_export_payload_from_args(args),
-        }
-        if args.resume and stage_done(markers / "04_build_tree.done", [tree_dir / "summary.json"], fingerprint=reuse_fingerprint):
-            print("[resume] skip stage 04_build_tree", flush=True)
-            summary = json.loads((tree_dir / "summary.json").read_text(encoding="utf-8"))
-        else:
-            summary = materialize_reused_tree_nodebank(
-                reuse_tree_dir=reuse_tree_dir,
-                tree_dir=tree_dir,
-                args=args,
-                current_config=config,
-                fingerprint=reuse_fingerprint,
-                marker_dir=markers,
-                log_path=logs / "04_build_tree.log",
-                usage_logs=usage_logs_by_stage["04_build_tree"],
-            )
-    else:
-        run_stage(
-            "04_build_tree",
-            build_tree_cmd,
-            cwd=repo,
-            env=build_tree_usage_env,
-            log_path=logs / "04_build_tree.log",
-            marker_dir=markers,
-            outputs=[tree_dir / "summary.json"],
-            resume=args.resume,
-            clear_outputs_before_run=list(usage_logs_by_stage["04_build_tree"]),
-            fingerprint=build_tree_fingerprint,
-        )
-        summary = json.loads((tree_dir / "summary.json").read_text(encoding="utf-8"))
+    run_stage(
+        "04_build_tree",
+        build_tree_cmd,
+        cwd=repo,
+        env=build_tree_usage_env,
+        log_path=logs / "04_build_tree.log",
+        marker_dir=markers,
+        outputs=[tree_dir / "summary.json"],
+        resume=args.resume,
+        clear_outputs_before_run=list(usage_logs_by_stage["04_build_tree"]),
+        fingerprint=build_tree_fingerprint,
+    )
+
+    summary = json.loads((tree_dir / "summary.json").read_text(encoding="utf-8"))
     validate_tree_summary_for_heldout(summary, args)
     manifest = json.loads(Path(summary["node_bank_manifest"]).read_text(encoding="utf-8"))
     if int(manifest.get("node_count", 0)) <= 0:
@@ -1974,36 +1378,28 @@ def main() -> None:
     heldout_out = scenario_dir / "trace2skill_heldout_outputs"
     heldout_logs = scenario_dir / "trace2skill_heldout_logs"
     heldout_results = scenario_dir / "trace2skill_heldout_results.json"
-    heldout_collect_cmd = adapter.run_rollout(RolloutCommandSpec(
-        python_executable=python_executable,
-        data_path=Path(args.data_path),
-        data_slice=heldout_slice,
-        output_dir=heldout_out,
-        results_file=heldout_results,
-        log_dir=heldout_logs,
-        generation_config=scenario_gen_config_path,
-        model=args.model,
-        openai_base_url=args.openai_base_url,
-        rollout_llm_client=args.rollout_llm_client,
-        rollout_temperature=float(args.rollout_temperature),
-        llm_timeout_seconds=float(args.rollout_client_timeout_seconds),
-        llm_retry_wait_seconds=list(args.rollout_client_retry_wait_seconds),
-        rollout_num_random_seeds=int(args.rollout_num_random_seeds),
-        rollout_repeat=int(args.rollout_repeat),
-        max_turns=int(args.max_turns),
-        workers=int(args.workers),
-        skillbank_root=skills_root,
-        skillbank_top_k=int(args.skillbank_top_k),
-        selection_log=selection_log,
-        officeqa_docs_dirs=officeqa_docs_dirs_resolved,
-        officeqa_evaluator=args.officeqa_evaluator,
-        officeqa_max_completion_tokens=int(args.officeqa_max_completion_tokens),
-        officeqa_reward_path=officeqa_reward_path_resolved,
-        officeqa_reward_tolerance=float(args.officeqa_reward_tolerance),
-        officeqa_allow_fallback_evaluator=bool(args.officeqa_allow_fallback_evaluator),
-        officeqa_use_oracle_context=bool(args.officeqa_use_oracle_context),
-        officeqa_continue_on_infra_error=bool(args.officeqa_continue_on_infra_error),
-    ))
+    heldout_collect_cmd = [
+        python_executable, "run_spreadsheetbench.py",
+        "--data_path", args.data_path,
+        "--output_dir", str(heldout_out),
+        "--agent", "cli_skill_preloaded",
+        "--skills_dir", str(skills_root),
+        "--model", args.model,
+        "--llm_client", args.rollout_llm_client,
+        "--temperature", str(args.rollout_temperature),
+        "--generation_config", str(scenario_gen_config_path),
+        "--llm_timeout_seconds", str(args.rollout_client_timeout_seconds),
+        "--llm_retry_wait_seconds", ",".join(str(value) for value in args.rollout_client_retry_wait_seconds),
+        "--num_random_seeds", str(args.rollout_num_random_seeds),
+        "--repeat", str(args.rollout_repeat),
+        "--max_turns", str(args.max_turns),
+        "--start_idx", str(args.heldout_start),
+        "--end_idx", str(args.heldout_end),
+        "--workers", str(args.workers),
+        "--results_file", str(heldout_results),
+        "--log_dir", str(heldout_logs),
+        "--log_format", "markdown",
+    ]
     run_stage(
         "06_heldout_collect",
         heldout_collect_cmd,
@@ -2022,31 +1418,32 @@ def main() -> None:
             "06_heldout_collect:v2",
             heldout_collect_cmd,
             dataset=dataset_fp,
-            officeqa_inputs=officeqa_inputs_fp,
             generation_config=path_fingerprint(scenario_gen_config_path),
             tree_summary=path_fingerprint(tree_dir / "summary.json"),
             node_bank_manifest=path_fingerprint(Path(summary["node_bank_manifest"])),
             skillbank_root=path_fingerprint(skillbank_root),
             rollout_protocol=rollout_protocol(args, generation_config=scenario_gen_config_path),
             skillbank_retrieval_protocol=skillbank_retrieval_protocol(args, cache_path=skillbank_cache_path, selection_log=selection_log),
-            source=benchmark_source_fingerprints(source_fp, benchmark=args.benchmark, stage="rollout"),
-            split=[heldout_slice.split, args.heldout_start, args.heldout_end],
+            source={
+                "runner": source_fp["runner"],
+                "run_spreadsheetbench": source_fp["run_spreadsheetbench"],
+                "spreadsheet_agent": source_fp["spreadsheet_agent"],
+                "react_agent": source_fp["react_agent"],
+                "dynamix_trace2skill": source_fp["dynamix_trace2skill"],
+            },
+            split=[args.heldout_start, args.heldout_end],
         ),
     )
 
     heldout_eval = scenario_dir / "trace2skill_heldout_eval.json"
-    heldout_eval_cmd = adapter.evaluate_results(EvalCommandSpec(
-        python_executable=python_executable,
-        data_path=Path(args.data_path),
-        data_slice=heldout_slice,
-        output_dir=heldout_out,
-        results_file=heldout_results,
-        eval_file=heldout_eval,
-        officeqa_evaluator=args.officeqa_evaluator,
-        officeqa_reward_path=officeqa_reward_path_resolved,
-        officeqa_reward_tolerance=float(args.officeqa_reward_tolerance),
-        officeqa_allow_fallback_evaluator=bool(args.officeqa_allow_fallback_evaluator),
-    ))
+    heldout_eval_cmd = [
+        python_executable, "evaluate_with_official.py",
+        "--data_path", args.data_path,
+        "--output_dir", str(heldout_out),
+        "--start_idx", str(args.heldout_start),
+        "--end_idx", str(args.heldout_end),
+        "--results_file", str(heldout_eval),
+    ]
     run_stage(
         "07_heldout_eval",
         heldout_eval_cmd,
@@ -2060,11 +1457,14 @@ def main() -> None:
             "07_heldout_eval:v2",
             heldout_eval_cmd,
             dataset=dataset_fp,
-            officeqa_inputs=officeqa_inputs_fp,
             heldout_outputs=path_fingerprint(heldout_out),
             heldout_results=path_fingerprint(heldout_results),
-            source=benchmark_source_fingerprints(source_fp, benchmark=args.benchmark, stage="eval"),
-            split=[heldout_slice.split, args.heldout_start, args.heldout_end],
+            source={
+                "runner": source_fp["runner"],
+                "evaluate_with_official": source_fp["evaluate_with_official"],
+                "spreadsheetbench_support": source_fp["spreadsheetbench_support"],
+            },
+            split=[args.heldout_start, args.heldout_end],
         ),
     )
 

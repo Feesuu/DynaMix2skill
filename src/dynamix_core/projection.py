@@ -73,7 +73,7 @@ def local_pca_project(embeddings: np.ndarray, config: ProjectionConfig) -> Proje
 
 
 async def local_pca_project_async(embeddings: np.ndarray, config: ProjectionConfig) -> ProjectionResult:
-    return local_pca_project(embeddings, config)
+    return await asyncio.to_thread(local_pca_project, embeddings, config)
 
 
 def project_with_basis(embeddings: np.ndarray, *, mean: np.ndarray, components: np.ndarray) -> np.ndarray:

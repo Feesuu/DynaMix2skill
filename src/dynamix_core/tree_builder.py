@@ -142,14 +142,8 @@ class ProjectedGmmTreeBuilder:
         if not generated:
             return LayerBuildResult(clustering=clustering, generated_item_ids=[], committed=False)
 
-        builder_name = (
-            "projected_weighted_gmm_bic"
-            if self.config.tree_policy == "projected_gmm_bic"
-            else self.config.tree_policy
-        )
         metadata = {
-            "builder": builder_name,
-            "tree_policy": self.config.tree_policy,
+            "builder": "projected_weighted_gmm_bic",
             "chosen_k": clustering.chosen_k,
             "bic_margin": clustering.bic_margin,
             "projection_dim": clustering.projection_dim,
@@ -199,16 +193,6 @@ class ProjectedGmmTreeBuilder:
             and total_prompt_tokens > token_budget
         )
 
-        if self.config.tree_policy == "identity_singleton":
-            return self._identity_singleton_layer(
-                ordered,
-                level=level,
-                input_ids=input_ids,
-                items_by_id=items_by_id,
-                token_counts=token_counts,
-                token_budget=token_budget,
-            )
-
         if n_items < self.config.gmm_bic.min_split_size and not budget_refinement_enabled:
             return _stopped(level, input_ids, "too_small")
 
@@ -256,17 +240,6 @@ class ProjectedGmmTreeBuilder:
                     "budget_enforced": bool(refined["summary_budget"].get("refinement_routing_tree") or refined["excluded_input_item_ids"]),
                     **refined["summary_budget"],
                 },
-            )
-
-        if self.config.tree_policy == "projected_kmeans_elbow":
-            return await self._cluster_layer_kmeans_elbow(
-                ordered,
-                level=level,
-                input_ids=input_ids,
-                items_by_id=items_by_id,
-                token_counts=token_counts,
-                token_budget=token_budget,
-                budget_refinement_enabled=budget_refinement_enabled,
             )
 
         embeddings = normalize_rows(np.asarray([item.embedding for item in ordered], dtype=float))
@@ -380,188 +353,6 @@ class ProjectedGmmTreeBuilder:
             summary_budget={
                 "effective_token_budget": int(token_budget),
                 "bic_selected_k": int(selection.chosen.k),
-                "coarse_selected_k": int(fit.k),
-                "budget_enforced": bool(refined["summary_budget"].get("refinement_routing_tree") or refined["excluded_input_item_ids"]),
-                **refined["summary_budget"],
-            },
-        )
-
-    def _identity_singleton_layer(
-        self,
-        ordered: Sequence[ExperienceItem],
-        *,
-        level: int,
-        input_ids: list[str],
-        items_by_id: dict[str, ExperienceItem],
-        token_counts: dict[str, int],
-        token_budget: int,
-    ) -> LayerClusteringResult:
-        communities: list[ExperienceCommunity] = []
-        member_ids_by_community: dict[str, list[str]] = {}
-        excluded: dict[str, dict[str, Any]] = {}
-        enforce_budget = (
-            self.config.budget_refinement.enabled
-            and level == self.config.budget_refinement.apply_to_level
-            and bool(self.config.budget_refinement.skip_oversize_singleton)
-        )
-        for index, item in enumerate(ordered):
-            token_cost = int(token_counts.get(item.item_id, 0))
-            if enforce_budget and token_cost > token_budget:
-                excluded[item.item_id] = {
-                    "item_id": item.item_id,
-                    "token_cost": token_cost,
-                    "budget": int(token_budget),
-                    "reason": "oversize_singleton",
-                    "tree_policy": "identity_singleton",
-                }
-                continue
-            community_id = f"L{level}_C{index}"
-            member_weights = {item.item_id: 1.0}
-            success_count, failure_count, outcome_mode = _outcome_counts([item])
-            communities.append(ExperienceCommunity(
-                community_id=community_id,
-                level=level,
-                member_weights=member_weights,
-                posterior_member_weights=dict(member_weights),
-                clustering_method="identity_singleton",
-                support_mass=_support_mass(items_by_id, member_weights),
-                outcome_mode=outcome_mode,
-                success_count=success_count,
-                failure_count=failure_count,
-                metadata={
-                    "component_index": index,
-                    "tree_policy": "identity_singleton",
-                    "prompt_token_cost": token_cost,
-                    "budget": int(token_budget),
-                },
-            ))
-            member_ids_by_community[community_id] = [item.item_id]
-
-        return LayerClusteringResult(
-            level=level,
-            input_item_ids=input_ids,
-            communities=communities,
-            member_item_ids_by_community=member_ids_by_community,
-            stop_reason="" if communities else "identity_singleton_no_active_communities",
-            excluded_input_item_ids=sorted(excluded),
-            chosen_k=len(communities),
-            tested_k=[len(communities)],
-            summary_budget={
-                "effective_token_budget": int(token_budget),
-                "tree_policy": "identity_singleton",
-                "budget_enforced": bool(excluded),
-                "excluded_oversize_singletons": [excluded[item_id] for item_id in sorted(excluded)],
-                "refinement_routing_tree": None,
-            },
-        )
-
-    async def _cluster_layer_kmeans_elbow(
-        self,
-        ordered: Sequence[ExperienceItem],
-        *,
-        level: int,
-        input_ids: list[str],
-        items_by_id: dict[str, ExperienceItem],
-        token_counts: dict[str, int],
-        token_budget: int,
-        budget_refinement_enabled: bool,
-    ) -> LayerClusteringResult:
-        embeddings = normalize_rows(np.asarray([item.embedding for item in ordered], dtype=float))
-        projection = await local_pca_project_async(embeddings, self.config.projection)
-        weights = _normalized_gmm_sample_weights(ordered)
-        selection = _select_kmeans_elbow(
-            projection.projected,
-            config=self.config.gmm_bic,
-            random_seed=int(self.config.random_seed) + level * 100003 + len(ordered),
-            sample_weights=weights,
-            kmax_effective_n=float(len(ordered)),
-        )
-        if selection.chosen.k <= 1:
-            if budget_refinement_enabled:
-                coarse = ExperienceCommunity(
-                    community_id=f"L{level}_C0",
-                    level=level,
-                    member_weights={item_id: 1.0 for item_id in input_ids},
-                    posterior_member_weights={item_id: 1.0 for item_id in input_ids},
-                    clustering_method="kmeans_elbow_single_refined",
-                    support_mass=_support_mass(items_by_id, {item_id: 1.0 for item_id in input_ids}),
-                    outcome_mode=_outcome_counts(ordered)[2],
-                    success_count=_outcome_counts(ordered)[0],
-                    failure_count=_outcome_counts(ordered)[1],
-                    metadata={
-                        "component_index": 0,
-                        "chosen_k": int(selection.chosen.k),
-                        "inertia": float(selection.chosen.bic),
-                        "budget_refinement_coarse_root": True,
-                        "tree_policy": "projected_kmeans_elbow",
-                    },
-                )
-                refined = await self._refine_overbudget_coarse_communities(
-                    [coarse],
-                    {coarse.community_id: input_ids},
-                    level=level,
-                    input_ids=input_ids,
-                    items_by_id=items_by_id,
-                    token_counts=token_counts,
-                    token_budget=token_budget,
-                )
-                return _clustering_from_refinement(
-                    level=level,
-                    input_ids=input_ids,
-                    projection=projection,
-                    selection=selection,
-                    fit=selection.chosen,
-                    routing_model=None,
-                    refined=refined,
-                    selection_metric="kmeans_inertia_elbow",
-                )
-            return _stopped_from_selection(level, input_ids, "kmeans_elbow_selected_one", projection, selection, selection_metric="kmeans_inertia_elbow")
-
-        fit = selection.chosen
-        parts = _candidate_layer_parts(
-            fit,
-            level=level,
-            input_ids=input_ids,
-            items_by_id=items_by_id,
-            token_counts=token_counts,
-            soft_config=self.config.soft_membership,
-            clustering_method="kmeans_elbow",
-        )
-        if parts is None:
-            return _stopped_from_selection(level, input_ids, "kmeans_membership_collapsed", projection, selection, selection_metric="kmeans_inertia_elbow")
-
-        refined = await self._refine_overbudget_coarse_communities(
-            parts["communities"],
-            parts["member_ids_by_community"],
-            level=level,
-            input_ids=input_ids,
-            items_by_id=items_by_id,
-            token_counts=token_counts,
-            token_budget=token_budget,
-        )
-        return LayerClusteringResult(
-            level=level,
-            input_item_ids=input_ids,
-            communities=refined["communities"],
-            member_item_ids_by_community=refined["member_item_ids_by_community"],
-            stop_reason="" if refined["communities"] else "budget_refinement_no_active_communities",
-            excluded_input_item_ids=refined["excluded_input_item_ids"],
-            projection_dim=int(projection.dim),
-            explained_variance_ratio=float(projection.explained_variance_ratio),
-            pca_spectrum=list(projection.spectrum),
-            chosen_k=int(fit.k),
-            tested_k=[candidate.k for candidate in selection.candidates],
-            bic_by_k={},
-            log_likelihood_by_k={},
-            bic_margin=float(selection.bic_margin),
-            routing_model=None,
-            summary_budget={
-                "effective_token_budget": int(token_budget),
-                "tree_policy": "projected_kmeans_elbow",
-                "selection_metric": "kmeans_inertia_elbow",
-                "elbow_selected_k": int(fit.k),
-                "selected_inertia": float(fit.bic),
-                "inertia_by_k": {str(candidate.k): float(candidate.bic) for candidate in selection.candidates},
                 "coarse_selected_k": int(fit.k),
                 "budget_enforced": bool(refined["summary_budget"].get("refinement_routing_tree") or refined["excluded_input_item_ids"]),
                 **refined["summary_budget"],
@@ -746,7 +537,7 @@ class ProjectedGmmTreeBuilder:
                 }
             else:
                 local_items = [items_by_id[item_id] for item_id in node_item_ids]
-                split = await self._budget_refinement_statistical_split(
+                split = await self._budget_refinement_gmm_split(
                     local_items,
                     node=node,
                     level=level,
@@ -960,37 +751,6 @@ class ProjectedGmmTreeBuilder:
             },
         }
 
-    async def _budget_refinement_statistical_split(
-        self,
-        local_items: list[ExperienceItem],
-        *,
-        node: dict[str, Any],
-        level: int,
-        token_counts: dict[str, int],
-        parent_token_cost: int,
-        token_budget: int,
-        serial_start: int,
-    ) -> dict[str, Any]:
-        if self.config.tree_policy == "projected_kmeans_elbow":
-            return await self._budget_refinement_kmeans_split(
-                local_items,
-                node=node,
-                level=level,
-                token_counts=token_counts,
-                parent_token_cost=parent_token_cost,
-                token_budget=token_budget,
-                serial_start=serial_start,
-            )
-        return await self._budget_refinement_gmm_split(
-            local_items,
-            node=node,
-            level=level,
-            token_counts=token_counts,
-            parent_token_cost=parent_token_cost,
-            token_budget=token_budget,
-            serial_start=serial_start,
-        )
-
     async def _budget_refinement_gmm_split(
         self,
         local_items: list[ExperienceItem],
@@ -1030,8 +790,7 @@ class ProjectedGmmTreeBuilder:
             for item_id, local_memberships in child_weights.items():
                 for child_id, local_weight in local_memberships.items():
                     if local_weight > 0.0:
-                        effective_weight = 1.0 if self.config.soft_membership.recursive_assignment == "primary_argmax" else float(local_weight)
-                        selected_by_child[child_id][item_id] = float(path_weights.get(item_id, 1.0)) * effective_weight
+                        selected_by_child[child_id][item_id] = float(path_weights.get(item_id, 1.0)) * float(local_weight)
             selected_by_child = {cid: weights for cid, weights in selected_by_child.items() if weights}
             if len(selected_by_child) <= 1:
                 continue
@@ -1134,132 +893,6 @@ class ProjectedGmmTreeBuilder:
             "children": children,
         }
 
-    async def _budget_refinement_kmeans_split(
-        self,
-        local_items: list[ExperienceItem],
-        *,
-        node: dict[str, Any],
-        level: int,
-        token_counts: dict[str, int],
-        parent_token_cost: int,
-        token_budget: int,
-        serial_start: int,
-    ) -> dict[str, Any]:
-        if len(local_items) < 2:
-            return {"accepted": False, "reason": "too_few_items_for_kmeans_refinement"}
-        local_ids = [item.item_id for item in local_items]
-        embeddings = normalize_rows(np.asarray([item.embedding for item in local_items], dtype=float))
-        projection = await local_pca_project_async(embeddings, self.config.projection)
-        path_weights = dict(node["path_weights"])
-        weights = _normalized_gmm_sample_weights(local_items, path_weights=path_weights)
-        selection = _select_kmeans_elbow(
-            projection.projected,
-            config=self.config.gmm_bic,
-            random_seed=int(self.config.random_seed) + level * 100003 + len(local_items) + int(node["depth"]) * 7919,
-            sample_weights=weights,
-            kmax_effective_n=float(len(local_items)),
-        )
-
-        tested = [int(candidate.k) for candidate in selection.candidates]
-        inertia_by_k = {f"{node['node_id']}:k={candidate.k}": float(candidate.bic) for candidate in selection.candidates}
-        fit = selection.chosen
-        if not fit.valid or fit.k <= 1:
-            return {
-                "accepted": False,
-                "reason": "kmeans_elbow_selected_one_for_refinement",
-                "node_id": node["node_id"],
-                "tested_k": tested,
-                "inertia_by_k": inertia_by_k,
-            }
-        child_ids = [f"{node['node_id']}_K{fit.k}_C{component}" for component in range(fit.k)]
-        child_weights = membership_weight_dicts(local_ids, child_ids, fit.responsibilities, self.config.soft_membership)
-        selected_by_child: dict[str, dict[str, float]] = {child_id: {} for child_id in child_ids}
-        for item_id, local_memberships in child_weights.items():
-            for child_id, local_weight in local_memberships.items():
-                if local_weight > 0.0:
-                    selected_by_child[child_id][item_id] = float(path_weights.get(item_id, 1.0))
-        selected_by_child = {cid: member_weights for cid, member_weights in selected_by_child.items() if member_weights}
-        if len(selected_by_child) <= 1:
-            return {
-                "accepted": False,
-                "reason": "kmeans_elbow_membership_collapsed_for_refinement",
-                "node_id": node["node_id"],
-                "tested_k": tested,
-                "inertia_by_k": inertia_by_k,
-            }
-        child_token_costs = {cid: _selected_prompt_token_cost(token_counts, list(member_weights)) for cid, member_weights in selected_by_child.items()}
-        max_child_token = max(child_token_costs.values())
-        selected = {
-            "fit": fit,
-            "child_member_weights": selected_by_child,
-            "child_token_costs": child_token_costs,
-            "max_child_token_cost": int(max_child_token),
-            "progress_fraction": 1.0 - float(max_child_token) / max(float(parent_token_cost), 1.0),
-        }
-        min_reduction = float(self.config.budget_refinement.min_token_reduction_fraction)
-        threshold = float(parent_token_cost) * (1.0 - min_reduction)
-        if selected["max_child_token_cost"] > threshold and selected["max_child_token_cost"] >= parent_token_cost:
-            return {
-                "accepted": False,
-                "reason": "kmeans_elbow_candidate_does_not_reduce_prompt_tokens",
-                "node_id": node["node_id"],
-                "parent_prompt_tokens": int(parent_token_cost),
-                "selected_max_child_prompt_tokens": int(selected["max_child_token_cost"]),
-                "tested_k": tested,
-                "inertia_by_k": inertia_by_k,
-            }
-
-        children: list[dict[str, Any]] = []
-        child_node_ids: list[str] = []
-        active_components: list[int] = []
-        for child_index, (child_id, member_weights) in enumerate(selected["child_member_weights"].items()):
-            member_ids = [item_id for item_id in local_ids if item_id in member_weights]
-            child_node_id = f"{node['node_id']}_R{serial_start + child_index}"
-            component = int(child_id.rsplit("C", 1)[1])
-            child_node_ids.append(child_node_id)
-            active_components.append(component)
-            children.append(
-                {
-                    "node_id": child_node_id,
-                    "source_kmeans_child_id": child_id,
-                    "item_ids": member_ids,
-                    "path_weights": dict(member_weights),
-                    "depth": int(node["depth"]) + 1,
-                }
-            )
-        safe_active = active_components or list(range(int(fit.k)))
-        return {
-            "accepted": True,
-            "split_reason": "budget_forced_kmeans_elbow_progress",
-            "statistical_split": True,
-            "node_id": node["node_id"],
-            "parent_prompt_tokens": int(parent_token_cost),
-            "budget": int(token_budget),
-            "elbow_selected_k": int(selection.chosen.k),
-            "selected_k": int(fit.k),
-            "selected_inertia": float(fit.bic),
-            "selected_max_child_prompt_tokens": int(selected["max_child_token_cost"]),
-            "selected_progress_fraction": float(selected["progress_fraction"]),
-            "child_prompt_tokens": {cid: int(value) for cid, value in selected["child_token_costs"].items()},
-            "tested_k": tested,
-            "inertia_by_k": inertia_by_k,
-            "routing_node": {
-                "node_id": node["node_id"],
-                "kind": "kmeans_elbow_split",
-                "level": int(level),
-                "pca_mean": projection.mean.astype(float).tolist(),
-                "pca_components": projection.components.astype(float).tolist(),
-                "means": fit.means[safe_active].astype(float).tolist(),
-                "variances": fit.variances[safe_active].astype(float).tolist(),
-                "child_node_ids": child_node_ids,
-                "component_indices": [int(index) for index in safe_active],
-                "soft_assignment": self.config.soft_membership.__dict__,
-                "selected_k": int(fit.k),
-                "selected_inertia": float(fit.bic),
-            },
-            "children": children,
-        }
-
     async def _summarize_communities(self, clustering: LayerClusteringResult, *, items_by_id: dict[str, ExperienceItem], summary_fn: SummaryFn) -> list[ExperienceItem]:
         async def run_one(index: int, community: ExperienceCommunity) -> tuple[int, list[ExperienceItem]]:
             member_ids = clustering.member_item_ids_by_community[community.community_id]
@@ -1283,194 +916,6 @@ class ProjectedGmmTreeBuilder:
 ExperienceHierarchyTreeBuilder = ProjectedGmmTreeBuilder
 
 
-def _select_kmeans_elbow(
-    projected: np.ndarray,
-    *,
-    config: GmmBicConfig,
-    random_seed: int,
-    sample_weights: np.ndarray,
-    kmax_effective_n: float | None,
-) -> GmmBicSelection:
-    kmax = compute_kmax(
-        int(projected.shape[0]),
-        config,
-        total_weight=float(sample_weights.sum()),
-        kmax_effective_n=kmax_effective_n,
-    )
-    candidates = [
-        _fit_weighted_kmeans(
-            projected,
-            k=k,
-            config=config,
-            random_seed=int(random_seed) + k * 9973,
-            sample_weights=sample_weights,
-        )
-        for k in range(1, kmax + 1)
-    ]
-    chosen_index = _kmeans_elbow_index(candidates)
-    chosen = candidates[chosen_index]
-    sorted_by_inertia = sorted(candidates, key=lambda item: (item.bic, item.k))
-    margin = float(sorted_by_inertia[1].bic - sorted_by_inertia[0].bic) if len(sorted_by_inertia) >= 2 else 0.0
-    return GmmBicSelection(chosen=chosen, candidates=candidates, bic_margin=margin)
-
-
-def _fit_weighted_kmeans(
-    x: np.ndarray,
-    *,
-    k: int,
-    config: GmmBicConfig,
-    random_seed: int,
-    sample_weights: np.ndarray,
-) -> GmmCandidateFit:
-    best: GmmCandidateFit | None = None
-    for restart in range(config.num_restarts):
-        candidate = _fit_weighted_kmeans_restart(
-            x,
-            k=k,
-            config=config,
-            random_seed=int(random_seed) + restart * 104729,
-            sample_weights=sample_weights,
-        )
-        if best is None or candidate.bic < best.bic:
-            best = candidate
-    if best is None:
-        raise RuntimeError("no KMeans restart ran")
-    return best
-
-
-def _fit_weighted_kmeans_restart(
-    x: np.ndarray,
-    *,
-    k: int,
-    config: GmmBicConfig,
-    random_seed: int,
-    sample_weights: np.ndarray,
-) -> GmmCandidateFit:
-    rng = np.random.default_rng(random_seed)
-    centers = _init_weighted_kmeans_centers(x, k=k, rng=rng, sample_weights=sample_weights)
-    labels = np.zeros(int(x.shape[0]), dtype=int)
-    previous_inertia: float | None = None
-    converged = False
-    n_iter = 0
-    for iteration in range(1, int(config.max_iter) + 1):
-        distances = np.sum((x[:, None, :] - centers[None, :, :]) ** 2, axis=2)
-        labels = np.argmin(distances, axis=1)
-        min_distances = distances[np.arange(int(x.shape[0])), labels]
-        for component in range(k):
-            if not np.any(labels == component):
-                farthest = int(np.argmax(sample_weights * min_distances))
-                labels[farthest] = component
-                min_distances[farthest] = 0.0
-        new_centers = centers.copy()
-        for component in range(k):
-            mask = labels == component
-            local_weights = sample_weights[mask]
-            denom = max(float(local_weights.sum()), np.finfo(float).eps)
-            new_centers[component] = (x[mask] * local_weights[:, None]).sum(axis=0) / denom
-        inertia = float(np.dot(sample_weights, np.sum((x - new_centers[labels]) ** 2, axis=1)))
-        n_iter = iteration
-        if previous_inertia is not None and abs(previous_inertia - inertia) <= float(config.tol) * max(1.0, abs(previous_inertia)):
-            centers = new_centers
-            converged = True
-            break
-        centers = new_centers
-        previous_inertia = inertia
-
-    distances = np.sum((x[:, None, :] - centers[None, :, :]) ** 2, axis=2)
-    labels = np.argmin(distances, axis=1)
-    responsibilities = np.zeros((int(x.shape[0]), k), dtype=float)
-    responsibilities[np.arange(int(x.shape[0])), labels] = 1.0
-    masses = (responsibilities * sample_weights[:, None]).sum(axis=0)
-    total_weight = max(float(sample_weights.sum()), np.finfo(float).eps)
-    pi = np.maximum(masses / total_weight, np.finfo(float).eps)
-    pi = pi / pi.sum()
-    variances = _kmeans_component_variances(x, labels, centers, sample_weights, min_covar=float(config.min_covar))
-    inertia = float(np.dot(sample_weights, distances[np.arange(int(x.shape[0])), labels]))
-    return GmmCandidateFit(
-        k=int(k),
-        valid=True,
-        bic=inertia,
-        log_likelihood=-inertia,
-        pi=pi,
-        means=centers,
-        variances=variances,
-        responsibilities=responsibilities,
-        primary_labels=labels,
-        component_masses=[float(value) for value in masses],
-        child_sizes=[int(np.sum(labels == component)) for component in range(k)],
-        reason="kmeans_elbow",
-        converged=converged,
-        n_iter=int(n_iter),
-    )
-
-
-def _init_weighted_kmeans_centers(
-    x: np.ndarray,
-    *,
-    k: int,
-    rng: np.random.Generator,
-    sample_weights: np.ndarray,
-) -> np.ndarray:
-    n_items = int(x.shape[0])
-    probabilities = sample_weights / max(float(sample_weights.sum()), np.finfo(float).eps)
-    first = int(rng.choice(n_items, p=probabilities))
-    chosen = [first]
-    distances = np.sum((x - x[first]) ** 2, axis=1)
-    for _ in range(1, int(k)):
-        weighted = np.maximum(distances, 0.0) * sample_weights
-        total = float(weighted.sum())
-        if total <= 1.0e-12:
-            candidate = int(rng.choice(n_items, p=probabilities))
-        else:
-            candidate = int(rng.choice(n_items, p=weighted / total))
-        if candidate in chosen:
-            candidate = int(np.argmax(weighted))
-        chosen.append(candidate)
-        distances = np.minimum(distances, np.sum((x - x[candidate]) ** 2, axis=1))
-    return x[chosen].copy()
-
-
-def _kmeans_component_variances(
-    x: np.ndarray,
-    labels: np.ndarray,
-    centers: np.ndarray,
-    sample_weights: np.ndarray,
-    *,
-    min_covar: float,
-) -> np.ndarray:
-    variances = np.empty_like(centers, dtype=float)
-    global_mean = (x * sample_weights[:, None]).sum(axis=0) / max(float(sample_weights.sum()), np.finfo(float).eps)
-    global_var = np.maximum((sample_weights[:, None] * (x - global_mean) ** 2).sum(axis=0) / max(float(sample_weights.sum()), np.finfo(float).eps), min_covar)
-    for component in range(int(centers.shape[0])):
-        mask = labels == component
-        if not np.any(mask):
-            variances[component] = global_var
-            continue
-        local_weights = sample_weights[mask]
-        denom = max(float(local_weights.sum()), np.finfo(float).eps)
-        variances[component] = np.maximum((local_weights[:, None] * (x[mask] - centers[component]) ** 2).sum(axis=0) / denom, min_covar)
-    return variances
-
-
-def _kmeans_elbow_index(candidates: list[GmmCandidateFit]) -> int:
-    if len(candidates) <= 1:
-        return 0
-    ks = np.asarray([candidate.k for candidate in candidates], dtype=float)
-    inertias = np.asarray([candidate.bic for candidate in candidates], dtype=float)
-    if float(np.max(inertias) - np.min(inertias)) <= 1.0e-12:
-        return 0
-    x = (ks - ks[0]) / max(float(ks[-1] - ks[0]), np.finfo(float).eps)
-    y = (inertias - float(np.min(inertias))) / max(float(np.max(inertias) - np.min(inertias)), np.finfo(float).eps)
-    x1, y1 = float(x[0]), float(y[0])
-    x2, y2 = float(x[-1]), float(y[-1])
-    denom = max(float(np.hypot(y2 - y1, x2 - x1)), np.finfo(float).eps)
-    distances = np.abs((y2 - y1) * x - (x2 - x1) * y + x2 * y1 - y2 * x1) / denom
-    index = int(np.argmax(distances))
-    if float(distances[index]) <= 1.0e-12:
-        return 0
-    return index
-
-
 def _candidate_layer_parts(
     fit: GmmCandidateFit,
     *,
@@ -1479,31 +924,25 @@ def _candidate_layer_parts(
     items_by_id: dict[str, ExperienceItem],
     token_counts: dict[str, int],
     soft_config: SoftMembershipConfig,
-    clustering_method: str = "weighted_gmm_bic",
 ) -> dict[str, Any] | None:
     child_ids = [f"L{level}_C{component}" for component in range(fit.k)]
     selected_memberships = membership_weight_dicts(input_ids, child_ids, fit.responsibilities, soft_config)
     selected_memberships = {iid: {cid: w for cid, w in weights.items() if float(w) > 1.0e-12} for iid, weights in selected_memberships.items()}
-    raw_posterior_memberships = {
+    full_memberships = {
         item_id: {child_ids[col]: float(fit.responsibilities[row, col]) for col in range(len(child_ids))}
         for row, item_id in enumerate(input_ids)
     }
-    structural_posterior_memberships = selected_memberships if soft_config.recursive_assignment == "primary_argmax" else raw_posterior_memberships
 
     selected_by_child: dict[str, dict[str, float]] = {cid: {} for cid in child_ids}
     posterior_by_child: dict[str, dict[str, float]] = {cid: {} for cid in child_ids}
     for item_id, memberships in selected_memberships.items():
         for child_id, weight in memberships.items():
             if weight > 0.0:
-                selected_by_child[child_id][item_id] = (
-                    1.0 if soft_config.recursive_assignment == "primary_argmax" else float(weight)
-                )
-    for item_id, memberships in structural_posterior_memberships.items():
+                selected_by_child[child_id][item_id] = float(weight)
+    for item_id, memberships in full_memberships.items():
         for child_id, weight in memberships.items():
             if weight > 0.0:
-                posterior_by_child[child_id][item_id] = (
-                    1.0 if soft_config.recursive_assignment == "primary_argmax" else float(weight)
-                )
+                posterior_by_child[child_id][item_id] = float(weight)
     selected_by_child = {cid: weights for cid, weights in selected_by_child.items() if weights}
     if len(selected_by_child) <= 1:
         return None
@@ -1518,34 +957,26 @@ def _candidate_layer_parts(
         component = int(child_id.rsplit("C", 1)[1])
         member_ids = [item_id for item_id in input_ids if item_id in member_weights]
         success_count, failure_count, outcome_mode = _outcome_counts([items_by_id[item_id] for item_id in member_ids])
-        metadata = {
-            "component_index": component,
-            "component_effective_count": float(fit.component_masses[component]),
-            "primary_size": int(fit.child_sizes[component]),
-            "mixture_weight": float(fit.pi[component]),
-            "chosen_k": int(fit.k),
-            "log_likelihood": float(fit.log_likelihood),
-        }
-        if clustering_method == "kmeans_elbow":
-            metadata.update({
-                "tree_policy": "projected_kmeans_elbow",
-                "selection_metric": "kmeans_inertia_elbow",
-                "inertia": float(fit.bic),
-            })
-        else:
-            metadata["bic"] = float(fit.bic)
         communities.append(
             ExperienceCommunity(
                 community_id=child_id,
                 level=level,
                 member_weights=member_weights,
                 posterior_member_weights=posterior_by_child.get(child_id, {}),
-                clustering_method=clustering_method,
+                clustering_method="weighted_gmm_bic",
                 support_mass=_support_mass(items_by_id, member_weights),
                 outcome_mode=outcome_mode,
                 success_count=success_count,
                 failure_count=failure_count,
-                metadata=metadata,
+                metadata={
+                    "component_index": component,
+                    "component_effective_count": float(fit.component_masses[component]),
+                    "primary_size": int(fit.child_sizes[component]),
+                    "mixture_weight": float(fit.pi[component]),
+                    "chosen_k": int(fit.k),
+                    "bic": float(fit.bic),
+                    "log_likelihood": float(fit.log_likelihood),
+                },
             )
         )
         member_ids_by_community[child_id] = member_ids
@@ -1568,19 +999,7 @@ def _clustering_from_refinement(
     fit: GmmCandidateFit,
     routing_model: LayerRoutingModel | None,
     refined: dict[str, Any],
-    selection_metric: str = "gmm_bic",
 ) -> LayerClusteringResult:
-    summary_budget = dict(refined["summary_budget"])
-    if selection_metric == "kmeans_inertia_elbow":
-        bic_by_k: dict[str, float] = {}
-        log_likelihood_by_k: dict[str, float] = {}
-        summary_budget.setdefault("tree_policy", "projected_kmeans_elbow")
-        summary_budget.setdefault("selection_metric", "kmeans_inertia_elbow")
-        summary_budget.setdefault("selected_inertia", float(fit.bic))
-        summary_budget.setdefault("inertia_by_k", {str(candidate.k): float(candidate.bic) for candidate in selection.candidates})
-    else:
-        bic_by_k = {str(candidate.k): float(candidate.bic) for candidate in selection.candidates}
-        log_likelihood_by_k = {str(candidate.k): float(candidate.log_likelihood) for candidate in selection.candidates}
     return LayerClusteringResult(
         level=level,
         input_item_ids=input_ids,
@@ -1593,11 +1012,11 @@ def _clustering_from_refinement(
         pca_spectrum=list(projection.spectrum),
         chosen_k=int(fit.k),
         tested_k=[candidate.k for candidate in selection.candidates],
-        bic_by_k=bic_by_k,
-        log_likelihood_by_k=log_likelihood_by_k,
+        bic_by_k={str(candidate.k): float(candidate.bic) for candidate in selection.candidates},
+        log_likelihood_by_k={str(candidate.k): float(candidate.log_likelihood) for candidate in selection.candidates},
         bic_margin=float(selection.bic_margin),
         routing_model=routing_model,
-        summary_budget=summary_budget,
+        summary_budget=dict(refined["summary_budget"]),
     )
 
 
@@ -1742,28 +1161,7 @@ def _stopped(level: int, input_ids: list[str], reason: str) -> LayerClusteringRe
     return LayerClusteringResult(level=level, input_item_ids=list(input_ids), communities=[], member_item_ids_by_community={}, stop_reason=reason)
 
 
-def _stopped_from_selection(
-    level: int,
-    input_ids: list[str],
-    reason: str,
-    projection: ProjectionResult,
-    selection: GmmBicSelection,
-    *,
-    selection_metric: str = "gmm_bic",
-) -> LayerClusteringResult:
-    summary_budget: dict[str, Any] = {}
-    if selection_metric == "kmeans_inertia_elbow":
-        bic_by_k: dict[str, float] = {}
-        log_likelihood_by_k: dict[str, float] = {}
-        summary_budget = {
-            "tree_policy": "projected_kmeans_elbow",
-            "selection_metric": "kmeans_inertia_elbow",
-            "selected_inertia": float(selection.chosen.bic),
-            "inertia_by_k": {str(candidate.k): float(candidate.bic) for candidate in selection.candidates},
-        }
-    else:
-        bic_by_k = {str(candidate.k): float(candidate.bic) for candidate in selection.candidates}
-        log_likelihood_by_k = {str(candidate.k): float(candidate.log_likelihood) for candidate in selection.candidates}
+def _stopped_from_selection(level: int, input_ids: list[str], reason: str, projection: ProjectionResult, selection: GmmBicSelection) -> LayerClusteringResult:
     return LayerClusteringResult(
         level=level,
         input_item_ids=list(input_ids),
@@ -1775,10 +1173,9 @@ def _stopped_from_selection(
         pca_spectrum=list(projection.spectrum),
         chosen_k=int(selection.chosen.k),
         tested_k=[candidate.k for candidate in selection.candidates],
-        bic_by_k=bic_by_k,
-        log_likelihood_by_k=log_likelihood_by_k,
+        bic_by_k={str(candidate.k): float(candidate.bic) for candidate in selection.candidates},
+        log_likelihood_by_k={str(candidate.k): float(candidate.log_likelihood) for candidate in selection.candidates},
         bic_margin=float(selection.bic_margin),
-        summary_budget=summary_budget,
     )
 
 
