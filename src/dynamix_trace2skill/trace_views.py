@@ -14,7 +14,6 @@ def render_embedding_trace(record: RawTrajectoryRecord) -> str:
     lines = [
         f"instruction: {record.instruction}",
         f"instruction_type: {record.instruction_type}",
-        f"answer_position: {record.answer_position}",
         "trajectory_steps:",
     ]
     for step in record.steps:

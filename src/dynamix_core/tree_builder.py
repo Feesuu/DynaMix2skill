@@ -21,6 +21,10 @@ SummaryFn = Callable[
     [ExperienceCommunity, list[ExperienceItem], "LayerClusteringResult"],
     list[ExperienceItem] | Awaitable[list[ExperienceItem]],
 ]
+PromptTokenEstimator = Callable[
+    [ExperienceCommunity, list[ExperienceItem]],
+    int | Awaitable[int],
+]
 
 
 @dataclass(frozen=True)
@@ -107,6 +111,8 @@ class ProjectedGmmTreeBuilder:
         items: Iterable[ExperienceItem],
         *,
         summary_fn: SummaryFn,
+        prompt_token_estimator: PromptTokenEstimator | None = None,
+        prompt_token_budget: int | None = None,
         max_levels: int = 8,
     ) -> HierarchyBuildResult:
         if max_levels < 1:
@@ -118,7 +124,14 @@ class ProjectedGmmTreeBuilder:
             layer_items = await state.item_objects_at_level(level)
             if not layer_items:
                 break
-            result = await self.build_layer(state, level=level, items=layer_items, summary_fn=summary_fn)
+            result = await self.build_layer(
+                state,
+                level=level,
+                items=layer_items,
+                summary_fn=summary_fn,
+                prompt_token_estimator=prompt_token_estimator,
+                prompt_token_budget=prompt_token_budget,
+            )
             layer_results.append(result)
             if not result.committed:
                 break
@@ -131,9 +144,16 @@ class ProjectedGmmTreeBuilder:
         level: int,
         summary_fn: SummaryFn,
         items: Sequence[ExperienceItem] | None = None,
+        prompt_token_estimator: PromptTokenEstimator | None = None,
+        prompt_token_budget: int | None = None,
     ) -> LayerBuildResult:
         layer_items = list(items) if items is not None else await state.item_objects_at_level(level)
-        clustering = await self.cluster_layer(layer_items, level=level)
+        clustering = await self.cluster_layer(
+            layer_items,
+            level=level,
+            prompt_token_estimator=prompt_token_estimator,
+            prompt_token_budget=prompt_token_budget,
+        )
         if clustering.should_stop:
             return LayerBuildResult(clustering=clustering, generated_item_ids=[], committed=False)
 
@@ -169,7 +189,14 @@ class ProjectedGmmTreeBuilder:
             committed=True,
         )
 
-    async def cluster_layer(self, items: Sequence[ExperienceItem], *, level: int) -> LayerClusteringResult:
+    async def cluster_layer(
+        self,
+        items: Sequence[ExperienceItem],
+        *,
+        level: int,
+        prompt_token_estimator: PromptTokenEstimator | None = None,
+        prompt_token_budget: int | None = None,
+    ) -> LayerClusteringResult:
         self.config.validate()
         ordered = sorted(list(items), key=lambda item: item.item_id)
         input_ids = [item.item_id for item in ordered]
@@ -184,8 +211,35 @@ class ProjectedGmmTreeBuilder:
         n_items = len(ordered)
         items_by_id = {item.item_id: item for item in ordered}
         token_counts = {item.item_id: _item_token_count(item, self.config.summary_budget.token_count_metadata_keys) for item in ordered}
-        token_budget = self.config.summary_budget.effective_token_budget
+        active_prompt_token_budget = int(prompt_token_budget or self.config.summary_budget.analyst_prompt_token_budget)
+        token_budget = (
+            active_prompt_token_budget
+            if prompt_token_estimator is not None
+            else self.config.summary_budget.effective_token_budget
+        )
         total_prompt_tokens = sum(token_counts.values())
+        if prompt_token_estimator is not None and level == self.config.budget_refinement.apply_to_level:
+            success_count, failure_count, outcome_mode = _outcome_counts(ordered)
+            coarse_for_budget = ExperienceCommunity(
+                community_id=f"L{level}_C0",
+                level=level,
+                member_weights={item_id: 1.0 for item_id in input_ids},
+                posterior_member_weights={item_id: 1.0 for item_id in input_ids},
+                clustering_method="weighted_gmm_bic_budget_probe",
+                support_mass=_support_mass(items_by_id, {item_id: 1.0 for item_id in input_ids}),
+                outcome_mode=outcome_mode,
+                success_count=success_count,
+                failure_count=failure_count,
+                metadata={"budget_probe": True},
+            )
+            total_prompt_tokens = await self._estimate_community_token_cost(
+                coarse_for_budget,
+                input_ids,
+                items_by_id=items_by_id,
+                token_counts=token_counts,
+                prompt_token_estimator=prompt_token_estimator,
+                prompt_token_budget=active_prompt_token_budget,
+            )
 
         budget_refinement_enabled = (
             self.config.budget_refinement.enabled
@@ -223,6 +277,8 @@ class ProjectedGmmTreeBuilder:
                 items_by_id=items_by_id,
                 token_counts=token_counts,
                 token_budget=token_budget,
+                prompt_token_estimator=prompt_token_estimator,
+                prompt_token_budget=active_prompt_token_budget,
             )
             return LayerClusteringResult(
                 level=level,
@@ -283,6 +339,8 @@ class ProjectedGmmTreeBuilder:
                     items_by_id=items_by_id,
                     token_counts=token_counts,
                     token_budget=token_budget,
+                    prompt_token_estimator=prompt_token_estimator,
+                    prompt_token_budget=active_prompt_token_budget,
                 )
                 return _clustering_from_refinement(
                     level=level,
@@ -333,6 +391,8 @@ class ProjectedGmmTreeBuilder:
             items_by_id=items_by_id,
             token_counts=token_counts,
             token_budget=token_budget,
+            prompt_token_estimator=prompt_token_estimator,
+            prompt_token_budget=active_prompt_token_budget,
         )
         return LayerClusteringResult(
             level=level,
@@ -359,6 +419,59 @@ class ProjectedGmmTreeBuilder:
             },
         )
 
+    async def _estimate_community_token_cost(
+        self,
+        community: ExperienceCommunity,
+        member_ids: Sequence[str],
+        *,
+        items_by_id: dict[str, ExperienceItem],
+        token_counts: dict[str, int],
+        prompt_token_estimator: PromptTokenEstimator | None,
+        prompt_token_budget: int | None = None,
+    ) -> int:
+        metadata_cost = _selected_prompt_token_cost(token_counts, member_ids)
+        if prompt_token_estimator is None:
+            return metadata_cost
+        active_prompt_token_budget = int(prompt_token_budget or self.config.summary_budget.analyst_prompt_token_budget)
+        if metadata_cost > active_prompt_token_budget:
+            # The metadata sum is already over the full analyst prompt budget,
+            # so this community must be split or excluded.  Avoid constructing
+            # enormous prompts just to learn that they are still over budget.
+            return metadata_cost
+        members = [items_by_id[item_id] for item_id in member_ids]
+        value = prompt_token_estimator(community, members)
+        if inspect.isawaitable(value):
+            value = await value
+        return max(1, int(value))
+
+    def _refinement_node_community(
+        self,
+        parent: ExperienceCommunity,
+        community_id: str,
+        member_ids: Sequence[str],
+        member_weights: dict[str, float],
+        *,
+        items_by_id: dict[str, ExperienceItem],
+        metadata: dict[str, Any] | None = None,
+    ) -> ExperienceCommunity:
+        active_weights = {item_id: float(member_weights.get(item_id, 1.0)) for item_id in member_ids}
+        success_count, failure_count, outcome_mode = _outcome_counts([items_by_id[item_id] for item_id in member_ids])
+        return ExperienceCommunity(
+            community_id=community_id,
+            level=parent.level,
+            member_weights=active_weights,
+            posterior_member_weights=dict(active_weights),
+            clustering_method="budget_refinement_prompt_probe",
+            support_mass=_support_mass(items_by_id, active_weights),
+            outcome_mode=outcome_mode,
+            success_count=success_count,
+            failure_count=failure_count,
+            metadata={
+                **dict(parent.metadata or {}),
+                **dict(metadata or {}),
+            },
+        )
+
     async def _refine_overbudget_coarse_communities(
         self,
         communities: list[ExperienceCommunity],
@@ -369,6 +482,8 @@ class ProjectedGmmTreeBuilder:
         items_by_id: dict[str, ExperienceItem],
         token_counts: dict[str, int],
         token_budget: int,
+        prompt_token_estimator: PromptTokenEstimator | None,
+        prompt_token_budget: int | None = None,
     ) -> dict[str, Any]:
         if not (self.config.budget_refinement.enabled and level == self.config.budget_refinement.apply_to_level):
             return {
@@ -388,10 +503,22 @@ class ProjectedGmmTreeBuilder:
         refined_roots: dict[str, Any] = {}
         refined_nodes: dict[str, Any] = {}
         split_events: list[dict[str, Any]] = []
+        budget_summary = {
+            "token_budget_kind": "analyst_prompt" if prompt_token_estimator is not None else "member_evidence",
+            "member_evidence_token_budget": int(self.config.summary_budget.effective_token_budget),
+            "analyst_prompt_token_budget": int(prompt_token_budget or self.config.summary_budget.analyst_prompt_token_budget),
+        }
 
         for community in communities:
             member_ids = list(member_ids_by_community.get(community.community_id, []))
-            prompt_tokens = _selected_prompt_token_cost(token_counts, member_ids)
+            prompt_tokens = await self._estimate_community_token_cost(
+                community,
+                member_ids,
+                items_by_id=items_by_id,
+                token_counts=token_counts,
+                prompt_token_estimator=prompt_token_estimator,
+                prompt_token_budget=prompt_token_budget,
+            )
             if prompt_tokens <= token_budget:
                 final_communities.append(community)
                 final_members[community.community_id] = member_ids
@@ -404,6 +531,8 @@ class ProjectedGmmTreeBuilder:
                 items_by_id=items_by_id,
                 token_counts=token_counts,
                 token_budget=token_budget,
+                prompt_token_estimator=prompt_token_estimator,
+                prompt_token_budget=prompt_token_budget,
             )
             final_communities.extend(result["communities"])
             final_members.update(result["member_item_ids_by_community"])
@@ -442,6 +571,7 @@ class ProjectedGmmTreeBuilder:
                 "summary_budget": {
                     "budget_refinement_mode": "coarse_then_refine",
                     "effective_token_budget": int(token_budget),
+                    **budget_summary,
                     "excluded_oversize_singletons": [excluded[item_id] for item_id in sorted(excluded)],
                     "refinement_routing_tree": {
                         "kind": "coarse_refinement_routing_tree",
@@ -459,6 +589,7 @@ class ProjectedGmmTreeBuilder:
             "summary_budget": {
                 "budget_refinement_mode": "coarse_then_refine",
                 "effective_token_budget": int(token_budget),
+                **budget_summary,
                 "excluded_oversize_singletons": [excluded[item_id] for item_id in sorted(excluded)],
                 "refinement_routing_tree": {
                     "kind": "coarse_refinement_routing_tree",
@@ -478,6 +609,8 @@ class ProjectedGmmTreeBuilder:
         items_by_id: dict[str, ExperienceItem],
         token_counts: dict[str, int],
         token_budget: int,
+        prompt_token_estimator: PromptTokenEstimator | None,
+        prompt_token_budget: int | None = None,
     ) -> dict[str, Any]:
         root_node_id = f"{community.community_id}_R0"
         queue: list[dict[str, Any]] = [{
@@ -495,7 +628,21 @@ class ProjectedGmmTreeBuilder:
         while queue:
             node = queue.pop(0)
             node_item_ids = list(node["item_ids"])
-            node_token_cost = _selected_prompt_token_cost(token_counts, node_item_ids)
+            node_token_cost = await self._estimate_community_token_cost(
+                self._refinement_node_community(
+                    community,
+                    node["node_id"],
+                    node_item_ids,
+                    node["path_weights"],
+                    items_by_id=items_by_id,
+                    metadata={"budget_refinement_node": True},
+                ),
+                node_item_ids,
+                items_by_id=items_by_id,
+                token_counts=token_counts,
+                prompt_token_estimator=prompt_token_estimator,
+                prompt_token_budget=prompt_token_budget,
+            )
             if node_token_cost <= token_budget:
                 final_specs.append({
                     "source_node_id": node["node_id"],
@@ -547,7 +694,7 @@ class ProjectedGmmTreeBuilder:
                     serial_start=node_serial,
                 )
             if not split.get("accepted"):
-                fallback = self._fallback_overbudget_node(
+                fallback = await self._fallback_overbudget_node(
                     community,
                     node,
                     items_by_id=items_by_id,
@@ -555,6 +702,8 @@ class ProjectedGmmTreeBuilder:
                     token_budget=token_budget,
                     split_rejection=split,
                     serial_start=node_serial,
+                    prompt_token_estimator=prompt_token_estimator,
+                    prompt_token_budget=prompt_token_budget,
                 )
                 final_specs.extend(fallback["final_specs"])
                 excluded.update(fallback["excluded"])
@@ -573,31 +722,17 @@ class ProjectedGmmTreeBuilder:
 
         final_communities: list[ExperienceCommunity] = []
         final_members: dict[str, list[str]] = {}
-        for index, spec in enumerate(final_specs):
-            community_id = f"{community.community_id}_R{index:03d}"
+        final_index = 0
+
+        async def append_final_spec(spec: dict[str, Any]) -> None:
+            nonlocal final_index
             member_ids_for_leaf = [item_id for item_id in member_ids if item_id in set(spec["item_ids"])]
             member_weights = {item_id: float(spec["member_weights"].get(item_id, 1.0)) for item_id in member_ids_for_leaf if item_id not in excluded}
             if not member_weights:
-                continue
+                return
+            community_id = f"{community.community_id}_R{final_index:03d}"
             success_count, failure_count, outcome_mode = _outcome_counts([items_by_id[item_id] for item_id in member_weights])
             routing_kind = str(spec.get("routing_kind", "leaf"))
-            routing_payload = {
-                "node_id": spec["source_node_id"],
-                "kind": routing_kind,
-                "community_id": community_id,
-                "source_community_id": community.community_id,
-                "token_cost": int(spec["token_cost"]),
-                "refinement_depth": int(spec["refinement_depth"]),
-            }
-            if routing_kind in {"token_packing_leaf", "singleton_leaf"}:
-                routing_payload.update({
-                    "item_ids": list(member_weights),
-                    "fallback_parent_node_id": spec.get("fallback_parent_node_id"),
-                    "fallback_reason": spec.get("fallback_reason"),
-                    "centroid_embedding": _centroid_embedding(items_by_id, list(member_weights)),
-                    "token_budget": int(token_budget),
-                })
-            routing_nodes[spec["source_node_id"]] = routing_payload
             fallback_metadata = {
                 key: value
                 for key, value in {
@@ -607,7 +742,7 @@ class ProjectedGmmTreeBuilder:
                 }.items()
                 if value is not None
             }
-            final_communities.append(ExperienceCommunity(
+            candidate = ExperienceCommunity(
                 community_id=community_id,
                 level=level,
                 member_weights=member_weights,
@@ -627,8 +762,99 @@ class ProjectedGmmTreeBuilder:
                     "split_reason": str(spec.get("split_reason", "budget_refinement_leaf")),
                     **fallback_metadata,
                 },
-            ))
+            )
+            exact_token_cost = await self._estimate_community_token_cost(
+                candidate,
+                list(member_weights),
+                items_by_id=items_by_id,
+                token_counts=token_counts,
+                prompt_token_estimator=prompt_token_estimator,
+                prompt_token_budget=prompt_token_budget,
+            )
+            if exact_token_cost > token_budget:
+                if len(member_weights) <= 1:
+                    item_id = next(iter(member_weights))
+                    excluded[item_id] = {
+                        "item_id": item_id,
+                        "source_community_id": community.community_id,
+                        "node_id": spec["source_node_id"],
+                        "token_cost": int(exact_token_cost),
+                        "budget": int(token_budget),
+                        "reason": "oversize_singleton",
+                        "fallback_reason": "final_prompt_token_cost_exceeds_budget",
+                    }
+                    routing_nodes[spec["source_node_id"]] = {
+                        "node_id": spec["source_node_id"],
+                        "kind": "excluded_oversize_singleton",
+                        "item_ids": [item_id],
+                        "excluded_item_id": item_id,
+                        "token_cost": int(exact_token_cost),
+                        "budget": int(token_budget),
+                        "fallback_reason": "final_prompt_token_cost_exceeds_budget",
+                    }
+                    return
+                child_node_ids: list[str] = []
+                for child_index, item_id in enumerate(member_ids_for_leaf):
+                    child_node_id = f"{spec['source_node_id']}_V{child_index}"
+                    child_node_ids.append(child_node_id)
+                    await append_final_spec({
+                        **spec,
+                        "source_node_id": child_node_id,
+                        "item_ids": [item_id],
+                        "member_weights": {item_id: float(member_weights[item_id])},
+                        "token_cost": int(_selected_prompt_token_cost(token_counts, [item_id])),
+                        "refinement_depth": int(spec["refinement_depth"]) + 1,
+                        "routing_kind": "singleton_leaf",
+                        "clustering_method": "budget_fallback_singleton_leaf",
+                        "split_reason": "final_prompt_token_singleton_leaf",
+                        "fallback_parent_node_id": spec["source_node_id"],
+                        "fallback_reason": "final_prompt_token_cost_exceeds_budget",
+                    })
+                routing_nodes[spec["source_node_id"]] = {
+                    "node_id": spec["source_node_id"],
+                    "kind": "fallback_token_router",
+                    "routing_model_kind": "fallback_centroid_softmax_v1",
+                    "routing_temperature": 8.0,
+                    "soft_assignment": self.config.soft_membership.__dict__,
+                    "source_community_id": community.community_id,
+                    "item_ids": member_ids_for_leaf,
+                    "child_node_ids": child_node_ids,
+                    "token_cost": int(exact_token_cost),
+                    "budget": int(token_budget),
+                    "fallback_reason": "final_prompt_token_cost_exceeds_budget",
+                }
+                split_events.append({
+                    "split_reason": "final_prompt_token_cost_exceeds_budget",
+                    "node_id": spec["source_node_id"],
+                    "parent_prompt_tokens": int(exact_token_cost),
+                    "budget": int(token_budget),
+                    "child_node_ids": child_node_ids,
+                })
+                return
+
+            routing_payload = {
+                "node_id": spec["source_node_id"],
+                "kind": routing_kind,
+                "community_id": community_id,
+                "source_community_id": community.community_id,
+                "token_cost": int(exact_token_cost),
+                "refinement_depth": int(spec["refinement_depth"]),
+            }
+            if routing_kind in {"token_packing_leaf", "singleton_leaf"}:
+                routing_payload.update({
+                    "item_ids": list(member_weights),
+                    "fallback_parent_node_id": spec.get("fallback_parent_node_id"),
+                    "fallback_reason": spec.get("fallback_reason"),
+                    "centroid_embedding": _centroid_embedding(items_by_id, list(member_weights)),
+                    "token_budget": int(token_budget),
+                })
+            routing_nodes[spec["source_node_id"]] = routing_payload
+            final_communities.append(candidate)
             final_members[community_id] = list(member_weights)
+            final_index += 1
+
+        for spec in final_specs:
+            await append_final_spec(spec)
 
         return {
             "root_node_id": root_node_id if routing_nodes else "",
@@ -639,7 +865,7 @@ class ProjectedGmmTreeBuilder:
             "split_events": split_events,
         }
 
-    def _fallback_overbudget_node(
+    async def _fallback_overbudget_node(
         self,
         community: ExperienceCommunity,
         node: dict[str, Any],
@@ -649,6 +875,8 @@ class ProjectedGmmTreeBuilder:
         token_budget: int,
         split_rejection: dict[str, Any],
         serial_start: int,
+        prompt_token_estimator: PromptTokenEstimator | None,
+        prompt_token_budget: int | None = None,
     ) -> dict[str, Any]:
         node_item_ids = list(node["item_ids"])
         path_weights = dict(node["path_weights"])
@@ -664,9 +892,32 @@ class ProjectedGmmTreeBuilder:
             child_node_ids.append(child_id)
             return child_id
 
+        async def estimate_pack_cost(probe_id: str, pack_ids: list[str]) -> int:
+            probe = self._refinement_node_community(
+                community,
+                probe_id,
+                pack_ids,
+                path_weights,
+                items_by_id=items_by_id,
+                metadata={
+                    "budget_fallback_probe": True,
+                    "fallback_parent_node_id": node["node_id"],
+                    "fallback_reason": split_rejection.get("reason"),
+                },
+            )
+            return await self._estimate_community_token_cost(
+                probe,
+                pack_ids,
+                items_by_id=items_by_id,
+                token_counts=token_counts,
+                prompt_token_estimator=prompt_token_estimator,
+                prompt_token_budget=prompt_token_budget,
+            )
+
+        parent_prompt_tokens = await estimate_pack_cost(node["node_id"], node_item_ids)
         sortable_ids = sorted(node_item_ids, key=lambda item_id: (-int(token_counts.get(item_id, 0)), original_order[item_id]))
         for item_id in sortable_ids:
-            count = int(token_counts.get(item_id, 0))
+            count = await estimate_pack_cost(f"{node['node_id']}_singleton_probe_{item_id}", [item_id])
             if count > token_budget:
                 child_id = add_child_node_id()
                 excluded[item_id] = {
@@ -692,9 +943,11 @@ class ProjectedGmmTreeBuilder:
                 continue
             placed = False
             for index, cost in enumerate(pack_costs):
-                if cost <= token_budget and cost + count <= token_budget:
+                candidate_pack = packs[index] + [item_id]
+                candidate_cost = await estimate_pack_cost(f"{node['node_id']}_pack_probe_{index}", candidate_pack)
+                if cost <= token_budget and candidate_cost <= token_budget:
                     packs[index].append(item_id)
-                    pack_costs[index] += count
+                    pack_costs[index] = candidate_cost
                     placed = True
                     break
             if not placed:
@@ -728,7 +981,7 @@ class ProjectedGmmTreeBuilder:
             "source_community_id": community.community_id,
             "item_ids": node_item_ids,
             "child_node_ids": child_node_ids,
-            "token_cost": int(_selected_prompt_token_cost(token_counts, node_item_ids)),
+            "token_cost": int(parent_prompt_tokens),
             "budget": int(token_budget),
             "fallback_reason": split_rejection.get("reason"),
             "last_rejection": split_rejection,
@@ -741,7 +994,7 @@ class ProjectedGmmTreeBuilder:
             "event": {
                 "split_reason": "budget_fallback_token_pack_singleton",
                 "node_id": node["node_id"],
-                "parent_prompt_tokens": int(_selected_prompt_token_cost(token_counts, node_item_ids)),
+                "parent_prompt_tokens": int(parent_prompt_tokens),
                 "budget": int(token_budget),
                 "fallback_reason": split_rejection.get("reason"),
                 "pack_count": len(final_specs),

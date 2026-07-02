@@ -60,19 +60,18 @@ OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
 
 # OpenAI-compatible embedding endpoint used for trajectory/node embeddings and
 # heldout nodebank retrieval.
-EMBEDDING_BASE_URL="${EMBEDDING_BASE_URL:-http://127.0.0.1:8017/v1}"
+EMBEDDING_BASE_URL="${EMBEDDING_BASE_URL:-http://10.26.1.184:18007/v1}"
 
 # Embedding model name served by EMBEDDING_BASE_URL.
-EMBEDDING_MODEL="${EMBEDDING_MODEL:-Qwen3-Embedding-0.6B}"
+EMBEDDING_MODEL="${EMBEDDING_MODEL:-Qwen3-Embedding-8B}"
 
 # Local tokenizer path/name used for token counting and long-trace chunking.
-EMBEDDING_TOKENIZER="${EMBEDDING_TOKENIZER:-/mnt/data/grouph_share/models/modelscope/models/Qwen/Qwen3-Embedding-0___6B}"
+EMBEDDING_TOKENIZER="${EMBEDDING_TOKENIZER:-/mnt/data/grouph_share/models/modelscope/models/Qwen/Qwen3-Embedding-8B}"
 
 # Maximum ReAct turns per train/heldout spreadsheet task.
 MAX_TURNS="${MAX_TURNS:-30}"
 
-# Qwen thinking flag for Trace2Skill rollout and static DynaMix analyst calls.
-# Dynamic patch analyst calls force enable_thinking=false while using guided_json.
+# Qwen thinking flag for Trace2Skill rollout and DynaMix analyst calls.
 # Allowed values: true, false, null.  Use false for faster non-thinking tests.
 THINKING="${THINKING:-false}"
 

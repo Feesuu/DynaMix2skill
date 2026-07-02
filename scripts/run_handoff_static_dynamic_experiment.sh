@@ -19,8 +19,8 @@ set -euo pipefail
 #   MODEL=Qwen3.5-9B-AWQ \
 #   OPENAI_BASE_URL=http://asmiatbrqksz.10.27.127.9.nip.io/v1 \
 #   EMBEDDING_BASE_URL=http://127.0.0.1:8017/v1 \
-#   EMBEDDING_MODEL=Qwen3-Embedding-0.6B \
-#   EMBEDDING_TOKENIZER=/mnt/data/grouph_share/models/modelscope/models/Qwen/Qwen3-Embedding-0___6B \
+#   EMBEDDING_MODEL=Qwen3-Embedding-8B \
+#   EMBEDDING_TOKENIZER=/mnt/data/grouph_share/models/modelscope/models/Qwen/Qwen3-Embedding-8B \
 #   bash scripts/run_handoff_static_dynamic_experiment.sh
 #
 # Runnable example 2: dynamic update with the same train artifacts.
@@ -34,8 +34,8 @@ set -euo pipefail
 #   MODEL=Qwen3.5-9B-AWQ \
 #   OPENAI_BASE_URL=http://asmiatbrqksz.10.27.127.9.nip.io/v1 \
 #   EMBEDDING_BASE_URL=http://127.0.0.1:8017/v1 \
-#   EMBEDDING_MODEL=Qwen3-Embedding-0.6B \
-#   EMBEDDING_TOKENIZER=/mnt/data/grouph_share/models/modelscope/models/Qwen/Qwen3-Embedding-0___6B \
+#   EMBEDDING_MODEL=Qwen3-Embedding-8B \
+#   EMBEDDING_TOKENIZER=/mnt/data/grouph_share/models/modelscope/models/Qwen/Qwen3-Embedding-8B \
 #   bash scripts/run_handoff_static_dynamic_experiment.sh
 #
 # If train[0:200] records were already produced elsewhere, add either:
@@ -113,7 +113,7 @@ OPENAI_BASE_URL="${OPENAI_BASE_URL:-http://asmiatbrqksz.10.27.127.9.nip.io/v1}"
 OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
 
 # Thinking mode for train/heldout rollout and static DynaMix analyst calls.
-# Dynamic patch analyst calls force enable_thinking=false while using guided_json.
+# Dynamic patch analyst calls use enable_thinking=true by default.
 # Allowed: true, false, null.
 THINKING="${THINKING:-true}"
 
@@ -140,12 +140,12 @@ GENERATION_RETRY_WAIT_SECONDS="${GENERATION_RETRY_WAIT_SECONDS:-2,5,15}"
 # Embedding model, tokenizer, long-trace chunking, and retrieval.
 # ---------------------------------------------------------------------------
 
-EMBEDDING_BASE_URL="${EMBEDDING_BASE_URL:-http://127.0.0.1:8017/v1}"
-EMBEDDING_MODEL="${EMBEDDING_MODEL:-Qwen3-Embedding-0.6B}"
-EMBEDDING_TOKENIZER="${EMBEDDING_TOKENIZER:-/mnt/data/grouph_share/models/modelscope/models/Qwen/Qwen3-Embedding-0___6B}"
+EMBEDDING_BASE_URL="${EMBEDDING_BASE_URL:-http://10.26.1.184:18007/v1}"
+EMBEDDING_MODEL="${EMBEDDING_MODEL:-Qwen3-Embedding-8B}"
+EMBEDDING_TOKENIZER="${EMBEDDING_TOKENIZER:-/mnt/data/grouph_share/models/modelscope/models/Qwen/Qwen3-Embedding-8B}"
 
-EMBEDDING_MAX_MODEL_LEN="${EMBEDDING_MAX_MODEL_LEN:-8192}"
-EMBEDDING_MAX_INPUT_TOKENS="${EMBEDDING_MAX_INPUT_TOKENS:-8000}"
+EMBEDDING_MAX_MODEL_LEN="${EMBEDDING_MAX_MODEL_LEN:-32000}"
+EMBEDDING_MAX_INPUT_TOKENS="${EMBEDDING_MAX_INPUT_TOKENS:-32000}"
 EMBEDDING_TRUNCATE_LONG_TEXTS="${EMBEDDING_TRUNCATE_LONG_TEXTS:-true}"
 EMBEDDING_TRUNCATION_STRATEGY="${EMBEDDING_TRUNCATION_STRATEGY:-head}"
 EMBEDDING_BATCH_SIZE="${EMBEDDING_BATCH_SIZE:-8}"
@@ -154,8 +154,8 @@ EMBEDDING_TOKENIZER_REQUIRED="${EMBEDDING_TOKENIZER_REQUIRED:-true}"
 
 # Long trajectory embedding uses overlapping chunks and mean pooling.
 CHUNKED_EMBEDDING_ENABLED="${CHUNKED_EMBEDDING_ENABLED:-true}"
-CHUNKED_EMBEDDING_CHUNK_TOKENS="${CHUNKED_EMBEDDING_CHUNK_TOKENS:-7600}"
-CHUNKED_EMBEDDING_OVERLAP_TOKENS="${CHUNKED_EMBEDDING_OVERLAP_TOKENS:-512}"
+CHUNKED_EMBEDDING_CHUNK_TOKENS="${CHUNKED_EMBEDDING_CHUNK_TOKENS:-8000}"
+CHUNKED_EMBEDDING_OVERLAP_TOKENS="${CHUNKED_EMBEDDING_OVERLAP_TOKENS:-1000}"
 CHUNKED_EMBEDDING_POOLING="${CHUNKED_EMBEDDING_POOLING:-mean}"
 CHUNKED_EMBEDDING_ADD_SPECIAL_TOKENS="${CHUNKED_EMBEDDING_ADD_SPECIAL_TOKENS:-false}"
 CHUNKED_EMBEDDING_NORMALIZE_AFTER_POOLING="${CHUNKED_EMBEDDING_NORMALIZE_AFTER_POOLING:-false}"
@@ -193,7 +193,7 @@ GMM_KMEANS_INIT_ITERS="${GMM_KMEANS_INIT_ITERS:-15}"
 GMM_MAX_ITER="${GMM_MAX_ITER:-100}"
 GMM_TOL="${GMM_TOL:-0.0001}"
 GMM_MIN_COVAR="${GMM_MIN_COVAR:-0.000001}"
-GMM_MIN_SPLIT_SIZE="${GMM_MIN_SPLIT_SIZE:-4}"
+GMM_MIN_SPLIT_SIZE="${GMM_MIN_SPLIT_SIZE:-2}"
 GMM_MIN_EFFECTIVE_SAMPLES_PER_COMPONENT="${GMM_MIN_EFFECTIVE_SAMPLES_PER_COMPONENT:-2}"
 GMM_ABS_KMAX="${GMM_ABS_KMAX:-64}"
 GMM_MAX_CONCURRENT_CANDIDATES="${GMM_MAX_CONCURRENT_CANDIDATES:-1}"

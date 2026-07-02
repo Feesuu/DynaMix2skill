@@ -17,7 +17,7 @@ def main() -> None:
     parser.add_argument("--skillbank-root", required=True)
     parser.add_argument("--output", default=None, help="Index JSON path; default: <skillbank-root>/.dynamix_skillbank_index.json")
     parser.add_argument("--embedding-base-url", default="mock://deterministic")
-    parser.add_argument("--embedding-model", default="Qwen3-Embedding-0.6B")
+    parser.add_argument("--embedding-model", default="Qwen3-Embedding-8B")
     parser.add_argument("--embedding-api-key", default="EMPTY")
     args = parser.parse_args()
     selector = SkillBankSelector(

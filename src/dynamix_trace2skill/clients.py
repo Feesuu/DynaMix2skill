@@ -41,13 +41,12 @@ class GenerationConfig:
 @dataclass
 class EmbeddingConfig:
     base_url: str = "mock://deterministic"
-    model: str = "Qwen3-Embedding-0.6B"
+    model: str = "Qwen3-Embedding-8B"
     api_key: str = "EMPTY"
-    # Official handoff runs use the local Qwen3-Embedding-0.6B service with an
-    # 8k input window.  Long trajectories are chunked upstream before this
-    # tokenizer-level guard is reached.
-    max_model_len: int = 8192
-    max_input_tokens: int | None = 8000
+    # Official handoff runs use the Qwen3-Embedding-8B service with a 32k input
+    # window. Long trajectories are chunked upstream before this guard is hit.
+    max_model_len: int = 32000
+    max_input_tokens: int | None = 32000
     truncate_long_texts: bool = True
     tokenizer_model: str | None = None
     tokenizer_required: bool = True

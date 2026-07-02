@@ -8,6 +8,7 @@ import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -15,6 +16,8 @@ from dynamix_trace2skill.clients import EmbeddingClient, EmbeddingConfig, Genera
 from dynamix_trace2skill.summary import ClusterAnalyst, ClusterAnalystConfig
 from dynamix_trace2skill.log_parser import parse_trace2skill_logs, _result_fields
 from dynamix_trace2skill.pipeline import DynaMixRunConfig, default_hierarchy_config
+from dynamix_trace2skill.schemas import RawTrajectoryRecord, TrajectoryStep
+from dynamix_trace2skill.trace_views import render_embedding_trace
 from dynamix_core.data_structures import ExperienceCardPatch, ExperienceCommunity, ExperienceHierarchyState, ExperienceItem, ITEM_KIND_EXPERIENCE_CARD, ITEM_KIND_TRAJECTORY
 from dynamix_core.update import ExperienceHierarchyDynamicUpdater
 
@@ -48,6 +51,73 @@ def test_embedding_truncates_to_configured_32k_budget_with_tokenizer(tmp_path):
     payload = json.loads(report.read_text())
     assert payload["event_count"] == 1
     assert payload["truncation_strategy"] == "head"
+
+
+def test_embedding_trace_excludes_answer_position():
+    record = RawTrajectoryRecord(
+        trajectory_id="t0",
+        task_id="task0",
+        trial_index=0,
+        instruction="Fill the result column.",
+        instruction_type="Cell-Level Manipulation",
+        answer_position="E6:E13",
+        steps=[
+            TrajectoryStep(
+                step_id=1,
+                raw_model_output="Thought: inspect the sheet",
+                action="python inspect.py",
+                observation="headers found",
+            )
+        ],
+    )
+    text = render_embedding_trace(record)
+    assert "instruction: Fill the result column." in text
+    assert "instruction_type: Cell-Level Manipulation" in text
+    assert "raw_model_output" in text
+    assert "answer_position" not in text
+    assert "E6:E13" not in text
+
+
+def test_chunked_embedding_uses_project_defaults_when_fields_omitted(tmp_path, monkeypatch):
+    from dynamix_trace2skill import long_embeddings
+    from dynamix_trace2skill.pipeline import DynaMixRunConfig, _embed_records_for_build
+
+    class DummyTokenizer:
+        def encode(self, text, *, add_special_tokens=False):
+            return list(range(len(text.split())))
+
+        def decode(self, ids, *, skip_special_tokens=True):
+            return " ".join(f"tok{i}" for i in ids)
+
+    monkeypatch.setattr(long_embeddings, "_load_hf_tokenizer", lambda tokenizer_model: DummyTokenizer())
+
+    record = RawTrajectoryRecord(
+        trajectory_id="t0",
+        task_id="task0",
+        trial_index=0,
+        instruction="Do the task",
+        instruction_type="Cell-Level Manipulation",
+        steps=[TrajectoryStep(1, "raw", "action", "observation")],
+    )
+    embedding = EmbeddingClient(
+        EmbeddingConfig(
+            base_url="mock://deterministic",
+            tokenizer_model="dummy-tokenizer",
+            tokenizer_required=False,
+            cache_path=str(tmp_path / "cache.sqlite"),
+        )
+    )
+    config = DynaMixRunConfig(
+        output_dir=str(tmp_path / "out"),
+        records_path=str(tmp_path / "records.json"),
+        embedding=embedding.config,
+        chunked_embedding={"enabled": True},
+    )
+
+    asyncio.run(_embed_records_for_build(records=[record], embedding_client=embedding, config=config, out=tmp_path / "out"))
+    report = json.loads((tmp_path / "out" / "analysis" / "chunked_embedding_report.json").read_text(encoding="utf-8"))
+    assert report["chunk_tokens"] == 8000
+    assert report["overlap_tokens"] == 1000
 
 
 async def async_embed(client, texts):
@@ -370,7 +440,7 @@ def test_default_hierarchy_config_is_real_not_tiny_smoke():
     from dynamix_core.config import ProjectedGmmDynamicTreeConfig
 
     cfg = default_hierarchy_config({})
-    assert cfg.gmm_bic.min_split_size == 4
+    assert cfg.gmm_bic.min_split_size == 2
     assert cfg.gmm_bic.min_effective_samples_per_component == 2
     assert cfg.gmm_bic.abs_kmax == 64
     assert cfg.gmm_bic.num_restarts == 5
@@ -845,7 +915,7 @@ def test_experiment_runner_stage_report_aggregates_time_tokens_and_budget_pressu
         encoding="utf-8",
     )
     (analysis_dir / "chunked_embedding_report.json").write_text(
-        json.dumps({"chunk_tokens": 28000, "overlap_tokens": 1000, "pooling": "mean", "max_token_count": 90000, "over_limit_chunk_count": 0}),
+        json.dumps({"chunk_tokens": 8000, "overlap_tokens": 1000, "pooling": "mean", "max_token_count": 90000, "over_limit_chunk_count": 0}),
         encoding="utf-8",
     )
     args = SimpleNamespace(
@@ -864,7 +934,7 @@ def test_experiment_runner_stage_report_aggregates_time_tokens_and_budget_pressu
         rollout_client_timeout_seconds=600,
         chunked_embedding_enabled=True,
         embedding_batch_size=8,
-        chunked_embedding_chunk_tokens=28000,
+        chunked_embedding_chunk_tokens=8000,
         embedding_max_model_len=32000,
         train_start=0,
         train_end=200,
@@ -1118,6 +1188,154 @@ def test_budget_refinement_falls_back_to_token_packing_when_gmm_cannot_split():
     assert router["routing_model_kind"] == "fallback_centroid_softmax_v1"
     assert router["routing_temperature"] == pytest.approx(8.0)
     assert "singleton_budget" not in router
+
+
+def test_budget_refinement_uses_static_prompt_token_estimator_before_analyst():
+    from dynamix_core.tree_builder import ProjectedGmmTreeBuilder
+
+    cfg = default_hierarchy_config({
+        "summary_budget": {"max_model_tokens": 100, "budget_ratio": 0.5, "prompt_overhead_reserve_tokens": 0},
+        "gmm_bic": {"min_split_size": 4, "min_effective_samples_per_component": 2},
+    })
+    items = [
+        ExperienceItem(item_id="a", level=0, kind=ITEM_KIND_TRAJECTORY, text="a", embedding=[1.0, 0.0], metadata={"analysis_token_count": 10}),
+        ExperienceItem(item_id="b", level=0, kind=ITEM_KIND_TRAJECTORY, text="b", embedding=[0.0, 1.0], metadata={"analysis_token_count": 10}),
+    ]
+    calls = []
+
+    def estimator(community, members):
+        calls.append((community.community_id, tuple(item.item_id for item in members)))
+        return 90 if len(members) > 1 else 40
+
+    clustering = asyncio.run(
+        ProjectedGmmTreeBuilder(cfg).cluster_layer(
+            items,
+            level=0,
+            prompt_token_estimator=estimator,
+        )
+    )
+
+    assert clustering.excluded_input_item_ids == []
+    assert len(clustering.communities) == 2
+    assert {community.metadata["fallback_kind"] for community in clustering.communities} == {"singleton_leaf"}
+    assert max(community.metadata["prompt_token_cost"] for community in clustering.communities) <= 50
+    assert any(member_ids == ("a", "b") for _community_id, member_ids in calls)
+
+
+def test_budget_refinement_validates_exact_final_community_prompt_tokens():
+    from dynamix_core.tree_builder import ProjectedGmmTreeBuilder
+
+    cfg = default_hierarchy_config({
+        "summary_budget": {"max_model_tokens": 100, "budget_ratio": 0.5, "prompt_overhead_reserve_tokens": 0},
+        "gmm_bic": {"min_split_size": 4, "min_effective_samples_per_component": 2},
+    })
+    items = [
+        ExperienceItem(item_id="a", level=0, kind=ITEM_KIND_TRAJECTORY, text="a", embedding=[1.0, 0.0], metadata={"analysis_token_count": 10}),
+        ExperienceItem(item_id="b", level=0, kind=ITEM_KIND_TRAJECTORY, text="b", embedding=[0.0, 1.0], metadata={"analysis_token_count": 10}),
+    ]
+
+    def estimator(community, members):
+        if len(members) <= 1:
+            return 30
+        if community.metadata.get("budget_fallback_probe"):
+            return 45
+        if community.community_id.endswith("_R000"):
+            return 51
+        return 90
+
+    clustering = asyncio.run(
+        ProjectedGmmTreeBuilder(cfg).cluster_layer(
+            items,
+            level=0,
+            prompt_token_estimator=estimator,
+        )
+    )
+
+    assert clustering.excluded_input_item_ids == []
+    assert len(clustering.communities) == 2
+    assert all(len(clustering.member_item_ids_by_community[community.community_id]) == 1 for community in clustering.communities)
+    assert any(event.get("split_reason") == "final_prompt_token_cost_exceeds_budget" for event in clustering.summary_budget["split_events"])
+
+
+def test_budget_refinement_honors_explicit_prompt_token_budget():
+    from dynamix_core.tree_builder import ProjectedGmmTreeBuilder
+
+    cfg = default_hierarchy_config({
+        "summary_budget": {"max_model_tokens": 100, "budget_ratio": 0.5, "prompt_overhead_reserve_tokens": 0},
+        "gmm_bic": {"min_split_size": 4, "min_effective_samples_per_component": 2},
+    })
+    items = [
+        ExperienceItem(item_id="a", level=0, kind=ITEM_KIND_TRAJECTORY, text="a", embedding=[1.0, 0.0], metadata={"analysis_token_count": 10}),
+        ExperienceItem(item_id="b", level=0, kind=ITEM_KIND_TRAJECTORY, text="b", embedding=[0.0, 1.0], metadata={"analysis_token_count": 10}),
+    ]
+
+    def estimator(_community, members):
+        return 45 if len(members) > 1 else 30
+
+    clustering = asyncio.run(
+        ProjectedGmmTreeBuilder(cfg).cluster_layer(
+            items,
+            level=0,
+            prompt_token_estimator=estimator,
+            prompt_token_budget=40,
+        )
+    )
+
+    assert len(clustering.communities) == 2
+    assert clustering.summary_budget["analyst_prompt_token_budget"] == 40
+    assert clustering.summary_budget["effective_token_budget"] == 40
+
+
+def test_static_pipeline_passes_explicit_analyst_prompt_budget_to_builder(tmp_path, monkeypatch):
+    import dynamix_trace2skill.pipeline as pipeline
+    from dynamix_core.skill_export import SkillExportResult
+
+    captured: dict[str, Any] = {}
+
+    class FakeState:
+        async def to_dict(self, *, include_embeddings=False, validate=True):
+            return {"items": {}, "communities": {}}
+
+    class FakeBuilder:
+        def __init__(self, hierarchy_config):
+            captured["hierarchy_budget"] = hierarchy_config.summary_budget.analyst_prompt_token_budget
+
+        async def build(self, items, **kwargs):
+            captured["prompt_token_budget"] = kwargs.get("prompt_token_budget")
+            captured["has_prompt_token_estimator"] = callable(kwargs.get("prompt_token_estimator"))
+            return SimpleNamespace(state=FakeState(), layers=[])
+
+    async def fake_embed_records_for_build(*, records, embedding_client, config, out):
+        return ["embedding text"], [[1.0, 0.0]]
+
+    async def fake_export_skill_files(state, out, *, config=None):
+        return SkillExportResult(output_dir=str(tmp_path / "skills"), manifest_path=str(tmp_path / "manifest.json"), node_count=0)
+
+    record = RawTrajectoryRecord(trajectory_id="t0", task_id="task0", trial_index=0, instruction="Do it")
+    monkeypatch.setattr(pipeline, "_load_records_for_protocol", lambda config, out: [record])
+    monkeypatch.setattr(pipeline, "_embed_records_for_build", fake_embed_records_for_build)
+    monkeypatch.setattr(pipeline, "_records_to_items", lambda records, texts, embeddings, *, config: (
+        [ExperienceItem(item_id="t0", level=0, kind=ITEM_KIND_TRAJECTORY, text="trace", embedding=[1.0, 0.0], metadata={"analysis_token_count": 10})],
+        [],
+    ))
+    monkeypatch.setattr(pipeline, "ProjectedGmmTreeBuilder", FakeBuilder)
+    monkeypatch.setattr(pipeline, "export_skill_files", fake_export_skill_files)
+    monkeypatch.setattr(pipeline, "_refresh_skillbank_index", lambda skillbank_root, config: str(tmp_path / "index.json"))
+
+    config = DynaMixRunConfig(
+        output_dir=str(tmp_path / "out"),
+        records_path=str(tmp_path / "records.json"),
+        generation=GenerationConfig(base_url="mock://chat"),
+        embedding=EmbeddingConfig(base_url="mock://embedding", cache_path=str(tmp_path / "cache.sqlite")),
+        hierarchy={"summary_budget": {"max_model_tokens": 100, "budget_ratio": 0.8}},
+        analyst=ClusterAnalystConfig(max_prompt_tokens=40),
+    )
+
+    asyncio.run(pipeline.build_tree_from_records(config))
+
+    assert captured["hierarchy_budget"] == 80
+    assert captured["prompt_token_budget"] == 40
+    assert captured["has_prompt_token_estimator"] is True
 
 
 def test_budget_refinement_excludes_only_true_oversize_singleton_after_fallback():
@@ -1438,6 +1656,7 @@ def test_static_cluster_analyst_uses_guided_json_without_forcing_thinking():
 
     assert len(items) == 1
     assert generation.kwargs["guided_json"]["required"] == ["cards"]
+    assert generation.kwargs["guided_json"]["properties"]["cards"]["minItems"] == 1
     placement_schema = generation.kwargs["guided_json"]["properties"]["cards"]["items"]["properties"]["placement"]
     assert placement_schema["required"] == ["target", "reference_kind"]
     assert generation.kwargs["max_tokens"] == 3333
@@ -1521,7 +1740,7 @@ def test_dynamic_analyst_adds_new_cards_without_position_matching_old_cards():
     assert all("support_mass" not in card for card in payload["previous_generated_experiences"])
     assert generation.kwargs["guided_json"]["required"] == ["updates", "new_cards"]
     assert generation.kwargs["max_tokens"] == 7777
-    assert generation.kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+    assert generation.kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is True
 
 
 def test_dynamic_analyst_updates_only_explicit_previous_card_ids():

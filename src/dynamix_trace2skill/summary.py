@@ -51,7 +51,7 @@ _UPDATE_CARD_SCHEMA: dict[str, Any] = {
 MINIMAL_CLUSTER_EXPERIENCE_CARDS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "cards": {"type": "array", "items": _CARD_SCHEMA},
+        "cards": {"type": "array", "items": _CARD_SCHEMA, "minItems": 1},
     },
     "required": ["cards"],
     "additionalProperties": False,
@@ -131,7 +131,7 @@ class ClusterAnalyst:
 
     @staticmethod
     def _analyst_extra_body() -> dict[str, Any]:
-        return {"chat_template_kwargs": {"enable_thinking": False}}
+        return {"chat_template_kwargs": {"enable_thinking": True}}
 
     async def summarize(self, community: ExperienceCommunity, members: Sequence[ExperienceItem], clustering: Any | None = None) -> list[ExperienceItem]:
         if _is_diagnostic_community(community):
@@ -567,6 +567,17 @@ Return valid JSON only.
         analyst_mode = _infer_analyst_mode(community, members, self.config)
         system_prompt = self._dynamic_system_prompt(analyst_mode)
         user_prompt = self._build_dynamic_update_prompt(community, members, previous_generated_experiences, analyst_mode)
+        token_count, _tokenizer_name = self._count_text_tokens(system_prompt + "\n" + user_prompt)
+        return int(token_count)
+
+    def estimate_static_prompt_tokens(
+        self,
+        community: ExperienceCommunity,
+        members: Sequence[ExperienceItem],
+    ) -> int:
+        analyst_mode = _infer_analyst_mode(community, members, self.config)
+        system_prompt = self._system_prompt(analyst_mode)
+        user_prompt = self._build_prompt(community, members, analyst_mode)
         token_count, _tokenizer_name = self._count_text_tokens(system_prompt + "\n" + user_prompt)
         return int(token_count)
 

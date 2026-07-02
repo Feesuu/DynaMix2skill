@@ -27,13 +27,13 @@ class ChunkedEmbeddingConfig:
         -> embed each window with the normal embedding client
         -> average chunk embeddings to represent the original trajectory
 
-    Official handoff runs use Qwen3-Embedding-0.6B with an 8k window, so the
-    runner passes smaller chunk settings such as 7600 tokens with 512 overlap.
+    Official handoff runs use Qwen3-Embedding-8B with a 32k window, while the
+    runner embeds 8k-token chunks with 1k overlap for more stable batching.
     """
 
     tokenizer_model: str
-    chunk_tokens: int = 10_000
-    overlap_tokens: int = 2_000
+    chunk_tokens: int = 8_000
+    overlap_tokens: int = 1_000
     pooling: str = "mean"  # currently: mean or token_weighted_mean
     add_special_tokens: bool = False
     normalize_after_pooling: bool = False

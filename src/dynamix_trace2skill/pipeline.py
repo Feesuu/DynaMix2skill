@@ -95,7 +95,7 @@ def default_hierarchy_config(payload: dict[str, Any] | None = None) -> Projected
             "max_iter": 100,
             "tol": 1.0e-4,
             "min_covar": 1.0e-6,
-            "min_split_size": 4,
+            "min_split_size": 2,
             "min_effective_samples_per_component": 2,
             "abs_kmax": 64,
             "max_concurrent_candidates": 1,
@@ -145,8 +145,15 @@ async def build_tree_from_records(config: DynaMixRunConfig) -> dict[str, Any]:
     (out / "normalized_records.json").write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8")
 
     analyst = ClusterAnalyst(generation_client, embedding_client, config.analyst)
-    builder = ProjectedGmmTreeBuilder(default_hierarchy_config(config.hierarchy))
-    result = await builder.build(items, summary_fn=analyst.summarize, max_levels=config.max_levels)
+    hierarchy_config = default_hierarchy_config(config.hierarchy)
+    builder = ProjectedGmmTreeBuilder(hierarchy_config)
+    result = await builder.build(
+        items,
+        summary_fn=analyst.summarize,
+        prompt_token_estimator=analyst.estimate_static_prompt_tokens,
+        prompt_token_budget=int(config.analyst.max_prompt_tokens or hierarchy_config.summary_budget.analyst_prompt_token_budget),
+        max_levels=config.max_levels,
+    )
     analyst.save_prompt_token_report(out / "analysis" / "cluster_prompt_token_report.json")
     state_payload = await result.state.to_dict(include_embeddings=False, validate=True)
     (out / "hierarchy_state.json").write_text(json.dumps(state_payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -236,7 +243,13 @@ async def build_dynamic_tree_from_records(config: DynaMixRunConfig) -> dict[str,
             for payload in entry.get("excluded_oversize_singletons", [])
         ]
     else:
-        build_result = await builder.build(initial_items, summary_fn=analyst.summarize, max_levels=config.max_levels)
+        build_result = await builder.build(
+            initial_items,
+            summary_fn=analyst.summarize,
+            prompt_token_estimator=analyst.estimate_static_prompt_tokens,
+            prompt_token_budget=int(config.analyst.max_prompt_tokens or hierarchy_config.summary_budget.analyst_prompt_token_budget),
+            max_levels=config.max_levels,
+        )
         analyst.save_prompt_token_report(out / "analysis" / "cluster_prompt_token_report.json")
         state = build_result.state
         processed_count = 0
@@ -365,8 +378,8 @@ async def _embed_records_for_build(
     )
     chunk_config = ChunkedEmbeddingConfig(
         tokenizer_model=str(tokenizer_model),
-        chunk_tokens=int(payload.get("chunk_tokens", 10000)),
-        overlap_tokens=int(payload.get("overlap_tokens", 2000)),
+        chunk_tokens=int(payload.get("chunk_tokens", ChunkedEmbeddingConfig.chunk_tokens)),
+        overlap_tokens=int(payload.get("overlap_tokens", ChunkedEmbeddingConfig.overlap_tokens)),
         pooling=str(payload.get("pooling", "mean")),
         add_special_tokens=bool(payload.get("add_special_tokens", False)),
         normalize_after_pooling=bool(payload.get("normalize_after_pooling", False)),
