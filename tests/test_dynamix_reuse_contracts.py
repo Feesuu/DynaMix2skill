@@ -1190,6 +1190,32 @@ def test_budget_refinement_falls_back_to_token_packing_when_gmm_cannot_split():
     assert "singleton_budget" not in router
 
 
+def test_static_tree_build_stops_before_gmm_when_effective_kmax_is_one():
+    from dynamix_core.tree_builder import ProjectedGmmTreeBuilder
+
+    cfg = default_hierarchy_config({
+        "gmm_bic": {"min_split_size": 2, "min_effective_samples_per_component": 2},
+    })
+    items = [
+        ExperienceItem(item_id="a", level=0, kind=ITEM_KIND_TRAJECTORY, text="a", embedding=[1.0, 0.0]),
+        ExperienceItem(item_id="b", level=0, kind=ITEM_KIND_TRAJECTORY, text="b", embedding=[0.0, 1.0]),
+    ]
+
+    async def summarize(*args, **kwargs):
+        raise AssertionError("BIC selected one cluster; summary_fn should not run")
+
+    async def run_build():
+        return await asyncio.wait_for(
+            ProjectedGmmTreeBuilder(cfg).build(items, summary_fn=summarize, max_levels=1),
+            timeout=1.0,
+        )
+
+    result = asyncio.run(run_build())
+    assert len(result.layers) == 1
+    assert result.layers[0].clustering.stop_reason == "bic_selected_one"
+    assert result.layers[0].committed is False
+
+
 def test_budget_refinement_uses_static_prompt_token_estimator_before_analyst():
     from dynamix_core.tree_builder import ProjectedGmmTreeBuilder
 
@@ -1336,6 +1362,64 @@ def test_static_pipeline_passes_explicit_analyst_prompt_budget_to_builder(tmp_pa
     assert captured["hierarchy_budget"] == 80
     assert captured["prompt_token_budget"] == 40
     assert captured["has_prompt_token_estimator"] is True
+
+
+def test_static_pipeline_writes_empty_nodebank_when_no_cards_are_exportable(tmp_path, monkeypatch):
+    import dynamix_trace2skill.pipeline as pipeline
+
+    class FakeState:
+        async def to_dict(self, *, include_embeddings=False, validate=True):
+            return {
+                "items": {
+                    "t0": {
+                        "item_id": "t0",
+                        "kind": ITEM_KIND_TRAJECTORY,
+                        "level": 0,
+                        "text": "trace",
+                        "embedding": None,
+                        "metadata": {},
+                    },
+                },
+                "communities": {},
+            }
+
+    class FakeBuilder:
+        def __init__(self, hierarchy_config):
+            pass
+
+        async def build(self, items, **kwargs):
+            return SimpleNamespace(state=FakeState(), layers=[])
+
+    async def fake_embed_records_for_build(*, records, embedding_client, config, out):
+        return ["embedding text"], [[1.0, 0.0]]
+
+    record = RawTrajectoryRecord(trajectory_id="t0", task_id="task0", trial_index=0, instruction="Do it")
+    monkeypatch.setattr(pipeline, "_load_records_for_protocol", lambda config, out: [record])
+    monkeypatch.setattr(pipeline, "_embed_records_for_build", fake_embed_records_for_build)
+    monkeypatch.setattr(pipeline, "_records_to_items", lambda records, texts, embeddings, *, config: (
+        [ExperienceItem(item_id="t0", level=0, kind=ITEM_KIND_TRAJECTORY, text="trace", embedding=[1.0, 0.0], metadata={"analysis_token_count": 10})],
+        [],
+    ))
+    monkeypatch.setattr(pipeline, "ProjectedGmmTreeBuilder", FakeBuilder)
+    monkeypatch.setattr(pipeline, "_refresh_skillbank_index", lambda skillbank_root, config: pytest.fail("empty nodebank should not be indexed"))
+
+    config = DynaMixRunConfig(
+        output_dir=str(tmp_path / "out"),
+        records_path=str(tmp_path / "records.json"),
+        generation=GenerationConfig(base_url="mock://chat"),
+        embedding=EmbeddingConfig(base_url="mock://embedding", cache_path=str(tmp_path / "cache.sqlite")),
+        analyst=ClusterAnalystConfig(max_prompt_tokens=40),
+    )
+
+    summary = asyncio.run(pipeline.build_tree_from_records(config))
+
+    assert summary["node_count"] == 0
+    assert summary["skillbank_index"] == ""
+    assert summary["empty_nodebank_reason"] == "no_exportable_experience_cards"
+    manifest = json.loads((tmp_path / "out" / "skills" / "node_bank_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["node_count"] == 0
+    assert manifest["nodes"] == []
+    assert manifest["empty_reason"] == "no_exportable_experience_cards"
 
 
 def test_budget_refinement_excludes_only_true_oversize_singleton_after_fallback():
@@ -1606,6 +1690,9 @@ def test_cluster_prompt_uses_minimal_experience_schema():
     member = ExperienceItem(item_id="t0", level=0, kind=ITEM_KIND_TRAJECTORY, text="trace", embedding=[1.0], metadata={"analysis_bundle": "bundle"})
     payload = json.loads(analyst._build_prompt(community, [member], "raw_extractor"))
     schema = payload["output_schema"]
+    assert "task_profile" not in payload
+    assert "officeqa_experience_policy" not in payload
+    assert "template_user_prompt_adaptation" in payload
     assert set(schema) == {"cards"}
     card_schema = schema["cards"][0]
     assert set(card_schema) == {"name", "trigger", "content", "placement", "confidence"}

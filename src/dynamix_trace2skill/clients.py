@@ -43,6 +43,7 @@ class EmbeddingConfig:
     base_url: str = "mock://deterministic"
     model: str = "Qwen3-Embedding-8B"
     api_key: str = "EMPTY"
+    api_key_env_var: str | None = None
     # Official handoff runs use the Qwen3-Embedding-8B service with a 32k input
     # window. Long trajectories are chunked upstream before this guard is hit.
     max_model_len: int = 32000
@@ -59,6 +60,12 @@ class EmbeddingConfig:
     @property
     def effective_max_input_tokens(self) -> int:
         return int(self.max_input_tokens or self.max_model_len)
+
+    @property
+    def resolved_api_key(self) -> str:
+        if self.api_key_env_var:
+            return os.environ.get(self.api_key_env_var, self.api_key or "EMPTY")
+        return self.api_key or "EMPTY"
 
 
 class GenerationClient:
@@ -394,7 +401,7 @@ class EmbeddingClient:
         payload = {
             "base_url": self.config.base_url,
             "model": model_name,
-            "api_key": _api_key_fingerprint(self.config.api_key),
+            "api_key": _api_key_fingerprint(self.config.resolved_api_key),
             "max_model_len": int(self.config.max_model_len),
             "max_input_tokens": int(self.config.effective_max_input_tokens),
             "truncate_long_texts": bool(self.config.truncate_long_texts),
@@ -472,7 +479,7 @@ class EmbeddingClient:
             from openai import OpenAI
         except ImportError:
             from .openai_compat import OpenAI
-        client = OpenAI(api_key=self.config.api_key, base_url=self.config.base_url)
+        client = OpenAI(api_key=self.config.resolved_api_key, base_url=self.config.base_url)
         response = client.embeddings.create(model=model_name, input=texts)
         _append_usage_record(
             "DYNAMIX_EMBEDDING_USAGE_LOG",

@@ -103,12 +103,24 @@ class SkillBankSelector:
         model: str = "Qwen3-Embedding-8B",
         api_key: str = "EMPTY",
         cache_path: str | Path | None = None,
+        max_model_len: int = 32000,
+        max_input_tokens: int | None = 32000,
+        batch_size: int = 8,
+        tokenizer_model: str | None = None,
+        chunk_tokens: int | None = None,
+        chunk_overlap_tokens: int | None = None,
     ):
         self.skillbank_root = Path(skillbank_root)
         self.base_url = base_url
         self.model = model
         self.api_key = api_key
         self.cache_path = Path(cache_path) if cache_path else self.skillbank_root / ".dynamix_skillbank_index.json"
+        self.max_model_len = int(max_model_len)
+        self.max_input_tokens = int(max_input_tokens or max_model_len)
+        self.batch_size = max(1, int(batch_size or 1))
+        self.tokenizer_model = tokenizer_model or ""
+        self.chunk_tokens = int(chunk_tokens) if chunk_tokens is not None else None
+        self.chunk_overlap_tokens = int(chunk_overlap_tokens) if chunk_overlap_tokens is not None else None
         self._docs: list[SkillNodeDocument] | None = None
         self._embeddings: np.ndarray | None = None
 
@@ -123,6 +135,12 @@ class SkillBankSelector:
             model=os.environ.get("DYNAMIX_SKILLBANK_EMBED_MODEL", os.environ.get("EMBED_MODEL", "Qwen3-Embedding-8B")),
             api_key=os.environ.get("DYNAMIX_SKILLBANK_EMBED_API_KEY", os.environ.get("OPENAI_API_KEY", "EMPTY")),
             cache_path=os.environ.get("DYNAMIX_SKILLBANK_CACHE_PATH") or None,
+            max_model_len=int(os.environ.get("DYNAMIX_SKILLBANK_EMBED_MAX_MODEL_LEN", "32000")),
+            max_input_tokens=int(os.environ.get("DYNAMIX_SKILLBANK_EMBED_MAX_INPUT_TOKENS", "32000")),
+            batch_size=int(os.environ.get("DYNAMIX_SKILLBANK_EMBED_BATCH_SIZE", "8")),
+            tokenizer_model=os.environ.get("DYNAMIX_SKILLBANK_EMBED_TOKENIZER") or None,
+            chunk_tokens=int(os.environ["DYNAMIX_SKILLBANK_CHUNK_TOKENS"]) if os.environ.get("DYNAMIX_SKILLBANK_CHUNK_TOKENS") else None,
+            chunk_overlap_tokens=int(os.environ["DYNAMIX_SKILLBANK_CHUNK_OVERLAP_TOKENS"]) if os.environ.get("DYNAMIX_SKILLBANK_CHUNK_OVERLAP_TOKENS") else None,
         )
 
     def select(self, query_text: str, *, top_k: int = 3) -> list[SkillSelection]:
@@ -145,6 +163,7 @@ class SkillBankSelector:
                     payload.get("model") == self.model
                     and payload.get("base_url") == self.base_url
                     and payload.get("api_key_fingerprint") == _api_key_fingerprint(self.api_key)
+                    and payload.get("embedding_protocol") == self._embedding_protocol_payload()
                     and payload.get("document_hashes") == expected
                 ):
                     self._docs = [SkillNodeDocument(**item) for item in payload["documents"]]
@@ -162,6 +181,7 @@ class SkillBankSelector:
             "model": self.model,
             "base_url": self.base_url,
             "api_key_fingerprint": _api_key_fingerprint(self.api_key),
+            "embedding_protocol": self._embedding_protocol_payload(),
             "document_hashes": expected,
             "documents": [asdict(doc) for doc in docs],
             "embeddings": embeddings.tolist(),
@@ -176,21 +196,39 @@ class SkillBankSelector:
             return [_deterministic_embedding(text) for text in texts]
         client_cls = OpenAI or CompatOpenAI
         client = client_cls(api_key=self.api_key, base_url=self.base_url, timeout=600)
-        response = client.embeddings.create(model=self.model, input=texts)
-        _append_usage_record(
-            "DYNAMIX_SKILLBANK_USAGE_LOG",
-            {
-                "component": "dynamix_skillbank_embedding",
-                "client": "openai_embeddings",
-                "model": self.model,
-                "endpoint": self.base_url,
-                "cache_hit": False,
-                "usage": _response_usage_payload(response),
-                "request": {"input_count": len(texts)},
-                "timestamp": _utc_timestamp(),
-            },
-        )
-        return [list(item.embedding) for item in response.data]
+        embeddings: list[list[float]] = []
+        for offset in range(0, len(texts), self.batch_size):
+            batch = texts[offset: offset + self.batch_size]
+            response = client.embeddings.create(model=self.model, input=batch)
+            _append_usage_record(
+                "DYNAMIX_SKILLBANK_USAGE_LOG",
+                {
+                    "component": "dynamix_skillbank_embedding",
+                    "client": "openai_embeddings",
+                    "model": self.model,
+                    "endpoint": self.base_url,
+                    "cache_hit": False,
+                    "usage": _response_usage_payload(response),
+                    "request": {
+                        "input_count": len(batch),
+                        "batch_size": self.batch_size,
+                        "embedding_protocol": self._embedding_protocol_payload(),
+                    },
+                    "timestamp": _utc_timestamp(),
+                },
+            )
+            embeddings.extend(list(item.embedding) for item in response.data)
+        return embeddings
+
+    def _embedding_protocol_payload(self) -> dict[str, object]:
+        return {
+            "max_model_len": self.max_model_len,
+            "max_input_tokens": self.max_input_tokens,
+            "batch_size": self.batch_size,
+            "tokenizer_model": self.tokenizer_model,
+            "chunk_tokens": self.chunk_tokens,
+            "chunk_overlap_tokens": self.chunk_overlap_tokens,
+        }
 
 
 def selected_experience_to_system_content(selections: Iterable[SkillSelection]) -> str:

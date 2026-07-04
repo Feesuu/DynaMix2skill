@@ -250,6 +250,14 @@ class ProjectedGmmTreeBuilder:
         if n_items < self.config.gmm_bic.min_split_size and not budget_refinement_enabled:
             return _stopped(level, input_ids, "too_small")
 
+        effective_kmax = compute_kmax(
+            n_items,
+            self.config.gmm_bic,
+            kmax_effective_n=float(n_items),
+        )
+        if effective_kmax <= 1 and not budget_refinement_enabled:
+            return _stopped(level, input_ids, "bic_selected_one")
+
         if n_items < self.config.gmm_bic.min_split_size and budget_refinement_enabled:
             success_count, failure_count, outcome_mode = _outcome_counts(ordered)
             coarse = ExperienceCommunity(

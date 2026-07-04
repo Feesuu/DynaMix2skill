@@ -11,7 +11,7 @@ from typing import Any
 
 from dynamix_core import GmmBicConfig, ProjectedGmmDynamicTreeConfig, ProjectionConfig, SoftMembershipConfig, SummaryBudgetConfig
 from dynamix_core.data_structures import ExperienceCommunity, ExperienceHierarchyState, ExperienceItem, ExperienceLayer, ITEM_KIND_TRAJECTORY
-from dynamix_core.skill_export import SkillExportConfig, export_skill_files
+from dynamix_core.skill_export import SkillExportConfig, SkillExportResult, export_skill_files
 from dynamix_core.tree_builder import ProjectedGmmTreeBuilder
 from dynamix_core.update import ExperienceHierarchyDynamicUpdater
 
@@ -160,8 +160,16 @@ async def build_tree_from_records(config: DynaMixRunConfig) -> dict[str, Any]:
     layers_payload = _layers_payload(result.layers)
     (out / "hierarchy_layers.json").write_text(json.dumps(layers_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    skill_result = await export_skill_files(result.state, out, config=SkillExportConfig(output_dir_name=config.skill_output_dir_name))
-    skillbank_index = _refresh_skillbank_index(skill_result.output_dir, config)
+    try:
+        skill_result = await export_skill_files(result.state, out, config=SkillExportConfig(output_dir_name=config.skill_output_dir_name))
+        skillbank_index = _refresh_skillbank_index(skill_result.output_dir, config)
+        empty_nodebank_reason = ""
+    except ValueError as exc:
+        if "no exportable ExperienceCard nodes" not in str(exc):
+            raise
+        skill_result = _write_empty_skillbank(out, config, reason="no_exportable_experience_cards")
+        skillbank_index = ""
+        empty_nodebank_reason = "no_exportable_experience_cards"
     summary = {
         "scenario": "static_build",
         "record_count": len(records),
@@ -172,6 +180,7 @@ async def build_tree_from_records(config: DynaMixRunConfig) -> dict[str, Any]:
         "node_bank_dir": skill_result.output_dir,
         "node_bank_manifest": skill_result.manifest_path,
         "skillbank_index": skillbank_index,
+        "empty_nodebank_reason": empty_nodebank_reason,
         "embedding_truncation_events": len(embedding_client.truncation_events),
         "layers": layers_payload,
     }
@@ -402,6 +411,39 @@ async def _embed_records_for_build(
     )
     return result.embedding_texts, result.embeddings
 
+
+def _write_empty_skillbank(out: Path, config: DynaMixRunConfig, *, reason: str) -> SkillExportResult:
+    bank_dir = out / config.skill_output_dir_name
+    bank_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "format": "dynamix_node_skill_bank_v1",
+        "export_policy": {
+            "retrieval_unit": "experience_card_node",
+            "required_node_schema": ["name", "trigger", "content", "confidence"],
+            "embedding_fields": ["name", "trigger", "content"],
+            "strict_minimal_schema": True,
+            "node_order": "descending_support_mass_then_descending_level_then_item_id",
+            "trajectory_items_exported": False,
+            "diagnostic_oversize_nodes_exported": False,
+            "skill_md_files_generated": False,
+            "heldout_retrieval": "dense_top_k_nodes",
+        },
+        "output_dir": str(bank_dir),
+        "node_count": 0,
+        "empty_reason": str(reason),
+        "nodes": [],
+        "item_to_node_ids": {},
+    }
+    manifest_path = bank_dir / "node_bank_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return SkillExportResult(
+        output_dir=str(bank_dir),
+        manifest_path=str(manifest_path),
+        node_count=0,
+        nodes=[],
+    )
+
+
 def _refresh_skillbank_index(skillbank_root: str | Path, config: DynaMixRunConfig) -> str:
     """Build or refresh the nodebank embedding index after every export.
 
@@ -410,12 +452,20 @@ def _refresh_skillbank_index(skillbank_root: str | Path, config: DynaMixRunConfi
     """
     root = Path(skillbank_root)
     index_path = root / ".dynamix_skillbank_index.json"
+    chunked_payload = dict(config.chunked_embedding or {})
+    chunked_enabled = bool(chunked_payload.get("enabled", False))
     selector = SkillBankSelector(
         skillbank_root=root,
         base_url=config.embedding.base_url,
         model=config.embedding.model,
-        api_key=config.embedding.api_key,
+        api_key=config.embedding.resolved_api_key,
         cache_path=index_path,
+        max_model_len=config.embedding.max_model_len,
+        max_input_tokens=config.embedding.effective_max_input_tokens,
+        batch_size=config.embedding.batch_size,
+        tokenizer_model=config.embedding.tokenizer_model,
+        chunk_tokens=int(chunked_payload["chunk_tokens"]) if chunked_enabled and chunked_payload.get("chunk_tokens") is not None else None,
+        chunk_overlap_tokens=int(chunked_payload["overlap_tokens"]) if chunked_enabled and chunked_payload.get("overlap_tokens") is not None else None,
     )
     selector._load_or_build_index()
     return str(index_path)
@@ -525,7 +575,10 @@ def _order_records_by_dataset_slice(
 def _records_to_items(records: list[RawTrajectoryRecord], embedding_texts: list[str], embeddings: list[list[float]], *, config: DynaMixRunConfig) -> tuple[list[ExperienceItem], list[dict[str, Any]]]:
     items = []
     normalized = []
-    tokenizer = get_tokenizer(config.analyst.tokenizer_model or config.embedding.tokenizer_model or config.embedding.model, allow_regex_fallback=config.analyst.allow_regex_tokenizer_fallback)
+    tokenizer_model = config.analyst.tokenizer_model
+    if tokenizer_model is None and not config.analyst.allow_regex_tokenizer_fallback:
+        tokenizer_model = config.embedding.tokenizer_model or config.embedding.model
+    tokenizer = get_tokenizer(tokenizer_model, allow_regex_fallback=config.analyst.allow_regex_tokenizer_fallback)
     per_member_overhead = 128
     for record, text, embedding in zip(records, embedding_texts, embeddings):
         analysis_bundle = render_analysis_bundle_text(record)

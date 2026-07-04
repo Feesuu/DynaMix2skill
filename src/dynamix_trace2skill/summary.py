@@ -108,6 +108,7 @@ class ClusterAnalystConfig:
     max_cards_higher: int = 1
     higher_level_mode: str = "single_abstraction"
     truncate_higher_level_extra_cards: bool = True
+    task_profile: str = "spreadsheetbench"
 
 
 class ClusterAnalyst:
@@ -132,6 +133,9 @@ class ClusterAnalyst:
     @staticmethod
     def _analyst_extra_body() -> dict[str, Any]:
         return {"chat_template_kwargs": {"enable_thinking": True}}
+
+    def _task_profile(self) -> str:
+        return str(self.config.task_profile or "spreadsheetbench").strip().lower()
 
     async def summarize(self, community: ExperienceCommunity, members: Sequence[ExperienceItem], clustering: Any | None = None) -> list[ExperienceItem]:
         if _is_diagnostic_community(community):
@@ -474,6 +478,46 @@ class ClusterAnalyst:
 - Your job is abstraction, not further extraction: identify the shared higher-level principle behind the lower-level cards.
 - Return exactly one card. Do not split the cluster into multiple cards.
 - If the community is somewhat mixed, write the broadest valid abstraction and lower the confidence instead of producing multiple cards."""
+        if self._task_profile() == "officeqa":
+            return f"""# Role
+You are an expert OfficeQA trajectory analyst for evidence-grounded document question answering tasks.
+
+# Mission
+{mission}
+
+# OfficeQA target-agent setting
+The target agent answers document-based questions using only evidence available in its task context and trajectory observations. The final answer must be grounded in observed document evidence and follow the benchmark's required answer format.
+
+# Trajectory evidence discipline
+- Ground every card in observable trajectory behavior, actions, observations, and final answer behavior.
+- For successful members, distill the lean solution path and keep only steps that materially led to the answer.
+- For failed members, identify causal failure mechanisms and reusable prevention lessons; do not guess beyond the log.
+- Some members may include train-only predicted_answer, ground_truth, fail_reason, verifier/evaluator details, or reward audit fields. These are private diagnostic inputs. Use them only to infer the error category internally.
+- The ExperienceCard output is public reusable guidance for future heldout tasks. It must not contain private diagnostic inputs, exact train answers, predicted answers, gold answers, fail_reason labels, verifier/evaluator field names, or task-specific literals copied from members.
+- If a useful lesson depends on a private diagnostic value, replace the value with an abstract placeholder such as <computed_value>, <expected_value>, <requested_precision>, <source_period>, <target_period>, <unit>, or <metric>.
+
+# OfficeQA reusable experience focus
+- Extract reusable lessons about evidence selection, document-structure interpretation, operand tracking, period/basis/unit handling, numeric reasoning, and final answer formatting.
+- Prefer general OfficeQA behaviors: identify the requested entity, measure, period, and output format; verify that the evidence span matches the question constraints; track each operand's period, basis, unit, and semantic role; and check the final answer against the requested format.
+- Do not produce generic cards that merely restate base agent rules such as using available actions, avoiding hallucination, verifying evidence, or returning a final answer. Those belong in the target agent system prompt.
+- Do not mention specific tool names, exact document names, absolute paths, page identifiers, dataset source names, or implementation details. If such details matter, translate them into tool-agnostic evidence-access or document-navigation behavior.
+- Do not hardcode task-specific answers, files, years, page numbers, or labels as reusable guidance.
+- Do not use concrete numeric examples copied from input members. Avoid exact percentages, exact decimals, exact answer strings, exact bracketed values, exact years, or exact vectors from trajectories. Use symbolic wording or placeholders instead, such as <computed_value>, <expected_value>, <requested_precision>, <source_period>, <target_period>, <unit>, or <metric>.
+
+# Cluster-level rewrite
+{rewrite_policy}
+- Do not claim root causes are externally verified. State only lessons supported by trajectory evidence.
+
+# Minimal output schema
+Return one JSON object with a top-level cards list. For higher-level abstraction mode, that list must contain exactly one card. Each card must contain only these fields:
+- name: short name of the OfficeQA experience.
+- trigger: when a future OfficeQA document question should use this experience.
+- content: the concrete reusable OfficeQA guidance. This is the main body.
+- placement: where this experience should be exported. Include target and reference_kind.
+- confidence: float in (0, 1].
+
+Do not output support_mass. Do not output extra structured fields such as shared_patterns, success_motifs, anti_patterns, or patch_hints. Put the useful guidance in content. Do not duplicate semantically identical cards.
+"""
         return f"""# Role
 You are an expert Trace2Skill-style AI agent trajectory analyst for spreadsheet manipulation tasks.
 
@@ -527,6 +571,41 @@ Every updates[].item_id must be copied exactly from previous_generated_experienc
             output_policy = """Return one JSON object with exactly these top-level fields:
 - updates: a list of revised existing cards. Each update must include item_id and may only use an item_id from previous_generated_experiences.
 - new_cards: a list of newly discovered independent cards. New cards must not include item_id."""
+        if self._task_profile() == "officeqa":
+            return f"""
+# Role
+You are an expert OfficeQA trajectory analyst for evidence-grounded document question answering tasks.
+
+# Mission
+{mission}
+
+# OfficeQA target-agent setting
+The target agent answers document-based questions using only evidence available in its task context and trajectory observations. The final answer must be grounded in observed document evidence and follow the benchmark's required answer format.
+
+# Trajectory evidence discipline
+- Ground every update/new card in observable trajectory behavior, actions, observations, and final answer behavior.
+- For successful members, preserve the lean solution path and keep only steps that materially led to the answer.
+- For failed members, identify causal failure mechanisms and reusable prevention lessons; do not guess beyond the log.
+- Some members may include train-only predicted_answer, ground_truth, fail_reason, verifier/evaluator details, or reward audit fields. These are private diagnostic inputs. Use them only to infer the error category internally.
+- The ExperienceCard output is public reusable guidance for future heldout tasks. It must not contain private diagnostic inputs, exact train answers, predicted answers, gold answers, fail_reason labels, verifier/evaluator field names, or task-specific literals copied from members.
+- If a useful lesson depends on a private diagnostic value, replace the value with an abstract placeholder such as <computed_value>, <expected_value>, <requested_precision>, <source_period>, <target_period>, <unit>, or <metric>.
+
+# Dynamic OfficeQA rewrite
+{rewrite_policy}
+- Preserve or add only OfficeQA-specific reusable lessons about evidence selection, document-structure interpretation, operand tracking, period/basis/unit handling, numeric reasoning, and final answer formatting.
+- Do not create/update cards that merely repeat base agent rules such as using available actions, avoiding hallucination, verifying evidence, or returning a final answer.
+- Do not mention specific tool names, exact document names, absolute paths, page identifiers, dataset source names, or implementation details. If such details matter, translate them into tool-agnostic evidence-access or document-navigation behavior.
+- Do not use concrete numeric examples copied from input members. Avoid exact percentages, exact decimals, exact answer strings, exact bracketed values, exact years, or exact vectors from trajectories. Use symbolic wording or placeholders instead, such as <computed_value>, <expected_value>, <requested_precision>, <source_period>, <target_period>, <unit>, or <metric>.
+- Do not claim root causes are externally verified. State only lessons supported by trajectory evidence.
+
+# Dynamic output schema
+{output_policy}
+
+Do not match cards by list position. Do not overwrite an old card just because a revised card was generated.
+Use updates only when you are revising the same reusable experience already represented by that exact old item_id.
+Omit unchanged old cards. Do not delete old cards. Do not output support_mass.
+Return valid JSON only.
+"""
         return f"""
 # Role
 You are an expert Trace2Skill-style AI agent trajectory analyst for spreadsheet manipulation tasks.
@@ -685,6 +764,7 @@ Return valid JSON only.
         }
 
     def _build_prompt(self, community: ExperienceCommunity, members: Sequence[ExperienceItem], analyst_mode: str) -> str:
+        filename_label = "local document filenames" if self._task_profile() == "officeqa" else "xlsx filenames"
         member_payloads = []
         for item in members:
             member_payloads.append({
@@ -693,24 +773,19 @@ Return valid JSON only.
                 "success": item.metadata.get("success"),
                 "analysis_bundle": item.metadata.get("analysis_bundle", item.text),
             })
-        return json.dumps({
-            "instruction": _mode_instruction(analyst_mode),
+        payload: dict[str, Any] = {
+            "instruction": _mode_instruction(analyst_mode, self._task_profile()),
             "analyst_mode": analyst_mode,
             "cardinality_policy": {
                 "raw_extractor": "L0 raw trajectory communities may return one or more cards.",
                 "experience_abstractor": "L1+ ExperienceCard communities must return exactly one higher-level card.",
-            },
-            "template_user_prompt_adaptation": {
-                "success_user_template": self._templates.get("success_user_llm", ""),
-                "error_user_template": self._templates.get("error_user_llm", ""),
-                "replace_agent_log_with": "cluster_member_analysis_bundles",
             },
             "hard_constraints": [
                 "Use all provided members. Do not ignore later members or silently truncate the cluster.",
                 "Do not output support_mass.",
                 "Return a top-level cards list. Do not output fields except cards and each card's name, trigger, content, placement, confidence.",
                 "Do not output file_slug or rationale; filenames are assigned automatically by the exporter.",
-                "Do not copy absolute paths, output_path, xlsx filenames, raw long code blocks, XML/tool tags, or debug logs into reusable guidance.",
+                f"Do not copy absolute paths, output_path, {filename_label}, raw long code blocks, XML/tool tags, or debug logs into reusable guidance.",
                 "Never mention ground truth, gold answers, hidden labels, or verifier internals as something the target agent can access.",
                 "Return valid JSON only.",
             ],
@@ -736,7 +811,47 @@ Return valid JSON only.
                 "Use target=script only when content is a complete deterministic helper script; otherwise use reference.",
                 "Do not put raw trajectory text, local paths, output paths, or ground-truth-specific content into any placement."
             ]
-        }, ensure_ascii=False, indent=2)
+        }
+        if self._task_profile() == "officeqa":
+            payload["task_profile"] = "officeqa"
+            payload["hard_constraints"].extend([
+                "Treat predicted_answer, ground_truth, fail_reason, verifier/evaluator fields, and reward audit fields as private diagnostics only.",
+                "Do not copy or paraphrase exact train answers, predicted answers, gold answers, diagnostic labels, exact percentages, exact decimals, exact years, exact bracketed values, or exact vectors into name, trigger, content, or placement.",
+                "Use symbolic placeholders such as <computed_value>, <expected_value>, <requested_precision>, <source_period>, <target_period>, <unit>, or <metric> instead of concrete diagnostic values.",
+            ])
+            payload["officeqa_experience_policy"] = {
+                "target_agent_context": "OfficeQA evidence-grounded document question answering with task-provided document context and trajectory observations.",
+                "train_diagnostic_use": (
+                    "Members may include private train-only diagnostic fields such as predicted_answer, ground_truth, fail_reason, "
+                    "verifier/evaluator details, or reward audit fields. Use them only to classify root causes internally. "
+                    "The output card must be sanitized public guidance and must not quote, paraphrase, or expose exact train "
+                    "diagnostic values, labels, answer literals, or concrete numeric examples copied from members. Use symbolic "
+                    "placeholders such as <computed_value>, <expected_value>, <requested_precision>, <source_period>, "
+                    "<target_period>, <unit>, or <metric> when a value is needed."
+                ),
+                "high_value_lessons": [
+                    "task decomposition into requested entity, measure, period, and output format",
+                    "evidence-span verification against the question constraints before numeric reasoning",
+                    "operand ledger with period, basis, unit, and semantic role",
+                    "document-structure alignment, subtotal/category inclusion, and exclusion criteria",
+                    "numeric reasoning checks such as sign, absolute value, aggregation, rounding, and unit preservation",
+                    "final answer formatting discipline when it changes correctness",
+                ],
+                "avoid_low_value_lessons": [
+                    "generic advice to use available actions",
+                    "generic advice to verify evidence",
+                    "generic advice to avoid hallucination",
+                    "generic advice to return a final answer",
+                    "tool-specific, file-specific, page-specific, or dataset-source-specific guidance",
+                ],
+            }
+        else:
+            payload["template_user_prompt_adaptation"] = {
+                "success_user_template": self._templates.get("success_user_llm", ""),
+                "error_user_template": self._templates.get("error_user_llm", ""),
+                "replace_agent_log_with": "cluster_member_analysis_bundles",
+            }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
 
     def _build_dynamic_update_prompt(
         self,
@@ -745,6 +860,7 @@ Return valid JSON only.
         previous_generated_experiences: Sequence[dict[str, Any]],
         analyst_mode: str,
     ) -> str:
+        filename_label = "local document filenames" if self._task_profile() == "officeqa" else "xlsx filenames"
         member_payloads = []
         for item in members:
             member_payloads.append({
@@ -779,7 +895,7 @@ Return valid JSON only.
                 "Every updates[].item_id must be copied exactly from previous_generated_experiences.",
                 "Return a top-level JSON object with only updates.",
                 "Each update must contain item_id, name, trigger, content, placement, confidence.",
-                "Do not copy absolute paths, output_path, xlsx filenames, raw long code blocks, XML/tool tags, or debug logs into reusable guidance.",
+                f"Do not copy absolute paths, output_path, {filename_label}, raw long code blocks, XML/tool tags, or debug logs into reusable guidance.",
                 "Never mention ground truth, gold answers, hidden labels, or verifier internals as something the target agent can access.",
                 "Return valid JSON only.",
             ]
@@ -801,18 +917,39 @@ Return valid JSON only.
                 "Every updates[].item_id must be copied exactly from previous_generated_experiences.",
                 "Return a top-level JSON object with only updates and new_cards.",
                 "Each updated or new card must contain name, trigger, content, placement, confidence.",
-                "Do not copy absolute paths, output_path, xlsx filenames, raw long code blocks, XML/tool tags, or debug logs into reusable guidance.",
+                f"Do not copy absolute paths, output_path, {filename_label}, raw long code blocks, XML/tool tags, or debug logs into reusable guidance.",
                 "Never mention ground truth, gold answers, hidden labels, or verifier internals as something the target agent can access.",
                 "Return valid JSON only.",
             ]
-        return json.dumps({
+        if self._task_profile() == "officeqa":
+            output_scope = "updates" if higher_level else "updates or new_cards"
+            hard_constraints.extend([
+                "Treat predicted_answer, ground_truth, fail_reason, verifier/evaluator fields, and reward audit fields as private diagnostics only.",
+                f"Do not copy or paraphrase exact train answers, predicted answers, gold answers, diagnostic labels, exact percentages, exact decimals, exact years, exact bracketed values, or exact vectors into {output_scope}.",
+                "Use symbolic placeholders such as <computed_value>, <expected_value>, <requested_precision>, <source_period>, <target_period>, <unit>, or <metric> instead of concrete diagnostic values.",
+            ])
+        payload: dict[str, Any] = {
             "instruction": instruction,
             "analyst_mode": analyst_mode,
             "dynamic_patch_policy": dynamic_patch_policy,
             "hard_constraints": hard_constraints,
             "members": member_payloads,
             "previous_generated_experiences": previous_payloads,
-        }, ensure_ascii=False, indent=2)
+        }
+        if self._task_profile() == "officeqa":
+            payload["task_profile"] = "officeqa"
+            payload["officeqa_experience_policy"] = {
+                "target_agent_context": "OfficeQA evidence-grounded document question answering with task-provided document context and trajectory observations.",
+                "update_only_when": "The updated evidence changes a reusable OfficeQA evidence-selection, document-structure interpretation, operand-tracking, numeric-reasoning, or answer-formatting lesson.",
+                "avoid_low_value_lessons": [
+                    "generic advice to use available actions",
+                    "generic advice to verify evidence",
+                    "generic advice to avoid hallucination",
+                    "generic advice to return a final answer",
+                    "tool-specific, file-specific, page-specific, or dataset-source-specific guidance",
+                ],
+            }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 
@@ -828,7 +965,20 @@ def _infer_analyst_mode(community: ExperienceCommunity, members: Sequence[Experi
     return "experience_abstractor"
 
 
-def _mode_instruction(analyst_mode: str) -> str:
+def _mode_instruction(analyst_mode: str, task_profile: str | None = None) -> str:
+    task_profile = str(task_profile or "spreadsheetbench").strip().lower()
+    if task_profile == "officeqa":
+        if analyst_mode == "raw_extractor":
+            return (
+                "Analyze this raw OfficeQA trajectory cluster once and produce one or more reusable ExperienceCards. "
+                "Each card should capture one distinct reusable document-question-answering lesson supported by the raw trajectories. "
+                "Follow the trajectory evidence discipline inherited in the system prompt, but output the minimal cards-list schema only."
+            )
+        return (
+            "Analyze this cluster of lower-level OfficeQA ExperienceCards once and produce exactly one higher-level ExperienceCard. "
+            "Do not split the cluster into multiple cards. Your task is to identify the shared higher-level principle behind the lower-level cards. "
+            "Follow the trajectory evidence discipline inherited in the system prompt, but output the minimal cards-list schema only."
+        )
     if analyst_mode == "raw_extractor":
         return (
             "Analyze this raw trajectory cluster once and produce one or more reusable ExperienceCards. "
