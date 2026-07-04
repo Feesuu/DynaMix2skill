@@ -898,6 +898,7 @@ def main() -> None:
     parser.add_argument("--dynamic-max-propagation-rounds", type=int, default=16)
     parser.add_argument("--analyst-prompt-style", default="trace2skill_cluster_level_template_inheritance_v4")
     parser.add_argument("--analyst-confidence-floor", type=float, default=0.05)
+    parser.add_argument("--analyst-tokenizer", default="")
     parser.add_argument("--analyst-tokenizer-required", type=parse_bool, default=True)
     parser.add_argument("--analyst-allow-regex-tokenizer-fallback", type=parse_bool, default=False)
     parser.add_argument("--analyst-max-prompt-tokens", type=int, default=-1, help="-1 derives this from summary_max_model_tokens * budget_ratio")
@@ -908,6 +909,10 @@ def main() -> None:
     parser.add_argument("--analyst-max-cards-higher", type=int, default=1)
     parser.add_argument("--analyst-higher-level-mode", default="single_abstraction")
     parser.add_argument("--analyst-truncate-higher-level-extra-cards", type=parse_bool, default=True)
+    parser.add_argument("--analysis-bundle-max-chars", type=int, default=60000, help="0 disables compact analyst evidence bundles")
+    parser.add_argument("--analysis-bundle-max-steps", type=int, default=12)
+    parser.add_argument("--analysis-bundle-max-step-chars", type=int, default=6000)
+    parser.add_argument("--analysis-bundle-max-final-response-chars", type=int, default=12000)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
@@ -933,6 +938,17 @@ def main() -> None:
         parser.error("--rollout-shuffle-seed must be empty for this handoff protocol")
     if int(args.rollout_sample) != 0:
         parser.error("--rollout-sample is fixed to 0/full split for this handoff protocol")
+    if (
+        not str(args.openai_base_url or "").startswith("mock://")
+        and bool(args.analyst_tokenizer_required)
+        and not bool(args.analyst_allow_regex_tokenizer_fallback)
+        and not str(args.analyst_tokenizer or "").strip()
+    ):
+        parser.error(
+            "--analyst-tokenizer is required for real DynaMix tree builds when "
+            "--analyst-tokenizer-required=true and regex fallback is disabled. "
+            "Use the generation model tokenizer, not the embedding tokenizer."
+        )
 
     thinking = None if args.thinking == "null" else args.thinking == "true"
     python_executable = resolve_python_executable(args.python_executable)
@@ -1302,7 +1318,7 @@ def main() -> None:
         "analyst": {
             "prompt_style": args.analyst_prompt_style,
             "confidence_floor": float(args.analyst_confidence_floor),
-            "tokenizer_model": args.embedding_tokenizer,
+            "tokenizer_model": args.analyst_tokenizer or None,
             "tokenizer_required": bool(args.analyst_tokenizer_required),
             "allow_regex_tokenizer_fallback": bool(args.analyst_allow_regex_tokenizer_fallback),
             "max_prompt_tokens": None if int(args.analyst_max_prompt_tokens) <= 0 else int(args.analyst_max_prompt_tokens),
@@ -1313,6 +1329,10 @@ def main() -> None:
             "max_cards_higher": int(args.analyst_max_cards_higher),
             "higher_level_mode": args.analyst_higher_level_mode,
             "truncate_higher_level_extra_cards": bool(args.analyst_truncate_higher_level_extra_cards),
+            "analysis_bundle_max_chars": None if int(args.analysis_bundle_max_chars) <= 0 else int(args.analysis_bundle_max_chars),
+            "analysis_bundle_max_steps": int(args.analysis_bundle_max_steps),
+            "analysis_bundle_max_step_chars": int(args.analysis_bundle_max_step_chars),
+            "analysis_bundle_max_final_response_chars": int(args.analysis_bundle_max_final_response_chars),
         },
         "max_levels": int(args.max_levels),
         "skill_output_dir_name": args.skill_output_dir_name,

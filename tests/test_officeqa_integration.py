@@ -14,9 +14,9 @@ from dynamix_benchmarks.officeqa.reward import evaluate_official_audit, evaluate
 from dynamix_benchmarks.officeqa.rollout import OfficeQARolloutConfig, build_system_prompt, build_user_prompt, run_officeqa_batch
 from dynamix_benchmarks.officeqa.tools import build_oracle_parsed_pages_context, resolve_candidate_files, run_tool
 from dynamix_trace2skill.pipeline import DynaMixRunConfig, _prepare_analyst_tokenizer_config, _records_to_items, _refresh_skillbank_index
-from dynamix_trace2skill.schemas import RawTrajectoryRecord
+from dynamix_trace2skill.schemas import RawTrajectoryRecord, TrajectoryStep
 from dynamix_trace2skill.summary import ClusterAnalyst, ClusterAnalystConfig
-from dynamix_trace2skill.trace_views import render_analysis_bundle_text, render_embedding_trace
+from dynamix_trace2skill.trace_views import render_analysis_bundle_text, render_compact_analysis_bundle_text, render_embedding_trace
 from dynamix_core.data_structures import ExperienceCommunity, ExperienceItem, ITEM_KIND_EXPERIENCE_CARD, ITEM_KIND_TRAJECTORY
 
 
@@ -341,6 +341,63 @@ def test_officeqa_record_preserves_official_audit_for_train_diagnostics() -> Non
     assert "official_reward_error" not in bundle
 
 
+def test_compact_analysis_bundle_truncates_long_trace_but_keeps_diagnostics() -> None:
+    record = RawTrajectoryRecord(
+        trajectory_id="officeqa:UIDX",
+        task_id="UIDX",
+        trial_index=0,
+        instruction="What is the total?",
+        instruction_type="officeqa",
+        final_response="final " + ("x" * 5000) + " <answer>1</answer>",
+        success=False,
+        verifier_score=0.0,
+        verifier_feedback="expected GOLD_VALUE but got 1",
+        steps=[
+            TrajectoryStep(
+                step_id=i,
+                raw_model_output="thought " + ("a" * 2000),
+                action="read(path='doc.txt')",
+                observation=f"obs-{i} " + ("b" * 8000),
+            )
+            for i in range(8)
+        ],
+        extra={
+            "officeqa_result": {"ground_truth": "GOLD_VALUE", "predicted_answer": "1"},
+            "primary_eval": {"gold_answer": "GOLD_VALUE", "predicted_answer": "1", "hard": 0},
+        },
+    )
+    bundle = render_compact_analysis_bundle_text(
+        record,
+        max_chars=5000,
+        max_steps=4,
+        max_step_chars=500,
+        max_final_response_chars=500,
+    )
+    assert len(bundle) <= 5000
+    assert "GOLD_VALUE" in bundle
+    assert "predicted_answer" in bundle
+    assert "truncated" in bundle
+    assert "obs-0" in bundle
+    assert "obs-7" in bundle
+
+
+def test_compact_analysis_bundle_keeps_all_short_steps_until_char_budget() -> None:
+    record = RawTrajectoryRecord(
+        trajectory_id="traj",
+        task_id="task",
+        trial_index=0,
+        instruction="Do the task.",
+        steps=[
+            TrajectoryStep(step_id=i, raw_model_output=f"thought-{i}", action=f"action-{i}", observation=f"obs-{i}")
+            for i in range(13)
+        ],
+    )
+    bundle = render_compact_analysis_bundle_text(record, max_chars=20000, max_steps=4, max_step_chars=200)
+    assert "omitted_middle_step_count" not in bundle
+    assert "obs-6" in bundle
+    assert "obs-12" in bundle
+
+
 def test_officeqa_text_tool_fallback_turn_is_one_step() -> None:
     row = {
         "id": "UIDX",
@@ -391,6 +448,114 @@ def test_officeqa_nodebank_audit_blocks_train_answer_leakage(tmp_path: Path) -> 
         raise AssertionError("nodebank audit should reject copied train answer diagnostics")
 
 
+def test_officeqa_nodebank_sanitizer_rewrites_leakage_and_invalidates_index(tmp_path: Path) -> None:
+    runner = _load_officeqa_runner()
+    records = [{
+        "task_id": "UIDX",
+        "extra": {
+            "officeqa_result": {"ground_truth": "GOLD_VALUE", "predicted_answer": "WRONG_VALUE"},
+            "primary_eval": {"gold_answer": "GOLD_VALUE", "predicted_answer": "WRONG_VALUE"},
+        },
+    }]
+    records_path = tmp_path / "records.json"
+    records_path.write_text(json.dumps(records), encoding="utf-8")
+    skillbank = tmp_path / "skills"
+    skillbank.mkdir()
+    (skillbank / ".dynamix_skillbank_index.json").write_text("{}", encoding="utf-8")
+    (skillbank / "node_bank_manifest.json").write_text(json.dumps({
+        "nodes": [{
+            "node_id": "E1_bad",
+            "name": "Bad card",
+            "trigger": "When diagnostic values differ",
+            "content": "Use reusable comparison guidance.",
+            "embedding_text": "name: Bad card\ntrigger: clean\ncontent: The correct ground_truth was GOLD_VALUE.",
+            "prompt_text": "### Bad card\nGuidance:\nThe predicted_answer was WRONG_VALUE.",
+            "sha256": "stale",
+        }]
+    }), encoding="utf-8")
+    report = runner._sanitize_nodebank_for_train_diagnostic_leakage(skillbank, records_path, tmp_path)
+    assert report["status"] == "sanitized"
+    assert not (skillbank / ".dynamix_skillbank_index.json").exists()
+    manifest = json.loads((skillbank / "node_bank_manifest.json").read_text(encoding="utf-8"))
+    node = manifest["nodes"][0]
+    combined = "\n".join(str(node[field]) for field in ("name", "trigger", "content", "embedding_text", "prompt_text")).lower()
+    assert "gold_value" not in combined
+    assert "wrong_value" not in combined
+    assert "ground_truth" not in combined
+    assert "predicted_answer" not in combined
+    assert node["sha256"] != "stale"
+    report_text = json.dumps(report, ensure_ascii=False).lower()
+    assert "gold_value" not in report_text
+    assert "wrong_value" not in report_text
+    audit = runner._audit_nodebank_for_train_diagnostic_leakage(skillbank, records_path, tmp_path)
+    assert audit["status"] == "pass"
+
+
+def test_officeqa_nodebank_audit_redacts_short_numeric_answer_terms(tmp_path: Path) -> None:
+    runner = _load_officeqa_runner()
+    records = [{
+        "task_id": "UIDX",
+        "extra": {
+            "officeqa_result": {"ground_truth": "999", "predicted_answer": "1"},
+            "primary_eval": {"gold_answer": "999", "predicted_answer": "1"},
+        },
+    }]
+    records_path = tmp_path / "records.json"
+    records_path.write_text(json.dumps(records), encoding="utf-8")
+    skillbank = tmp_path / "skills"
+    skillbank.mkdir()
+    (skillbank / "node_bank_manifest.json").write_text(json.dumps({
+        "nodes": [{
+            "node_id": "E1_bad",
+            "name": "Numeric leak",
+            "trigger": "When exact value is needed",
+            "content": "The correct value was 999.",
+            "embedding_text": "name: Numeric leak\ntrigger: When exact value is needed\ncontent: The correct value was 999.",
+            "prompt_text": "### Numeric leak\nGuidance:\nThe correct value was 999.",
+            "sha256": "stale",
+        }]
+    }), encoding="utf-8")
+    try:
+        runner._audit_nodebank_for_train_diagnostic_leakage(skillbank, records_path, tmp_path)
+    except ValueError:
+        audit_text = (tmp_path / "officeqa_nodebank_diagnostic_audit.json").read_text(encoding="utf-8")
+        assert "999" not in audit_text
+        assert "term_sha256" in audit_text
+    else:
+        raise AssertionError("nodebank audit should reject exact short numeric train answers")
+
+
+def test_officeqa_skillbank_reindex_helper_writes_index_with_mock_embedding(tmp_path: Path) -> None:
+    runner = _load_officeqa_runner()
+    skillbank = tmp_path / "skills"
+    skillbank.mkdir()
+    (skillbank / "node_bank_manifest.json").write_text(json.dumps({
+        "format": "dynamix_node_skill_bank_v1",
+        "nodes": [{
+            "node_id": "E1",
+            "item_id": "E1",
+            "level": 1,
+            "support_mass": 1.0,
+            "confidence": 0.9,
+            "name": "Careful extraction",
+            "trigger": "When answering from documents",
+            "content": "Verify the requested scope before finalizing.",
+            "embedding_text": "name: Careful extraction\ntrigger: When answering from documents\ncontent: Verify the requested scope before finalizing.",
+            "prompt_text": "### Careful extraction\n\nTrigger: When answering from documents\n\nGuidance:\nVerify the requested scope before finalizing.",
+            "sha256": "abc",
+        }],
+    }), encoding="utf-8")
+    args = runner.parse_args([
+        "--run-dir", str(tmp_path / "run"),
+        "--embedding-base-url", "mock://deterministic",
+        "--embedding-model", "mock-embed",
+        "--analyst-tokenizer-required", "false",
+    ])
+    report = runner._refresh_officeqa_skillbank_index(skillbank, args)
+    assert Path(report["path"]).is_file()
+    assert report["sha256"]
+
+
 def test_officeqa_runner_defaults_to_train_val_and_test() -> None:
     runner = _load_officeqa_runner()
     args = runner.parse_args(["--run-dir", "/tmp/x"])
@@ -414,6 +579,7 @@ def test_officeqa_build_config_uses_officeqa_analyst_profile(tmp_path: Path) -> 
     config = runner._build_tree_config(args, records_path=tmp_path / "records.json", output_dir=tmp_path / "tree")
     assert config["analyst"]["task_profile"] == "officeqa"
     assert config["analyst"]["prompt_style"] == "officeqa_cluster_level_v1"
+    assert config["analyst"]["analysis_bundle_max_chars"] == 60000
     assert config["hierarchy"]["gmm_bic"]["min_split_size"] == 4
     assert config["hierarchy"]["gmm_bic"]["min_effective_samples_per_component"] == 4
 
@@ -653,6 +819,66 @@ def test_mock_pipeline_records_to_items_uses_regex_tokenizer_without_hf(tmp_path
     _prepare_analyst_tokenizer_config(cfg, tmp_path / "out")
     _, normalized = _records_to_items([record], ["trace"], [[1.0, 0.0]], config=cfg)
     assert normalized[0]["experience_item"]["metadata"]["analysis_tokenizer"] == "regex_fallback_test_only"
+
+
+def test_real_pipeline_does_not_fallback_to_embedding_tokenizer_for_analyst(tmp_path: Path) -> None:
+    cfg = DynaMixRunConfig(output_dir=str(tmp_path / "out"), records_path=str(tmp_path / "records.json"))
+    cfg.generation.base_url = "http://generation.example/v1"
+    cfg.embedding.base_url = "http://embedding.example/v1"
+    cfg.embedding.tokenizer_model = "embedding-tokenizer"
+    cfg.analyst.tokenizer_model = None
+    cfg.analyst.allow_regex_tokenizer_fallback = False
+    _prepare_analyst_tokenizer_config(cfg, tmp_path / "out")
+    assert cfg.analyst.tokenizer_model is None
+
+
+def test_records_to_items_uses_char_estimate_when_tokenizer_not_required(tmp_path: Path) -> None:
+    record = RawTrajectoryRecord(
+        trajectory_id="traj-1",
+        task_id="task-1",
+        trial_index=0,
+        instruction="Do the task.",
+    )
+    cfg = DynaMixRunConfig(output_dir=str(tmp_path / "out"), records_path=str(tmp_path / "records.json"))
+    cfg.generation.base_url = "http://generation.example/v1"
+    cfg.embedding.base_url = "http://embedding.example/v1"
+    cfg.analyst.tokenizer_model = None
+    cfg.analyst.tokenizer_required = False
+    cfg.analyst.allow_regex_tokenizer_fallback = False
+    _prepare_analyst_tokenizer_config(cfg, tmp_path / "out")
+    _, normalized = _records_to_items([record], ["trace"], [[1.0, 0.0]], config=cfg)
+    assert normalized[0]["experience_item"]["metadata"]["analysis_tokenizer"] == "char_estimate_fallback"
+
+
+def test_pipeline_uses_compact_analysis_bundle_for_all_task_profiles(tmp_path: Path) -> None:
+    record = RawTrajectoryRecord(
+        trajectory_id="traj-1",
+        task_id="task-1",
+        trial_index=0,
+        instruction="Do the task.",
+        instruction_type="spreadsheetbench",
+        final_response="final " + ("x" * 4000),
+        steps=[
+            TrajectoryStep(
+                step_id=i,
+                raw_model_output="thought " + ("a" * 2000),
+                action="python script",
+                observation=f"obs-{i} " + ("b" * 8000),
+            )
+            for i in range(6)
+        ],
+    )
+    cfg = DynaMixRunConfig(output_dir=str(tmp_path / "out"), records_path=str(tmp_path / "records.json"))
+    cfg.analyst.analysis_bundle_max_chars = 3000
+    cfg.analyst.analysis_bundle_max_steps = 4
+    cfg.analyst.analysis_bundle_max_step_chars = 400
+    cfg.analyst.analysis_bundle_max_final_response_chars = 400
+    _prepare_analyst_tokenizer_config(cfg, tmp_path / "out")
+    _, normalized = _records_to_items([record], ["trace"], [[1.0, 0.0]], config=cfg)
+    metadata = normalized[0]["experience_item"]["metadata"]
+    assert metadata["analysis_bundle_compacted"] is True
+    assert metadata["analysis_bundle_char_count"] <= 3000
+    assert "truncated" in normalized[0]["analysis_bundle"]
 
 
 def test_officeqa_resume_requires_matching_fingerprint(tmp_path: Path) -> None:

@@ -255,6 +255,7 @@ DYNAMIC_CONFIDENCE_METADATA_KEY="${DYNAMIC_CONFIDENCE_METADATA_KEY:-confidence}"
 
 ANALYST_PROMPT_STYLE="${ANALYST_PROMPT_STYLE:-trace2skill_cluster_level_template_inheritance_v4}"
 ANALYST_CONFIDENCE_FLOOR="${ANALYST_CONFIDENCE_FLOOR:-0.05}"
+ANALYST_TOKENIZER="${ANALYST_TOKENIZER:-}"
 ANALYST_TOKENIZER_REQUIRED="${ANALYST_TOKENIZER_REQUIRED:-true}"
 ANALYST_ALLOW_REGEX_TOKENIZER_FALLBACK="${ANALYST_ALLOW_REGEX_TOKENIZER_FALLBACK:-false}"
 
@@ -273,6 +274,10 @@ ANALYST_MAX_CARDS_L0="${ANALYST_MAX_CARDS_L0:-0}"
 ANALYST_MAX_CARDS_HIGHER="${ANALYST_MAX_CARDS_HIGHER:-1}"
 ANALYST_HIGHER_LEVEL_MODE="${ANALYST_HIGHER_LEVEL_MODE:-single_abstraction}"
 ANALYST_TRUNCATE_HIGHER_LEVEL_EXTRA_CARDS="${ANALYST_TRUNCATE_HIGHER_LEVEL_EXTRA_CARDS:-true}"
+ANALYSIS_BUNDLE_MAX_CHARS="${ANALYSIS_BUNDLE_MAX_CHARS:-60000}"
+ANALYSIS_BUNDLE_MAX_STEPS="${ANALYSIS_BUNDLE_MAX_STEPS:-12}"
+ANALYSIS_BUNDLE_MAX_STEP_CHARS="${ANALYSIS_BUNDLE_MAX_STEP_CHARS:-6000}"
+ANALYSIS_BUNDLE_MAX_FINAL_RESPONSE_CHARS="${ANALYSIS_BUNDLE_MAX_FINAL_RESPONSE_CHARS:-12000}"
 
 # ---------------------------------------------------------------------------
 # Preflight and command assembly.
@@ -321,7 +326,12 @@ echo "[preflight] python=$(command -v python)"
 "$DYNAMIX_PYTHON" -c 'import sys; print("[preflight] sys.executable=" + sys.executable)'
 echo "[preflight] generation=$MODEL $OPENAI_BASE_URL thinking=$THINKING workers=$WORKERS"
 echo "[preflight] embedding=$EMBEDDING_MODEL $EMBEDDING_BASE_URL tokenizer=$EMBEDDING_TOKENIZER"
+echo "[preflight] analyst_tokenizer=${ANALYST_TOKENIZER:-<missing>} analysis_bundle_max_chars=$ANALYSIS_BUNDLE_MAX_CHARS"
 echo "[preflight] heldout_query='instruction + Task type'; answer_position is not used for retrieval"
+if [[ "${ANALYST_TOKENIZER_REQUIRED,,}" == "true" && "${ANALYST_ALLOW_REGEX_TOKENIZER_FALLBACK,,}" != "true" && -z "$ANALYST_TOKENIZER" ]]; then
+  echo "[preflight:error] ANALYST_TOKENIZER is required for real tree builds. Set it to the generation model tokenizer; do not use EMBEDDING_TOKENIZER for analyst prompt budgeting." >&2
+  exit 2
+fi
 command -v soffice || true
 soffice --version || true
 
@@ -444,7 +454,15 @@ cmd=(
   "--analyst-max-cards-higher" "$ANALYST_MAX_CARDS_HIGHER"
   "--analyst-higher-level-mode" "$ANALYST_HIGHER_LEVEL_MODE"
   "--analyst-truncate-higher-level-extra-cards" "$ANALYST_TRUNCATE_HIGHER_LEVEL_EXTRA_CARDS"
+  "--analysis-bundle-max-chars" "$ANALYSIS_BUNDLE_MAX_CHARS"
+  "--analysis-bundle-max-steps" "$ANALYSIS_BUNDLE_MAX_STEPS"
+  "--analysis-bundle-max-step-chars" "$ANALYSIS_BUNDLE_MAX_STEP_CHARS"
+  "--analysis-bundle-max-final-response-chars" "$ANALYSIS_BUNDLE_MAX_FINAL_RESPONSE_CHARS"
 )
+
+if [[ -n "$ANALYST_TOKENIZER" ]]; then
+  cmd+=("--analyst-tokenizer" "$ANALYST_TOKENIZER")
+fi
 
 if [[ -n "$RECORDS_PATH" ]]; then
   cmd+=("--records-path" "$RECORDS_PATH")

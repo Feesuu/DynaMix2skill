@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from collections import Counter
@@ -28,11 +29,13 @@ from dynamix_benchmarks.officeqa import (  # noqa: E402
 from dynamix_benchmarks.officeqa.tools import resolve_docs_roots  # noqa: E402
 from dynamix_trace2skill.pipeline import DynaMixRunConfig, run_config  # noqa: E402
 from dynamix_trace2skill.skillbank import SkillBankSelector  # noqa: E402
+from dynamix_core.skill_export import _render_node_embedding_text, _render_node_prompt_text  # noqa: E402
 
 
 def main() -> None:
     args = parse_args()
     _validate_generation_endpoint(args)
+    _validate_analyst_tokenizer_args(args)
     if not args.docs_dir:
         args.docs_dir = ["/mnt/data/yaodong/officeqa/hf/treasury_bulletins_parsed"]
     run_dir = Path(args.run_dir)
@@ -115,6 +118,16 @@ def main() -> None:
         raise FileNotFoundError(f"tree summary not found for heldout: {tree_dir / 'summary.json'}")
 
     if tree_summary is not None:
+        report["nodebank_diagnostic_sanitizer"] = _sanitize_nodebank_for_train_diagnostic_leakage(
+            Path(tree_summary["node_bank_dir"]),
+            records_path,
+            run_dir,
+        )
+        if report["nodebank_diagnostic_sanitizer"].get("status") == "sanitized":
+            report["nodebank_reindex_after_sanitizer"] = _refresh_officeqa_skillbank_index(
+                Path(tree_summary["node_bank_dir"]),
+                args,
+            )
         report["nodebank_diagnostic_audit"] = _audit_nodebank_for_train_diagnostic_leakage(
             Path(tree_summary["node_bank_dir"]),
             records_path,
@@ -213,6 +226,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--analyst-tokenizer", default="")
     parser.add_argument("--analyst-tokenizer-required", default="true")
     parser.add_argument("--analyst-allow-regex-tokenizer-fallback", default="false")
+    parser.add_argument("--analysis-bundle-max-chars", type=int, default=60000)
+    parser.add_argument("--analysis-bundle-max-steps", type=int, default=12)
+    parser.add_argument("--analysis-bundle-max-step-chars", type=int, default=6000)
+    parser.add_argument("--analysis-bundle-max-final-response-chars", type=int, default=12000)
     parser.add_argument("--skillbank-top-k", type=int, default=10)
     parser.add_argument("--max-levels", type=int, default=8)
     parser.add_argument("--summary-max-model-tokens", type=int, default=100000)
@@ -315,6 +332,10 @@ def _build_tree_config(args: argparse.Namespace, *, records_path: Path, output_d
             "tokenizer_model": args.analyst_tokenizer or None,
             "tokenizer_required": _parse_bool(args.analyst_tokenizer_required),
             "allow_regex_tokenizer_fallback": _parse_bool(args.analyst_allow_regex_tokenizer_fallback),
+            "analysis_bundle_max_chars": None if int(args.analysis_bundle_max_chars) <= 0 else int(args.analysis_bundle_max_chars),
+            "analysis_bundle_max_steps": int(args.analysis_bundle_max_steps),
+            "analysis_bundle_max_step_chars": int(args.analysis_bundle_max_step_chars),
+            "analysis_bundle_max_final_response_chars": int(args.analysis_bundle_max_final_response_chars),
         },
         "max_levels": args.max_levels,
         "skill_output_dir_name": "skills",
@@ -337,21 +358,79 @@ def _render_retrieved_experience(selections) -> str:
     return "\n".join(lines).strip()
 
 
+def _sanitize_nodebank_for_train_diagnostic_leakage(skillbank_root: Path, records_path: Path, run_dir: Path) -> dict[str, Any]:
+    manifest_path = skillbank_root / "node_bank_manifest.json"
+    if not manifest_path.is_file():
+        return {"status": "skipped", "reason": f"node bank manifest not found: {manifest_path}"}
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    records = json.loads(records_path.read_text(encoding="utf-8"))
+    forbidden_labels = _officeqa_forbidden_diagnostic_labels()
+    forbidden_terms = _officeqa_train_diagnostic_terms(records)
+    nodes = manifest.get("nodes") or manifest.get("entries") or []
+    replacements: list[dict[str, Any]] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        node_id = str(node.get("node_id") or node.get("id") or "")
+        node_changed = False
+        for field in ("name", "trigger", "content"):
+            original = str(node.get(field) or "")
+            sanitized, events = _sanitize_node_text(original, forbidden_labels=forbidden_labels, forbidden_terms=forbidden_terms)
+            if sanitized != original:
+                node[field] = sanitized
+                node_changed = True
+                replacements.extend({"node_id": node_id, "field": field, **event} for event in events)
+        name = str(node.get("name") or "")
+        trigger = str(node.get("trigger") or "")
+        content = str(node.get("content") or "")
+        expected_embedding_text = _render_node_embedding_text(name=name, trigger=trigger, content=content)
+        expected_prompt_text = _render_node_prompt_text(name=name, trigger=trigger, content=content)
+        expected_sha256 = _node_content_sha256(name=name, trigger=trigger, content=content)
+        if (
+            str(node.get("embedding_text") or "") != expected_embedding_text
+            or str(node.get("prompt_text") or "") != expected_prompt_text
+            or str(node.get("sha256") or "") != expected_sha256
+        ):
+            node["embedding_text"] = expected_embedding_text
+            node["prompt_text"] = expected_prompt_text
+            node["sha256"] = expected_sha256
+            node_changed = True
+            replacements.append({"node_id": node_id, "field": "derived_node_text", "kind": "derived_regenerated", "count": 1})
+    changed = bool(replacements)
+    if changed:
+        manifest.setdefault("sanitization", {})
+        manifest["sanitization"]["officeqa_train_diagnostic_leakage"] = {
+            "status": "sanitized",
+            "replacement_count": len(replacements),
+            "fields": ["name", "trigger", "content"],
+            "index_invalidated": True,
+        }
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        index_path = skillbank_root / ".dynamix_skillbank_index.json"
+        if index_path.is_file():
+            index_path.unlink()
+    report = {
+        "status": "sanitized" if changed else "pass",
+        "manifest": str(manifest_path),
+        "records": str(records_path),
+        "node_count": len(nodes),
+        "forbidden_term_count": len(forbidden_terms),
+        "replacement_count": len(replacements),
+        "replacements": replacements[:100],
+    }
+    report_path = run_dir / "officeqa_nodebank_diagnostic_sanitizer.json"
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    report["path"] = str(report_path)
+    return report
+
+
 def _audit_nodebank_for_train_diagnostic_leakage(skillbank_root: Path, records_path: Path, run_dir: Path) -> dict[str, Any]:
     manifest_path = skillbank_root / "node_bank_manifest.json"
     if not manifest_path.is_file():
         return {"status": "skipped", "reason": f"node bank manifest not found: {manifest_path}"}
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     records = json.loads(records_path.read_text(encoding="utf-8"))
-    forbidden_labels = {
-        "ground_truth",
-        "gold_answer",
-        "predicted_answer",
-        "official_reward_audit",
-        "verifier_score",
-        "verifier_feedback",
-        "answer_mismatch",
-    }
+    forbidden_labels = _officeqa_forbidden_diagnostic_labels()
     forbidden_terms = _officeqa_train_diagnostic_terms(records)
     nodes = manifest.get("nodes") or manifest.get("entries") or []
     violations: list[dict[str, Any]] = []
@@ -359,13 +438,16 @@ def _audit_nodebank_for_train_diagnostic_leakage(skillbank_root: Path, records_p
         if not isinstance(node, dict):
             continue
         node_id = str(node.get("node_id") or node.get("id") or "")
-        text = "\n".join(str(node.get(field) or "") for field in ("name", "trigger", "content")).lower()
-        for label in sorted(forbidden_labels):
-            if label in text:
-                violations.append({"node_id": node_id, "kind": "diagnostic_label", "term": label})
-        for term in forbidden_terms:
-            if term in text:
-                violations.append({"node_id": node_id, "kind": "train_answer_value", "term": term})
+        for field in _node_public_text_fields():
+            text = str(node.get(field) or "")
+            for label in sorted(forbidden_labels):
+                count = len(_forbidden_term_pattern(label).findall(text))
+                if count:
+                    violations.append({"node_id": node_id, "field": field, **_redacted_term_event("diagnostic_label", label, count)})
+            for term in forbidden_terms:
+                count = len(_forbidden_term_pattern(term).findall(text))
+                if count:
+                    violations.append({"node_id": node_id, "field": field, **_redacted_term_event("train_answer_value", term, count)})
     audit = {
         "status": "pass" if not violations else "fail",
         "manifest": str(manifest_path),
@@ -381,6 +463,74 @@ def _audit_nodebank_for_train_diagnostic_leakage(skillbank_root: Path, records_p
     if violations:
         raise ValueError(f"OfficeQA nodebank leaked train diagnostics; see {audit_path}")
     return audit
+
+
+def _officeqa_forbidden_diagnostic_labels() -> set[str]:
+    return {
+        "ground_truth",
+        "gold_answer",
+        "predicted_answer",
+        "official_reward_audit",
+        "verifier_score",
+        "verifier_feedback",
+        "answer_mismatch",
+    }
+
+
+def _sanitize_node_text(text: str, *, forbidden_labels: set[str], forbidden_terms: list[str]) -> tuple[str, list[dict[str, Any]]]:
+    result = text
+    events: list[dict[str, Any]] = []
+    for label in sorted(forbidden_labels, key=len, reverse=True):
+        result, count = _forbidden_term_pattern(label).subn("train diagnostic field", result)
+        if count:
+            events.append(_redacted_term_event("diagnostic_label", label, count))
+    for term in sorted(forbidden_terms, key=len, reverse=True):
+        result, count = _forbidden_term_pattern(term).subn("<train_diagnostic_value>", result)
+        if count:
+            events.append(_redacted_term_event("train_answer_value", term, count))
+    return result, events
+
+
+def _node_public_text_fields() -> tuple[str, ...]:
+    return ("name", "trigger", "content", "embedding_text", "prompt_text")
+
+
+def _node_content_sha256(*, name: str, trigger: str, content: str) -> str:
+    payload = json.dumps({"name": name, "trigger": trigger, "content": content}, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _forbidden_term_pattern(term: str) -> re.Pattern[str]:
+    escaped = re.escape(term)
+    if _is_numeric_like(term):
+        return re.compile(rf"(?<![A-Za-z0-9_%+-])(?<!\d\.){escaped}(?![A-Za-z0-9_%+-]|\.\d)", re.IGNORECASE)
+    if term and term[0].isalnum() and term[-1].isalnum():
+        return re.compile(rf"(?<!\w){escaped}(?!\w)", re.IGNORECASE)
+    return re.compile(escaped, re.IGNORECASE)
+
+
+def _redacted_term_event(kind: str, term: str, count: int) -> dict[str, Any]:
+    return {
+        "kind": kind,
+        "term_sha256": hashlib.sha256(term.encode("utf-8")).hexdigest(),
+        "term_class": _term_class(term),
+        "count": count,
+    }
+
+
+def _term_class(term: str) -> str:
+    if _is_numeric_like(term):
+        return "numeric_like"
+    if any(ch.isdigit() for ch in term):
+        return "contains_digit"
+    return "text"
+
+
+def _is_numeric_like(term: str) -> bool:
+    text = str(term or "").strip()
+    if not text or not any(ch.isdigit() for ch in text):
+        return False
+    return not any(ch.isalpha() for ch in text)
 
 
 def _officeqa_train_diagnostic_terms(records: list[Any]) -> list[str]:
@@ -414,11 +564,32 @@ def _collect_answer_terms(value: Any, terms: set[str]) -> None:
 
 def _add_forbidden_term(value: Any, terms: set[str]) -> None:
     text = str(value or "").strip().lower()
-    if len(text) < 4:
+    if len(text) < 4 and not _is_numeric_like(text):
         return
     if not any(ch.isalnum() for ch in text):
         return
     terms.add(text)
+
+
+def _refresh_officeqa_skillbank_index(skillbank_root: Path, args: argparse.Namespace) -> dict[str, Any]:
+    selector = SkillBankSelector(
+        skillbank_root=skillbank_root,
+        base_url=args.embedding_base_url,
+        model=args.embedding_model,
+        api_key=_resolve_api_key(args.embedding_api_key, args.embedding_api_key_env),
+        max_model_len=args.embedding_max_model_len,
+        max_input_tokens=args.embedding_max_model_len,
+        batch_size=args.embedding_batch_size,
+        tokenizer_model=args.embedding_tokenizer or None,
+        chunk_tokens=args.chunk_tokens,
+        chunk_overlap_tokens=args.chunk_overlap_tokens,
+    )
+    selector._load_or_build_index()
+    index_path = skillbank_root / ".dynamix_skillbank_index.json"
+    return {
+        "path": str(index_path),
+        "sha256": _file_sha256(index_path),
+    }
 
 
 def _timed(report: dict[str, Any], stage: str, fn):
@@ -511,6 +682,23 @@ def _validate_generation_endpoint(args: argparse.Namespace) -> None:
         raise ValueError(
             "OfficeQA runner refuses local A5000 18002 by default. "
             "Use the external AWQ endpoint/tunnel, or set ALLOW_OFFICEQA_LOCAL_18002=1 for an explicit debug run."
+        )
+
+
+def _validate_analyst_tokenizer_args(args: argparse.Namespace) -> None:
+    if bool(getattr(args, "skip_build_tree", False)):
+        return
+    if str(args.openai_base_url or "").startswith("mock://"):
+        return
+    if (
+        _parse_bool(args.analyst_tokenizer_required)
+        and not _parse_bool(args.analyst_allow_regex_tokenizer_fallback)
+        and not str(args.analyst_tokenizer or "").strip()
+    ):
+        raise ValueError(
+            "--analyst-tokenizer is required for real OfficeQA tree builds when "
+            "--analyst-tokenizer-required=true and regex fallback is disabled. "
+            "Use the generation model tokenizer, not the embedding tokenizer."
         )
 
 

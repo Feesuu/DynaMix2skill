@@ -20,8 +20,8 @@ from .long_embeddings import ChunkedEmbeddingConfig, embed_records_chunked_mean,
 from .log_parser import load_records
 from .schemas import RawTrajectoryRecord
 from .summary import ClusterAnalyst, ClusterAnalystConfig
-from .trace_views import render_analysis_bundle_text, render_embedding_trace
-from .tokenization import get_tokenizer
+from .trace_views import render_analysis_bundle_text, render_compact_analysis_bundle_text, render_embedding_trace
+from .tokenization import get_tokenizer, TokenizerUnavailable
 from .skillbank import SkillBankSelector
 
 
@@ -477,7 +477,7 @@ def _prepare_analyst_tokenizer_config(config: DynaMixRunConfig, out: Path) -> No
     # depend on the same tokenization regime used before the LLM call.
     mock_mode = config.generation.base_url.startswith("mock://") or config.embedding.base_url.startswith("mock://")
     if not config.analyst.tokenizer_model:
-        config.analyst.tokenizer_model = None if mock_mode else (config.embedding.tokenizer_model or config.embedding.model)
+        config.analyst.tokenizer_model = None
     # Analyst prompt budget is the full prompt allowance.  The hierarchy builder
     # uses summary_budget.effective_token_budget for member evidence after
     # subtracting prompt overhead reserve.
@@ -496,6 +496,13 @@ def _prepare_analyst_tokenizer_config(config: DynaMixRunConfig, out: Path) -> No
         "analyst_max_prompt_tokens": config.analyst.max_prompt_tokens,
         "analyst_max_output_tokens": config.analyst.max_output_tokens,
         "analyst_dynamic_max_output_tokens": config.analyst.dynamic_max_output_tokens,
+        "analyst_tokenizer_model": config.analyst.tokenizer_model,
+        "analyst_tokenizer_required": config.analyst.tokenizer_required,
+        "analyst_allow_regex_tokenizer_fallback": config.analyst.allow_regex_tokenizer_fallback,
+        "analysis_bundle_max_chars": config.analyst.analysis_bundle_max_chars,
+        "analysis_bundle_max_steps": config.analyst.analysis_bundle_max_steps,
+        "analysis_bundle_max_step_chars": config.analyst.analysis_bundle_max_step_chars,
+        "analysis_bundle_max_final_response_chars": config.analyst.analysis_bundle_max_final_response_chars,
         "source": "analyst.max_prompt_tokens override" if analyst_budget_was_overridden else "hierarchy.summary_budget",
         "hierarchy_summary_budget": default_hierarchy_config(config.hierarchy).summary_budget.to_dict(),
     }
@@ -575,15 +582,34 @@ def _order_records_by_dataset_slice(
 def _records_to_items(records: list[RawTrajectoryRecord], embedding_texts: list[str], embeddings: list[list[float]], *, config: DynaMixRunConfig) -> tuple[list[ExperienceItem], list[dict[str, Any]]]:
     items = []
     normalized = []
-    tokenizer_model = config.analyst.tokenizer_model
-    if tokenizer_model is None and not config.analyst.allow_regex_tokenizer_fallback:
-        tokenizer_model = config.embedding.tokenizer_model or config.embedding.model
-    tokenizer = get_tokenizer(tokenizer_model, allow_regex_fallback=config.analyst.allow_regex_tokenizer_fallback)
+    try:
+        tokenizer = get_tokenizer(config.analyst.tokenizer_model, allow_regex_fallback=config.analyst.allow_regex_tokenizer_fallback)
+        tokenizer_name = tokenizer.name
+    except Exception as exc:
+        if config.analyst.tokenizer_required:
+            raise TokenizerUnavailable(f"cluster analyst tokenizer unavailable for analysis-bundle accounting: {exc}") from exc
+        tokenizer = None
+        tokenizer_name = "char_estimate_fallback"
     per_member_overhead = 128
     for record, text, embedding in zip(records, embedding_texts, embeddings):
-        analysis_bundle = render_analysis_bundle_text(record)
-        analysis_count = tokenizer.count(analysis_bundle) + per_member_overhead
-        embedding_count = tokenizer.count(text)
+        if config.analyst.analysis_bundle_max_chars is not None and int(config.analyst.analysis_bundle_max_chars) > 0:
+            analysis_bundle = render_compact_analysis_bundle_text(
+                record,
+                max_chars=int(config.analyst.analysis_bundle_max_chars),
+                max_steps=int(config.analyst.analysis_bundle_max_steps),
+                max_step_chars=int(config.analyst.analysis_bundle_max_step_chars),
+                max_final_response_chars=int(config.analyst.analysis_bundle_max_final_response_chars),
+            )
+            analysis_bundle_compacted = True
+        else:
+            analysis_bundle = render_analysis_bundle_text(record)
+            analysis_bundle_compacted = False
+        if tokenizer is None:
+            analysis_count = max(1, (len(analysis_bundle) + 3) // 4) + per_member_overhead
+            embedding_count = max(1, (len(text) + 3) // 4)
+        else:
+            analysis_count = tokenizer.count(analysis_bundle) + per_member_overhead
+            embedding_count = tokenizer.count(text)
         metadata = {
             "success": record.success,
             "verifier_score": record.verifier_score,
@@ -592,7 +618,9 @@ def _records_to_items(records: list[RawTrajectoryRecord], embedding_texts: list[
             "answer_position": record.answer_position,
             "analysis_bundle": analysis_bundle,
             "analysis_token_count": analysis_count,
-            "analysis_tokenizer": tokenizer.name,
+            "analysis_tokenizer": tokenizer_name,
+            "analysis_bundle_compacted": analysis_bundle_compacted,
+            "analysis_bundle_char_count": len(analysis_bundle),
             "analysis_per_member_prompt_overhead": per_member_overhead,
             "embedding_trace_token_count": embedding_count,
             "trajectory_id": record.trajectory_id,

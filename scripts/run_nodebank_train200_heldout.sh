@@ -68,6 +68,12 @@ EMBEDDING_MODEL="${EMBEDDING_MODEL:-Qwen3-Embedding-8B}"
 # Local tokenizer path/name used for token counting and long-trace chunking.
 EMBEDDING_TOKENIZER="${EMBEDDING_TOKENIZER:-/mnt/data/grouph_share/models/modelscope/models/Qwen/Qwen3-Embedding-8B}"
 
+# Local tokenizer path/name used for analyst prompt budgeting.  Keep separate
+# from embedding tokenizer so prompt budgets track the generation model.
+ANALYST_TOKENIZER="${ANALYST_TOKENIZER:-}"
+ANALYST_TOKENIZER_REQUIRED="${ANALYST_TOKENIZER_REQUIRED:-true}"
+ANALYST_ALLOW_REGEX_TOKENIZER_FALLBACK="${ANALYST_ALLOW_REGEX_TOKENIZER_FALLBACK:-false}"
+
 # Maximum ReAct turns per train/heldout spreadsheet task.
 MAX_TURNS="${MAX_TURNS:-30}"
 
@@ -79,6 +85,10 @@ THINKING="${THINKING:-false}"
 # unbounded when a model keeps expanding an experience card or dynamic patch.
 ANALYST_MAX_OUTPUT_TOKENS="${ANALYST_MAX_OUTPUT_TOKENS:-4096}"
 ANALYST_DYNAMIC_MAX_OUTPUT_TOKENS="${ANALYST_DYNAMIC_MAX_OUTPUT_TOKENS:-8192}"
+ANALYSIS_BUNDLE_MAX_CHARS="${ANALYSIS_BUNDLE_MAX_CHARS:-60000}"
+ANALYSIS_BUNDLE_MAX_STEPS="${ANALYSIS_BUNDLE_MAX_STEPS:-12}"
+ANALYSIS_BUNDLE_MAX_STEP_CHARS="${ANALYSIS_BUNDLE_MAX_STEP_CHARS:-6000}"
+ANALYSIS_BUNDLE_MAX_FINAL_RESPONSE_CHARS="${ANALYSIS_BUNDLE_MAX_FINAL_RESPONSE_CHARS:-12000}"
 
 # Number of retrieved nodebank experience nodes injected into each heldout system prompt.
 SKILLBANK_TOP_K="${SKILLBANK_TOP_K:-10}"
@@ -92,6 +102,10 @@ mkdir -p "$RUN_DIR/logs"
 
 if [[ ! -x "$DYNAMIX_PYTHON" ]]; then
   echo "ERROR: DYNAMIX_PYTHON is not executable: $DYNAMIX_PYTHON" >&2
+  exit 2
+fi
+if [[ "${ANALYST_TOKENIZER_REQUIRED,,}" == "true" && "${ANALYST_ALLOW_REGEX_TOKENIZER_FALLBACK,,}" != "true" && -z "$ANALYST_TOKENIZER" ]]; then
+  echo "[preflight:error] ANALYST_TOKENIZER is required for real tree builds. Set it to the generation model tokenizer; do not use EMBEDDING_TOKENIZER for analyst prompt budgeting." >&2
   exit 2
 fi
 
@@ -144,12 +158,22 @@ cmd=(
   "--thinking" "$THINKING"
 
   # DynaMix analyst guided JSON completion caps.
+  "--analyst-tokenizer-required" "$ANALYST_TOKENIZER_REQUIRED"
+  "--analyst-allow-regex-tokenizer-fallback" "$ANALYST_ALLOW_REGEX_TOKENIZER_FALLBACK"
   "--analyst-max-output-tokens" "$ANALYST_MAX_OUTPUT_TOKENS"
   "--analyst-dynamic-max-output-tokens" "$ANALYST_DYNAMIC_MAX_OUTPUT_TOKENS"
+  "--analysis-bundle-max-chars" "$ANALYSIS_BUNDLE_MAX_CHARS"
+  "--analysis-bundle-max-steps" "$ANALYSIS_BUNDLE_MAX_STEPS"
+  "--analysis-bundle-max-step-chars" "$ANALYSIS_BUNDLE_MAX_STEP_CHARS"
+  "--analysis-bundle-max-final-response-chars" "$ANALYSIS_BUNDLE_MAX_FINAL_RESPONSE_CHARS"
 
   # Heldout nodebank retrieval top-k.
   "--skillbank-top-k" "$SKILLBANK_TOP_K"
 )
+
+if [[ -n "$ANALYST_TOKENIZER" ]]; then
+  cmd+=("--analyst-tokenizer" "$ANALYST_TOKENIZER")
+fi
 
 if [[ "$RESUME" == "true" ]]; then
   # Reuse completed stage markers and outputs in RUN_DIR.

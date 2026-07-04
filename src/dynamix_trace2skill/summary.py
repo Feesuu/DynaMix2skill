@@ -109,6 +109,10 @@ class ClusterAnalystConfig:
     higher_level_mode: str = "single_abstraction"
     truncate_higher_level_extra_cards: bool = True
     task_profile: str = "spreadsheetbench"
+    analysis_bundle_max_chars: int | None = 60000
+    analysis_bundle_max_steps: int = 12
+    analysis_bundle_max_step_chars: int = 6000
+    analysis_bundle_max_final_response_chars: int = 12000
 
 
 class ClusterAnalyst:
