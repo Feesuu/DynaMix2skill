@@ -1,0 +1,13 @@
+{
+  "variant_name": "kmeans_fixed_k",
+  "tree": {
+    "tree_policy": "projected_kmeans_fixed",
+    "soft_recursive_assignment": "primary_argmax",
+    "kmeans_fixed_k": 8,
+    "max_levels": 8
+  },
+  "skill_export": {
+    "min_level": null,
+    "max_level": null
+  }
+}

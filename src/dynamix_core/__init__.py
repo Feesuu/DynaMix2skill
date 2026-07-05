@@ -1,6 +1,7 @@
 from .config import (
     DynamicUpdateConfig,
     GmmBicConfig,
+    KMeansConfig,
     ProjectedGmmDynamicTreeConfig,
     ProjectionConfig,
     SoftMembershipConfig,
@@ -45,6 +46,7 @@ __all__ = [
     "ExperienceLayer",
     "GmmBicConfig",
     "HierarchyBuildResult",
+    "KMeansConfig",
     "LayerBuildResult",
     "LayerClusteringResult",
     "LayerRoutingModel",

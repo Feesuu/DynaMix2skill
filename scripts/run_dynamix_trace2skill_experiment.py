@@ -792,6 +792,7 @@ def main() -> None:
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--records-path", default=None, help="Existing extracted records.json; when set, skip train rollout/eval/extraction and build from this file")
     parser.add_argument("--reuse-train-run-dir", default=None, help="Existing run dir containing records.json; when set, skip train rollout/eval/extraction")
+    parser.add_argument("--reuse-tree-dir", default=None, help="Existing dynamix_tree dir to reuse; exports a fresh nodebank with this run's skill_export filter")
     parser.add_argument("--train-artifact-dir", default=None, help="Directory for train rollout/eval/extraction artifacts; default: --run-dir")
     parser.add_argument("--scenario-output-dir", default=None, help="Directory for tree, nodebank, heldout, and final reports; default: --run-dir")
     parser.add_argument("--train-start", type=int, default=0)
@@ -824,6 +825,8 @@ def main() -> None:
     parser.add_argument("--dynamic-resume-from-snapshots", type=parse_bool, default=False, help="Dynamic mode: resume from latest dynamic_snapshots/batch_* snapshot when present; default false until fingerprint validation is enabled")
     parser.add_argument("--max-levels", type=int, default=8)
     parser.add_argument("--skill-output-dir-name", default="skills")
+    parser.add_argument("--skill-export-min-level", type=int, default=-1, help="-1 exports all lower levels; 1 exports L1+")
+    parser.add_argument("--skill-export-max-level", type=int, default=-1, help="-1 exports all upper levels; 1 exports L1 only")
     parser.add_argument("--rollout-temperature", type=float, default=0.0)
     parser.add_argument("--rollout-client-timeout-seconds", type=float, default=600.0)
     parser.add_argument("--rollout-client-retry-wait-seconds", type=parse_float_csv, default=[5.0, 10.0, 30.0])
@@ -869,6 +872,11 @@ def main() -> None:
     parser.add_argument("--gmm-abs-kmax", type=int, default=64)
     parser.add_argument("--gmm-max-concurrent-candidates", type=int, default=1)
     parser.add_argument("--gmm-max-concurrent-restarts", type=int, default=1)
+    parser.add_argument("--kmeans-fixed-k", type=int, default=8)
+    parser.add_argument("--kmeans-min-k", type=int, default=1)
+    parser.add_argument("--kmeans-num-restarts", type=int, default=5)
+    parser.add_argument("--kmeans-max-iter", type=int, default=100)
+    parser.add_argument("--kmeans-tol", type=float, default=1.0e-4)
     parser.add_argument("--soft-save-soft-edges", type=parse_bool, default=True)
     parser.add_argument("--soft-top-r-memberships", type=int, default=2)
     parser.add_argument("--soft-recursive-assignment", choices=["primary_argmax", "top_r_threshold", "cumulative_mass"], default="cumulative_mass")
@@ -956,12 +964,17 @@ def main() -> None:
     run_dir = Path(args.run_dir).resolve()
     records_path_arg = resolved_optional_path(args.records_path)
     reuse_train_run_dir = resolved_optional_path(args.reuse_train_run_dir)
+    reuse_tree_dir = resolved_optional_path(args.reuse_tree_dir)
     train_artifact_dir = resolved_optional_path(args.train_artifact_dir) or run_dir
     scenario_dir = resolved_optional_path(args.scenario_output_dir) or run_dir
     if records_path_arg is not None and reuse_train_run_dir is not None:
         parser.error("--records-path and --reuse-train-run-dir are mutually exclusive")
     if reuse_train_run_dir is not None:
         train_artifact_dir = reuse_train_run_dir
+    if reuse_tree_dir is not None and not (reuse_tree_dir / "hierarchy_state.json").is_file():
+        raise FileNotFoundError(f"--reuse-tree-dir must contain hierarchy_state.json: {reuse_tree_dir}")
+    if reuse_tree_dir is not None and records_path_arg is None and reuse_train_run_dir is None:
+        raise RuntimeError("--reuse-tree-dir requires --records-path or --reuse-train-run-dir so train stages are not re-run for retrieval-only ablations")
     run_dir.mkdir(parents=True, exist_ok=True)
     train_artifact_dir.mkdir(parents=True, exist_ok=True)
     scenario_dir.mkdir(parents=True, exist_ok=True)
@@ -1017,6 +1030,9 @@ def main() -> None:
         "dynamic_resume_from_snapshots": bool(args.dynamic_resume_from_snapshots),
         "max_levels": int(args.max_levels),
         "skill_output_dir_name": args.skill_output_dir_name,
+        "skill_export_min_level": None if int(args.skill_export_min_level) < 0 else int(args.skill_export_min_level),
+        "skill_export_max_level": None if int(args.skill_export_max_level) < 0 else int(args.skill_export_max_level),
+        "reuse_tree_dir": str(reuse_tree_dir) if reuse_tree_dir is not None else "",
         "rollout_temperature": float(args.rollout_temperature),
         "rollout_client_timeout_seconds": float(args.rollout_client_timeout_seconds),
         "rollout_client_retry_wait_seconds": list(args.rollout_client_retry_wait_seconds),
@@ -1271,6 +1287,13 @@ def main() -> None:
                 "max_concurrent_candidates": int(args.gmm_max_concurrent_candidates),
                 "max_concurrent_restarts": int(args.gmm_max_concurrent_restarts),
             },
+            "kmeans": {
+                "fixed_k": int(args.kmeans_fixed_k),
+                "min_k": int(args.kmeans_min_k),
+                "num_restarts": int(args.kmeans_num_restarts),
+                "max_iter": int(args.kmeans_max_iter),
+                "tol": float(args.kmeans_tol),
+            },
             "soft_membership": {
                 "save_soft_edges": bool(args.soft_save_soft_edges),
                 "top_r_memberships": int(args.soft_top_r_memberships),
@@ -1336,23 +1359,62 @@ def main() -> None:
         },
         "max_levels": int(args.max_levels),
         "skill_output_dir_name": args.skill_output_dir_name,
+        "skill_export": {
+            "min_level": None if int(args.skill_export_min_level) < 0 else int(args.skill_export_min_level),
+            "max_level": None if int(args.skill_export_max_level) < 0 else int(args.skill_export_max_level),
+        },
     }
     config_path = scenario_dir / "dynamix_config.json"
     config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
-    build_tree_cmd = [python_executable, "scripts/build_dynamix_tree.py", "--config", str(config_path)]
+    if reuse_tree_dir is not None:
+        if tree_dir.resolve() == reuse_tree_dir.resolve():
+            raise RuntimeError("--reuse-tree-dir cannot be the same as this run's output dynamix_tree dir")
+        build_tree_cmd = [
+            python_executable,
+            "scripts/export_dynamix_nodebank.py",
+            "--source-tree-dir",
+            str(reuse_tree_dir),
+            "--output-tree-dir",
+            str(tree_dir),
+            "--config",
+            str(config_path),
+        ]
+        build_tree_contract = "04_reuse_tree_export_nodebank:v1"
+        build_tree_source = {
+            "runner": source_fp["runner"],
+            "export_dynamix_nodebank": path_fingerprint(repo / "scripts" / "export_dynamix_nodebank.py"),
+            "dynamix_core": source_fp["dynamix_core"],
+            "dynamix_trace2skill": source_fp["dynamix_trace2skill"],
+        }
+        reuse_config_path = reuse_tree_dir / "analysis" / "runtime_config.json"
+        if not reuse_config_path.is_file():
+            reuse_config_path = reuse_tree_dir.parent / "dynamix_config.json"
+        reuse_tree_fingerprint = {
+            "hierarchy_state": path_fingerprint(reuse_tree_dir / "hierarchy_state.json"),
+            "hierarchy_layers": path_fingerprint(reuse_tree_dir / "hierarchy_layers.json"),
+            "summary": path_fingerprint(reuse_tree_dir / "summary.json"),
+            "runtime_config": path_fingerprint(reuse_config_path),
+        }
+    else:
+        build_tree_cmd = [python_executable, "scripts/build_dynamix_tree.py", "--config", str(config_path)]
+        build_tree_contract = "04_build_tree:v2"
+        build_tree_source = {
+            "runner": source_fp["runner"],
+            "build_dynamix_tree": source_fp["build_dynamix_tree"],
+            "dynamix_core": source_fp["dynamix_core"],
+            "dynamix_trace2skill": source_fp["dynamix_trace2skill"],
+        }
+        reuse_tree_fingerprint = {"exists": False}
     build_tree_fingerprint = {
-        "stage_contract": "04_build_tree:v2",
+        "stage_contract": build_tree_contract,
         "cmd": build_tree_cmd,
         "config_sha256": file_sha256(config_path),
         "records_sha256": file_sha256(records),
         "openai_api_key": api_key_fingerprint(args.openai_api_key),
         "tree_scenario": args.tree_scenario,
-        "source": {
-            "runner": source_fp["runner"],
-            "build_dynamix_tree": source_fp["build_dynamix_tree"],
-            "dynamix_core": source_fp["dynamix_core"],
-            "dynamix_trace2skill": source_fp["dynamix_trace2skill"],
-        },
+        "reuse_tree_dir": str(reuse_tree_dir) if reuse_tree_dir is not None else "",
+        "reuse_tree_state": reuse_tree_fingerprint,
+        "source": build_tree_source,
     }
     build_tree_usage_env = {
         **env,

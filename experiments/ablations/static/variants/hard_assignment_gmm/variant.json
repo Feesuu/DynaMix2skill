@@ -1,0 +1,12 @@
+{
+  "variant_name": "hard_assignment_gmm",
+  "tree": {
+    "tree_policy": "projected_gmm_bic",
+    "soft_recursive_assignment": "primary_argmax",
+    "max_levels": 8
+  },
+  "skill_export": {
+    "min_level": null,
+    "max_level": null
+  }
+}

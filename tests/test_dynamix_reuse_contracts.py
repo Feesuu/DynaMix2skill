@@ -5,11 +5,14 @@ import asyncio
 import importlib.util
 import multiprocessing as mp
 import os
+import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 
 from dynamix_trace2skill.clients import EmbeddingClient, EmbeddingConfig, GenerationClient, GenerationConfig
@@ -440,6 +443,7 @@ def test_default_hierarchy_config_is_real_not_tiny_smoke():
     from dynamix_core.config import ProjectedGmmDynamicTreeConfig
 
     cfg = default_hierarchy_config({})
+    assert cfg.tree_policy == "projected_gmm_bic"
     assert cfg.gmm_bic.min_split_size == 2
     assert cfg.gmm_bic.min_effective_samples_per_component == 2
     assert cfg.gmm_bic.abs_kmax == 64
@@ -451,6 +455,7 @@ def test_default_hierarchy_config_is_real_not_tiny_smoke():
     assert cfg.dynamic_update.cumulative_mass_coverage == pytest.approx(0.90)
     assert cfg.budget_refinement.fallback == "gmm_bic_recursive"
     direct_cfg = ProjectedGmmDynamicTreeConfig.from_mapping({})
+    assert direct_cfg.tree_policy == "projected_gmm_bic"
     assert direct_cfg.soft_membership.recursive_assignment == "cumulative_mass"
     assert direct_cfg.soft_membership.cumulative_mass_coverage == pytest.approx(0.90)
     assert direct_cfg.dynamic_update.mode == "budget_constrained_online_gmm"
@@ -882,6 +887,27 @@ def test_experiment_runner_tree_resume_requires_matching_fingerprint(tmp_path):
     assert not runner.stage_done(marker, [output], fingerprint={"scenario": "dynamic_update"})
 
 
+def test_experiment_runner_reuse_tree_requires_reused_train_artifacts(tmp_path, monkeypatch):
+    runner = _load_experiment_runner_module()
+    tree = tmp_path / "baseline_tree"
+    tree.mkdir()
+    (tree / "hierarchy_state.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr("sys.argv", [
+        "run_dynamix_trace2skill_experiment.py",
+        "--data-path", str(tmp_path / "data"),
+        "--run-dir", str(tmp_path / "run"),
+        "--reuse-tree-dir", str(tree),
+        "--model", "mock-model",
+        "--openai-base-url", "mock://generation",
+        "--embedding-base-url", "mock://embedding",
+        "--embedding-model", "mock-embed",
+        "--embedding-tokenizer", "mock-tokenizer",
+        "--python-executable", sys.executable,
+    ])
+    with pytest.raises(RuntimeError, match="--reuse-tree-dir requires --records-path or --reuse-train-run-dir"):
+        runner.main()
+
+
 def test_experiment_runner_stage_report_aggregates_time_tokens_and_budget_pressure(tmp_path):
     runner = _load_experiment_runner_module()
     marker_dir = tmp_path / "stage_markers"
@@ -1214,6 +1240,100 @@ def test_static_tree_build_stops_before_gmm_when_effective_kmax_is_one():
     assert len(result.layers) == 1
     assert result.layers[0].clustering.stop_reason == "bic_selected_one"
     assert result.layers[0].committed is False
+
+
+def test_primary_argmax_memberships_are_structural_one_hot():
+    from dynamix_core.config import SoftMembershipConfig
+    from dynamix_core.gmm_bic import membership_weight_dicts
+
+    weights = membership_weight_dicts(
+        ["item0"],
+        ["c0", "c1"],
+        np.asarray([[0.60, 0.40]], dtype=float),
+        SoftMembershipConfig(recursive_assignment="primary_argmax"),
+    )
+    assert weights == {"item0": {"c0": 1.0}}
+
+
+def test_cumulative_mass_memberships_preserve_soft_weights():
+    from dynamix_core.config import SoftMembershipConfig
+    from dynamix_core.gmm_bic import membership_weight_dicts
+
+    weights = membership_weight_dicts(
+        ["item0"],
+        ["c0", "c1"],
+        np.asarray([[0.60, 0.40]], dtype=float),
+        SoftMembershipConfig(
+            recursive_assignment="cumulative_mass",
+            cumulative_mass_coverage=0.90,
+            max_membership_gap=0.25,
+            min_membership_weight=0.0,
+        ),
+    )
+    assert weights == {"item0": {"c0": pytest.approx(0.60), "c1": pytest.approx(0.40)}}
+
+
+def test_projected_kmeans_elbow_selects_hard_two_cluster_split():
+    from dynamix_core.tree_builder import ProjectedGmmTreeBuilder
+
+    cfg = default_hierarchy_config({
+        "tree_policy": "projected_kmeans_elbow",
+        "gmm_bic": {"min_split_size": 2, "min_effective_samples_per_component": 1, "abs_kmax": 4},
+        "kmeans": {"min_k": 1, "num_restarts": 3, "max_iter": 50},
+        "soft_membership": {"recursive_assignment": "primary_argmax"},
+        "budget_refinement": {"enabled": False},
+    })
+    items = [
+        ExperienceItem(item_id="a0", level=0, kind=ITEM_KIND_TRAJECTORY, text="a0", embedding=[1.0, 0.0]),
+        ExperienceItem(item_id="a1", level=0, kind=ITEM_KIND_TRAJECTORY, text="a1", embedding=[0.98, 0.02]),
+        ExperienceItem(item_id="b0", level=0, kind=ITEM_KIND_TRAJECTORY, text="b0", embedding=[-1.0, 0.0]),
+        ExperienceItem(item_id="b1", level=0, kind=ITEM_KIND_TRAJECTORY, text="b1", embedding=[-0.98, -0.02]),
+    ]
+    clustering = asyncio.run(ProjectedGmmTreeBuilder(cfg).cluster_layer(items, level=0))
+    assert not clustering.should_stop
+    assert clustering.chosen_k == 2
+    assert {community.clustering_method for community in clustering.communities} == {"weighted_kmeans_elbow"}
+    for community in clustering.communities:
+        assert set(community.member_weights) == set(community.posterior_member_weights)
+        assert set(community.member_weights.values()) == {1.0}
+
+
+def test_default_tree_policy_does_not_call_kmeans_selector(monkeypatch):
+    import dynamix_core.tree_builder as tree_builder
+    from dynamix_core.gmm_bic import GmmBicSelection, GmmCandidateFit
+    from dynamix_core.tree_builder import ProjectedGmmTreeBuilder
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("default projected_gmm_bic path must not call KMeans")
+
+    async def fake_gmm_selector(*_args, **_kwargs):
+        fit = GmmCandidateFit(
+            k=1,
+            valid=True,
+            bic=0.0,
+            log_likelihood=0.0,
+            pi=np.asarray([1.0], dtype=float),
+            means=np.zeros((1, 1), dtype=float),
+            variances=np.ones((1, 1), dtype=float),
+            responsibilities=np.ones((2, 1), dtype=float),
+            primary_labels=np.zeros(2, dtype=int),
+            component_masses=[2.0],
+            child_sizes=[2],
+        )
+        return GmmBicSelection(chosen=fit, candidates=[fit], bic_margin=0.0)
+
+    monkeypatch.setattr(tree_builder, "select_kmeans_split", fail_if_called)
+    monkeypatch.setattr(tree_builder, "select_gmm_bic_async", fake_gmm_selector)
+    cfg = default_hierarchy_config({})
+    result = asyncio.run(ProjectedGmmTreeBuilder(cfg)._select_projected_split(
+        np.zeros((2, 1), dtype=float),
+        level=0,
+        n_items=2,
+        random_seed=42,
+        sample_weights=np.ones(2, dtype=float),
+        kmax_effective_n=2.0,
+    ))
+    assert result.chosen.k == 1
 
 
 def test_budget_refinement_uses_static_prompt_token_estimator_before_analyst():
@@ -1682,6 +1802,160 @@ def test_nodebank_export_uses_only_name_trigger_content_for_embedding(tmp_path):
     assert "level:" not in node["embedding_text"]
     assert "support_mass" not in node["embedding_text"]
     assert not (tmp_path / "skills" / "SKILL.md").exists()
+
+
+def test_nodebank_export_level_filter_selects_retrieval_layers(tmp_path):
+    from dynamix_core.skill_export import SkillExportConfig, export_skill_files_from_payload
+
+    def card(item_id: str, level: int) -> dict[str, Any]:
+        return {
+            "item_id": item_id,
+            "level": level,
+            "kind": "experience_card",
+            "text": item_id,
+            "support_mass": float(level),
+            "generated_from_community_ids": [f"c{level}"],
+            "metadata": {
+                "name": f"Card {item_id}",
+                "trigger": "When relevant.",
+                "content": "Use the reusable experience.",
+                "confidence": 0.9,
+            },
+        }
+
+    payload = {"items": {"l1": card("l1", 1), "l2": card("l2", 2), "l3": card("l3", 3)}, "communities": {}}
+    all_nodes = export_skill_files_from_payload(payload, tmp_path / "all")
+    l1 = export_skill_files_from_payload(payload, tmp_path / "l1", config=SkillExportConfig(min_level=1, max_level=1))
+    l2plus = export_skill_files_from_payload(payload, tmp_path / "l2plus", config=SkillExportConfig(min_level=2))
+    assert {node.item_id for node in all_nodes.nodes} == {"l1", "l2", "l3"}
+    assert [node.item_id for node in l1.nodes] == ["l1"]
+    assert {node.item_id for node in l2plus.nodes} == {"l2", "l3"}
+    manifest = json.loads(Path(l2plus.manifest_path).read_text())
+    assert manifest["export_policy"]["level_filter"] == {"min_level": 2, "max_level": None}
+
+
+def test_reuse_tree_contract_rejects_non_baseline_source(tmp_path):
+    script = Path(__file__).resolve().parents[1] / "scripts" / "export_dynamix_nodebank.py"
+    spec = importlib.util.spec_from_file_location("export_dynamix_nodebank", script)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+
+    source = tmp_path / "source_tree"
+    (source / "analysis").mkdir(parents=True)
+    target = DynaMixRunConfig(
+        output_dir=str(tmp_path / "target"),
+        records_path=str(tmp_path / "records.json"),
+        scenario="static_build",
+        dataset_path="/data/spreadsheetbench",
+        train_start=0,
+        train_end=200,
+        chunked_embedding={"enabled": True, "chunk_tokens": 28000, "overlap_tokens": 1000, "pooling": "mean"},
+        max_levels=8,
+    )
+
+    def full_config_payload(config: DynaMixRunConfig) -> dict[str, Any]:
+        payload = asdict(config)
+        payload["hierarchy"] = asdict(default_hierarchy_config(config.hierarchy))
+        return json.loads(json.dumps(payload))
+
+    def write_source_config(payload: dict[str, Any]) -> None:
+        (source / "summary.json").write_text(json.dumps({"scenario": "static_build"}), encoding="utf-8")
+        (source / "analysis" / "runtime_config.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    baseline_config = full_config_payload(target)
+    write_source_config(baseline_config)
+    accepted = module._validate_source_tree_contract(source, target_config=target)
+    assert accepted["observed"]["tree_policy"] == "projected_gmm_bic"
+
+    bad_config = json.loads(json.dumps(baseline_config))
+    bad_config["hierarchy"]["tree_policy"] = "projected_kmeans_elbow"
+    write_source_config(bad_config)
+    with pytest.raises(ValueError, match="not the expected full static baseline"):
+        module._validate_source_tree_contract(source, target_config=target)
+
+    bad_config = json.loads(json.dumps(baseline_config))
+    bad_config["hierarchy"]["soft_membership"]["recursive_assignment"] = "primary_argmax"
+    write_source_config(bad_config)
+    with pytest.raises(ValueError, match="not the expected full static baseline"):
+        module._validate_source_tree_contract(source, target_config=target)
+
+    bad_config = json.loads(json.dumps(baseline_config))
+    bad_config["analyst"]["max_cards_l0"] = 1
+    write_source_config(bad_config)
+    with pytest.raises(ValueError, match="not the expected full static baseline"):
+        module._validate_source_tree_contract(source, target_config=target)
+
+    bad_config = json.loads(json.dumps(baseline_config))
+    bad_config["max_levels"] = 1
+    write_source_config(bad_config)
+    with pytest.raises(ValueError, match="not the expected full static baseline"):
+        module._validate_source_tree_contract(source, target_config=target)
+
+    bad_config = json.loads(json.dumps(baseline_config))
+    bad_config["dataset_path"] = "/data/different_spreadsheetbench"
+    write_source_config(bad_config)
+    with pytest.raises(ValueError, match="source protocol does not match"):
+        module._validate_source_tree_contract(source, target_config=target)
+
+    bad_config = json.loads(json.dumps(baseline_config))
+    bad_config["embedding"]["base_url"] = "http://different-embedding/v1"
+    write_source_config(bad_config)
+    with pytest.raises(ValueError, match="source protocol does not match"):
+        module._validate_source_tree_contract(source, target_config=target)
+
+    write_source_config(baseline_config)
+    target_kmeans = DynaMixRunConfig(
+        output_dir=str(tmp_path / "target_kmeans"),
+        records_path=str(tmp_path / "records.json"),
+        scenario="static_build",
+        dataset_path="/data/spreadsheetbench",
+        train_start=0,
+        train_end=200,
+        chunked_embedding={"enabled": True, "chunk_tokens": 28000, "overlap_tokens": 1000, "pooling": "mean"},
+        hierarchy={"tree_policy": "projected_kmeans_elbow"},
+        max_levels=8,
+    )
+    with pytest.raises(ValueError, match="reuse-tree target is not the expected full static baseline"):
+        module._validate_source_tree_contract(source, target_config=target_kmeans)
+
+    target_l1_only = DynaMixRunConfig(
+        output_dir=str(tmp_path / "target_l1_only"),
+        records_path=str(tmp_path / "records.json"),
+        scenario="static_build",
+        dataset_path="/data/spreadsheetbench",
+        train_start=0,
+        train_end=200,
+        chunked_embedding={"enabled": True, "chunk_tokens": 28000, "overlap_tokens": 1000, "pooling": "mean"},
+        max_levels=1,
+    )
+    with pytest.raises(ValueError, match="reuse-tree target is not the expected full static baseline"):
+        module._validate_source_tree_contract(source, target_config=target_l1_only)
+
+
+def test_retrieval_only_variant_requires_reused_train_artifacts(tmp_path, monkeypatch):
+    script = Path(__file__).resolve().parents[1] / "experiments" / "ablations" / "static" / "common" / "run_variant.py"
+    spec = importlib.util.spec_from_file_location("run_static_ablation_variant", script)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+
+    variant = {
+        "variant_name": "retrieve_l1_only",
+        "reuse_full_tree": True,
+        "tree": {"tree_policy": "projected_gmm_bic"},
+        "skill_export": {"min_level": 1, "max_level": 1},
+    }
+    variant_path = tmp_path / "variant.json"
+    variant_path.write_text(json.dumps(variant), encoding="utf-8")
+    monkeypatch.setenv("REPO_ROOT", str(Path(__file__).resolve().parents[1]))
+    monkeypatch.setenv("RUN_ROOT", str(tmp_path / "runs"))
+    monkeypatch.setenv("BASELINE_TREE_DIR", str(tmp_path / "baseline_tree"))
+    monkeypatch.delenv("RECORDS_PATH", raising=False)
+    monkeypatch.delenv("REUSE_TRAIN_RUN_DIR", raising=False)
+    monkeypatch.setattr("sys.argv", ["run_variant.py", "--variant-json", str(variant_path)])
+    with pytest.raises(SystemExit, match="retrieval-only variants require RECORDS_PATH or REUSE_TRAIN_RUN_DIR"):
+        module.main()
 
 
 def test_cluster_prompt_uses_minimal_experience_schema():

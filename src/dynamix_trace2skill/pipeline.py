@@ -56,6 +56,7 @@ class DynaMixRunConfig:
     dynamic: DynamicPipelineConfig = field(default_factory=DynamicPipelineConfig)
     max_levels: int = 8
     skill_output_dir_name: str = "skills"
+    skill_export: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_json(cls, path: str | Path) -> "DynaMixRunConfig":
@@ -76,6 +77,7 @@ class DynaMixRunConfig:
             dynamic=DynamicPipelineConfig(**payload.get("dynamic", {})),
             max_levels=int(payload.get("max_levels", 8)),
             skill_output_dir_name=str(payload.get("skill_output_dir_name", "skills")),
+            skill_export=dict(payload.get("skill_export", {})),
         )
 
 
@@ -87,6 +89,7 @@ def default_hierarchy_config(payload: dict[str, Any] | None = None) -> Projected
     """
     data = dict(payload or {})
     return ProjectedGmmDynamicTreeConfig.from_mapping({
+        "tree_policy": data.get("tree_policy", "projected_gmm_bic"),
         "projection": data.get("projection", {"variance_ratio": 0.90, "max_dim": 32, "min_dim": 2, "whiten": False}),
         "gmm_bic": data.get("gmm_bic", {
             "covariance_type": "spherical",
@@ -101,6 +104,7 @@ def default_hierarchy_config(payload: dict[str, Any] | None = None) -> Projected
             "max_concurrent_candidates": 1,
             "max_concurrent_restarts": 1,
         }),
+        "kmeans": data.get("kmeans", {}),
         "soft_membership": data.get("soft_membership", {
             "save_soft_edges": True,
             "recursive_assignment": "cumulative_mass",
@@ -161,7 +165,7 @@ async def build_tree_from_records(config: DynaMixRunConfig) -> dict[str, Any]:
     (out / "hierarchy_layers.json").write_text(json.dumps(layers_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     try:
-        skill_result = await export_skill_files(result.state, out, config=SkillExportConfig(output_dir_name=config.skill_output_dir_name))
+        skill_result = await export_skill_files(result.state, out, config=_skill_export_config(config))
         skillbank_index = _refresh_skillbank_index(skill_result.output_dir, config)
         empty_nodebank_reason = ""
     except ValueError as exc:
@@ -286,7 +290,7 @@ async def build_dynamic_tree_from_records(config: DynaMixRunConfig) -> dict[str,
         snap_dir = out / "dynamic_snapshots" / f"batch_{batch_index:03d}"
         snap_dir.mkdir(parents=True, exist_ok=True)
         (snap_dir / "hierarchy_state.json").write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
-        skill_result = await export_skill_files(state, snap_dir, config=SkillExportConfig(output_dir_name=config.skill_output_dir_name))
+        skill_result = await export_skill_files(state, snap_dir, config=_skill_export_config(config))
         skillbank_index = _refresh_skillbank_index(skill_result.output_dir, config)
         from dynamix_core.skill_export import affected_node_refs
         affected_refs = affected_node_refs(update_result.changed_item_ids, skill_result.manifest_path)
@@ -320,7 +324,7 @@ async def build_dynamic_tree_from_records(config: DynaMixRunConfig) -> dict[str,
     analyst.save_prompt_token_report(out / "analysis" / "cluster_prompt_token_report.json")
     final_state = await state.to_dict(include_embeddings=False, validate=True)
     (out / "hierarchy_state.json").write_text(json.dumps(final_state, ensure_ascii=False, indent=2), encoding="utf-8")
-    final_skill = await export_skill_files(state, out, config=SkillExportConfig(output_dir_name=config.skill_output_dir_name))
+    final_skill = await export_skill_files(state, out, config=_skill_export_config(config))
     final_skillbank_index = _refresh_skillbank_index(final_skill.output_dir, config)
     summary = {
         "scenario": "dynamic_update",
@@ -413,7 +417,8 @@ async def _embed_records_for_build(
 
 
 def _write_empty_skillbank(out: Path, config: DynaMixRunConfig, *, reason: str) -> SkillExportResult:
-    bank_dir = out / config.skill_output_dir_name
+    export_config = _skill_export_config(config)
+    bank_dir = out / export_config.output_dir_name
     bank_dir.mkdir(parents=True, exist_ok=True)
     manifest = {
         "format": "dynamix_node_skill_bank_v1",
@@ -427,6 +432,7 @@ def _write_empty_skillbank(out: Path, config: DynaMixRunConfig, *, reason: str) 
             "diagnostic_oversize_nodes_exported": False,
             "skill_md_files_generated": False,
             "heldout_retrieval": "dense_top_k_nodes",
+            "level_filter": {"min_level": export_config.min_level, "max_level": export_config.max_level},
         },
         "output_dir": str(bank_dir),
         "node_count": 0,
@@ -441,6 +447,16 @@ def _write_empty_skillbank(out: Path, config: DynaMixRunConfig, *, reason: str) 
         manifest_path=str(manifest_path),
         node_count=0,
         nodes=[],
+    )
+
+
+def _skill_export_config(config: DynaMixRunConfig) -> SkillExportConfig:
+    payload = dict(config.skill_export or {})
+    return SkillExportConfig(
+        output_dir_name=str(payload.get("output_dir_name") or config.skill_output_dir_name),
+        max_node_count=payload.get("max_node_count"),
+        min_level=payload.get("min_level"),
+        max_level=payload.get("max_level"),
     )
 
 
@@ -651,7 +667,10 @@ def _layers_payload(layers) -> list[dict[str, Any]]:
             "chosen_k": layer.clustering.chosen_k,
             "tested_k": layer.clustering.tested_k,
             "bic_by_k": layer.clustering.bic_by_k,
+            "selection_score_by_k": layer.clustering.bic_by_k,
             "bic_margin": layer.clustering.bic_margin,
+            "selection_score_kind": layer.clustering.selection_score_kind,
+            "split_selector": layer.clustering.split_selector,
             "summary_budget": layer.clustering.summary_budget,
         }
         for layer in layers

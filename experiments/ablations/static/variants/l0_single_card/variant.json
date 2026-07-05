@@ -1,0 +1,13 @@
+{
+  "variant_name": "l0_single_card",
+  "tree": {
+    "tree_policy": "projected_gmm_bic",
+    "soft_recursive_assignment": "cumulative_mass",
+    "analyst_max_cards_l0": 1,
+    "max_levels": 8
+  },
+  "skill_export": {
+    "min_level": null,
+    "max_level": null
+  }
+}

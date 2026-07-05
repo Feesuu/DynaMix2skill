@@ -69,6 +69,27 @@ class GmmBicConfig:
 
 
 @dataclass(frozen=True)
+class KMeansConfig:
+    fixed_k: int = 8
+    min_k: int = 1
+    num_restarts: int = 5
+    max_iter: int = 100
+    tol: float = 1.0e-4
+
+    def validate(self) -> None:
+        if self.fixed_k < 1:
+            raise ValueError("kmeans.fixed_k must be >= 1")
+        if self.min_k < 1:
+            raise ValueError("kmeans.min_k must be >= 1")
+        if self.num_restarts < 1:
+            raise ValueError("kmeans.num_restarts must be >= 1")
+        if self.max_iter < 1:
+            raise ValueError("kmeans.max_iter must be >= 1")
+        if self.tol <= 0.0:
+            raise ValueError("kmeans.tol must be positive")
+
+
+@dataclass(frozen=True)
 class SoftMembershipConfig:
     save_soft_edges: bool = True
     top_r_memberships: int = 2
@@ -231,6 +252,7 @@ class ProjectedGmmDynamicTreeConfig:
     random_seed: int = 42
     projection: ProjectionConfig = field(default_factory=ProjectionConfig)
     gmm_bic: GmmBicConfig = field(default_factory=GmmBicConfig)
+    kmeans: KMeansConfig = field(default_factory=KMeansConfig)
     soft_membership: SoftMembershipConfig = field(default_factory=SoftMembershipConfig)
     summary_budget: SummaryBudgetConfig = field(default_factory=SummaryBudgetConfig)
     budget_refinement: BudgetRefinementConfig = field(default_factory=BudgetRefinementConfig)
@@ -248,6 +270,7 @@ class ProjectedGmmDynamicTreeConfig:
             random_seed=int(data.get("random_seed", 42)),
             projection=ProjectionConfig(**dict(data.get("projection", {}))),
             gmm_bic=GmmBicConfig(**_clean_gmm_bic_payload(dict(data.get("gmm_bic", {})))),
+            kmeans=KMeansConfig(**dict(data.get("kmeans", {}))),
             soft_membership=SoftMembershipConfig(**_clean_soft_membership_payload(dict(data.get("soft_membership", {})))),
             summary_budget=SummaryBudgetConfig(**_clean_summary_budget_payload(dict(data.get("summary_budget", {})))),
             budget_refinement=BudgetRefinementConfig(**dict(data.get("budget_refinement", {}))),
@@ -257,8 +280,13 @@ class ProjectedGmmDynamicTreeConfig:
         return config
 
     def validate(self) -> None:
-        if self.tree_policy != "projected_gmm_bic":
-            raise ValueError("tree_policy must be 'projected_gmm_bic'")
+        allowed_policies = {
+            "projected_gmm_bic",
+            "projected_kmeans_elbow",
+            "projected_kmeans_fixed",
+        }
+        if self.tree_policy not in allowed_policies:
+            raise ValueError(f"tree_policy must be one of {sorted(allowed_policies)}")
         if self.graph_kind not in {"overlapping_experience_hierarchy", "overlapping_hierarchy_dag"}:
             raise ValueError("graph_kind must be overlapping_experience_hierarchy or overlapping_hierarchy_dag")
         if not self.allow_overlap:
@@ -269,6 +297,7 @@ class ProjectedGmmDynamicTreeConfig:
             raise ValueError("use_support_mass must be true")
         self.projection.validate()
         self.gmm_bic.validate()
+        self.kmeans.validate()
         self.soft_membership.validate()
         self.summary_budget.validate()
         self.budget_refinement.validate()
@@ -321,6 +350,7 @@ __all__ = [
     "BudgetRefinementConfig",
     "DynamicUpdateConfig",
     "GmmBicConfig",
+    "KMeansConfig",
     "ProjectedGmmDynamicTreeConfig",
     "ProjectionConfig",
     "SoftMembershipConfig",

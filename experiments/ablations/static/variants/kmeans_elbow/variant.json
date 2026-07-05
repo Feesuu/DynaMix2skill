@@ -1,0 +1,13 @@
+{
+  "variant_name": "kmeans_elbow",
+  "tree": {
+    "tree_policy": "projected_kmeans_elbow",
+    "soft_recursive_assignment": "primary_argmax",
+    "kmeans_min_k": 1,
+    "max_levels": 8
+  },
+  "skill_export": {
+    "min_level": null,
+    "max_level": null
+  }
+}

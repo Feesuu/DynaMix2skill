@@ -1,0 +1,12 @@
+{
+  "variant_name": "l1_only",
+  "tree": {
+    "tree_policy": "projected_gmm_bic",
+    "soft_recursive_assignment": "cumulative_mass",
+    "max_levels": 1
+  },
+  "skill_export": {
+    "min_level": 1,
+    "max_level": 1
+  }
+}

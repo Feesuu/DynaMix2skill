@@ -31,6 +31,16 @@ class SkillExportConfig:
 
     output_dir_name: str = "skills"
     max_node_count: int | None = None
+    min_level: int | None = None
+    max_level: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.min_level is not None and int(self.min_level) < 0:
+            raise ValueError("skill_export.min_level must be >= 0 when set")
+        if self.max_level is not None and int(self.max_level) < 0:
+            raise ValueError("skill_export.max_level must be >= 0 when set")
+        if self.min_level is not None and self.max_level is not None and int(self.min_level) > int(self.max_level):
+            raise ValueError("skill_export.min_level must be <= max_level")
 
 
 @dataclass(frozen=True)
@@ -86,7 +96,7 @@ def export_skill_files_from_payload(
     nodes = _sort_nodes_for_bank([
         _node_from_payload(item)
         for item in items.values()
-        if _is_exportable_experience_card(item)
+        if _is_exportable_experience_card(item) and _level_allowed(item, config)
     ])
     if config.max_node_count is not None:
         nodes = nodes[: max(0, int(config.max_node_count))]
@@ -107,6 +117,7 @@ def export_skill_files_from_payload(
             "diagnostic_oversize_nodes_exported": False,
             "skill_md_files_generated": False,
             "heldout_retrieval": "dense_top_k_nodes",
+            "level_filter": {"min_level": config.min_level, "max_level": config.max_level},
         },
         "output_dir": str(out),
         "node_count": len(nodes),
@@ -141,6 +152,15 @@ def _is_exportable_experience_card(item: Mapping[str, Any] | dict[str, Any]) -> 
     if metadata.get("llm_summary_skipped") or metadata.get("oversize_singleton"):
         return False
     if str(metadata.get("name", "")).strip() == "Oversize Trajectory Reference":
+        return False
+    return True
+
+
+def _level_allowed(item: Mapping[str, Any], config: SkillExportConfig) -> bool:
+    level = int(item.get("level", -1))
+    if config.min_level is not None and level < int(config.min_level):
+        return False
+    if config.max_level is not None and level > int(config.max_level):
         return False
     return True
 

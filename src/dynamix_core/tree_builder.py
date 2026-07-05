@@ -15,7 +15,8 @@ from .data_structures import (
     ITEM_KIND_EXPERIENCE_CARD,
 )
 from .gmm_bic import GmmBicSelection, GmmCandidateFit, compute_kmax, membership_weight_dicts, select_gmm_bic_async
-from .projection import ProjectionResult, local_pca_project_async, normalize_rows
+from .kmeans_split import select_kmeans_split
+from .projection import ProjectionResult, local_pca_project, normalize_rows
 
 SummaryFn = Callable[
     [ExperienceCommunity, list[ExperienceItem], "LayerClusteringResult"],
@@ -74,6 +75,8 @@ class LayerClusteringResult:
     bic_by_k: dict[str, float] = field(default_factory=dict)
     log_likelihood_by_k: dict[str, float] = field(default_factory=dict)
     bic_margin: float = 0.0
+    selection_score_kind: str = "bic"
+    split_selector: str = "weighted_gmm_bic"
     routing_model: LayerRoutingModel | None = None
     summary_budget: dict[str, Any] = field(default_factory=dict)
 
@@ -163,7 +166,8 @@ class ProjectedGmmTreeBuilder:
             return LayerBuildResult(clustering=clustering, generated_item_ids=[], committed=False)
 
         metadata = {
-            "builder": "projected_weighted_gmm_bic",
+            "builder": self._builder_name(),
+            "tree_policy": self.config.tree_policy,
             "chosen_k": clustering.chosen_k,
             "bic_margin": clustering.bic_margin,
             "projection_dim": clustering.projection_dim,
@@ -299,6 +303,8 @@ class ProjectedGmmTreeBuilder:
                 tested_k=[1],
                 summary_budget={
                     "effective_token_budget": int(token_budget),
+                    "selection_score_kind": "bic",
+                    "split_selector": "weighted_gmm_bic",
                     "bic_selected_k": 1,
                     "coarse_selected_k": 1,
                     "budget_enforced": bool(refined["summary_budget"].get("refinement_routing_tree") or refined["excluded_input_item_ids"]),
@@ -307,17 +313,15 @@ class ProjectedGmmTreeBuilder:
             )
 
         embeddings = normalize_rows(np.asarray([item.embedding for item in ordered], dtype=float))
-        projection = await local_pca_project_async(embeddings, self.config.projection)
+        projection = local_pca_project(embeddings, self.config.projection)
         weights = _normalized_gmm_sample_weights(ordered)
-        selection = await select_gmm_bic_async(
+        selection = await self._select_projected_split(
             projection.projected,
-            config=self.config.gmm_bic,
-            soft_config=self.config.soft_membership,
+            level=level,
+            n_items=n_items,
             random_seed=int(self.config.random_seed) + level * 100003 + n_items,
             sample_weights=weights,
             kmax_effective_n=float(n_items),
-            max_concurrent_candidates=self.config.gmm_bic.max_concurrent_candidates,
-            max_concurrent_restarts=self.config.gmm_bic.max_concurrent_restarts,
         )
         if selection.chosen.k <= 1:
             if budget_refinement_enabled:
@@ -358,8 +362,10 @@ class ProjectedGmmTreeBuilder:
                     fit=selection.chosen,
                     routing_model=None,
                     refined=refined,
+                    selection_score_kind=self._selection_score_kind(),
+                    split_selector=self._community_clustering_method(),
                 )
-            return _stopped_from_selection(level, input_ids, "bic_selected_one", projection, selection)
+            return _stopped_from_selection(level, input_ids, "bic_selected_one", projection, selection, selection_score_kind=self._selection_score_kind(), split_selector=self._community_clustering_method())
 
         fit = selection.chosen
         parts = _candidate_layer_parts(
@@ -369,9 +375,10 @@ class ProjectedGmmTreeBuilder:
             items_by_id=items_by_id,
             token_counts=token_counts,
             soft_config=self.config.soft_membership,
+            clustering_method=self._community_clustering_method(),
         )
         if parts is None:
-            return _stopped_from_selection(level, input_ids, "membership_collapsed", projection, selection)
+            return _stopped_from_selection(level, input_ids, "membership_collapsed", projection, selection, selection_score_kind=self._selection_score_kind(), split_selector=self._community_clustering_method())
 
         communities = parts["communities"]
         member_ids_by_community = parts["member_ids_by_community"]
@@ -417,15 +424,75 @@ class ProjectedGmmTreeBuilder:
             bic_by_k={str(candidate.k): float(candidate.bic) for candidate in selection.candidates},
             log_likelihood_by_k={str(candidate.k): float(candidate.log_likelihood) for candidate in selection.candidates},
             bic_margin=float(selection.bic_margin),
+            selection_score_kind=self._selection_score_kind(),
+            split_selector=self._community_clustering_method(),
             routing_model=routing_model,
             summary_budget={
                 "effective_token_budget": int(token_budget),
+                "selection_score_kind": self._selection_score_kind(),
+                "split_selector": self._community_clustering_method(),
+                "kmeans_fixed_k_requested": int(self.config.kmeans.fixed_k) if self.config.tree_policy == "projected_kmeans_fixed" else None,
                 "bic_selected_k": int(selection.chosen.k),
                 "coarse_selected_k": int(fit.k),
                 "budget_enforced": bool(refined["summary_budget"].get("refinement_routing_tree") or refined["excluded_input_item_ids"]),
                 **refined["summary_budget"],
             },
         )
+
+    def _builder_name(self) -> str:
+        mapping = {
+            "projected_gmm_bic": "projected_weighted_gmm_bic",
+            "projected_kmeans_elbow": "projected_weighted_kmeans_elbow",
+            "projected_kmeans_fixed": "projected_weighted_kmeans_fixed",
+        }
+        return mapping.get(self.config.tree_policy, self.config.tree_policy)
+
+    def _community_clustering_method(self) -> str:
+        mapping = {
+            "projected_gmm_bic": "weighted_gmm_bic",
+            "projected_kmeans_elbow": "weighted_kmeans_elbow",
+            "projected_kmeans_fixed": "weighted_kmeans_fixed",
+        }
+        return mapping.get(self.config.tree_policy, self.config.tree_policy)
+
+    def _selection_score_kind(self) -> str:
+        if self.config.tree_policy in {"projected_kmeans_elbow", "projected_kmeans_fixed"}:
+            return "weighted_inertia"
+        return "bic"
+
+    async def _select_projected_split(
+        self,
+        projected: np.ndarray,
+        *,
+        level: int,
+        n_items: int,
+        random_seed: int,
+        sample_weights: np.ndarray,
+        kmax_effective_n: float,
+    ) -> GmmBicSelection:
+        if self.config.tree_policy == "projected_gmm_bic":
+            return await select_gmm_bic_async(
+                projected,
+                config=self.config.gmm_bic,
+                soft_config=self.config.soft_membership,
+                random_seed=random_seed,
+                sample_weights=sample_weights,
+                kmax_effective_n=kmax_effective_n,
+                max_concurrent_candidates=self.config.gmm_bic.max_concurrent_candidates,
+                max_concurrent_restarts=self.config.gmm_bic.max_concurrent_restarts,
+            )
+        if self.config.tree_policy in {"projected_kmeans_elbow", "projected_kmeans_fixed"}:
+            mode = "fixed" if self.config.tree_policy == "projected_kmeans_fixed" else "elbow"
+            return select_kmeans_split(
+                projected,
+                gmm_config=self.config.gmm_bic,
+                kmeans_config=self.config.kmeans,
+                mode=mode,
+                random_seed=random_seed,
+                sample_weights=sample_weights,
+                kmax_effective_n=kmax_effective_n,
+            )
+        raise ValueError(f"unsupported projected tree_policy={self.config.tree_policy!r} at level {level} with n_items={n_items}")
 
     async def _estimate_community_token_cost(
         self,
@@ -1027,18 +1094,16 @@ class ProjectedGmmTreeBuilder:
             return {"accepted": False, "reason": "too_few_items_for_gmm_refinement"}
         local_ids = [item.item_id for item in local_items]
         embeddings = normalize_rows(np.asarray([item.embedding for item in local_items], dtype=float))
-        projection = await local_pca_project_async(embeddings, self.config.projection)
+        projection = local_pca_project(embeddings, self.config.projection)
         path_weights = dict(node["path_weights"])
         weights = _normalized_gmm_sample_weights(local_items, path_weights=path_weights)
-        selection = await select_gmm_bic_async(
+        selection = await self._select_projected_split(
             projection.projected,
-            config=self.config.gmm_bic,
-            soft_config=self.config.soft_membership,
+            level=level,
+            n_items=len(local_items),
             random_seed=int(self.config.random_seed) + level * 100003 + len(local_items) + int(node["depth"]) * 7919,
             sample_weights=weights,
             kmax_effective_n=float(len(local_items)),
-            max_concurrent_candidates=self.config.gmm_bic.max_concurrent_candidates,
-            max_concurrent_restarts=self.config.gmm_bic.max_concurrent_restarts,
         )
 
         candidates: list[dict[str, Any]] = []
@@ -1070,10 +1135,12 @@ class ProjectedGmmTreeBuilder:
         tested = [int(candidate.k) for candidate in selection.candidates]
         bic_by_k = {f"{node['node_id']}:k={candidate.k}": float(candidate.bic) for candidate in selection.candidates}
         ll_by_k = {f"{node['node_id']}:k={candidate.k}": float(candidate.log_likelihood) for candidate in selection.candidates}
+        split_selector = self._community_clustering_method()
         if not candidates:
             return {
                 "accepted": False,
-                "reason": "no_nontrivial_gmm_candidate",
+                "reason": f"no_nontrivial_{split_selector}_candidate",
+                "split_selector": split_selector,
                 "node_id": node["node_id"],
                 "tested_k": tested,
                 "bic_by_k": bic_by_k,
@@ -1089,7 +1156,8 @@ class ProjectedGmmTreeBuilder:
             best = min(candidates, key=lambda cand: (cand["max_child_token_cost"], cand["fit"].bic, cand["fit"].k))
             return {
                 "accepted": False,
-                "reason": "gmm_candidates_do_not_reduce_prompt_tokens",
+                "reason": f"{split_selector}_candidates_do_not_reduce_prompt_tokens",
+                "split_selector": split_selector,
                 "node_id": node["node_id"],
                 "parent_prompt_tokens": int(parent_token_cost),
                 "best_max_child_prompt_tokens": int(best["max_child_token_cost"]),
@@ -1121,7 +1189,8 @@ class ProjectedGmmTreeBuilder:
         safe_active = active_components or list(range(int(fit.k)))
         return {
             "accepted": True,
-            "split_reason": "budget_forced_gmm_bic_progress",
+            "split_reason": f"budget_forced_{split_selector}_progress",
+            "split_selector": split_selector,
             "statistical_split": True,
             "node_id": node["node_id"],
             "parent_prompt_tokens": int(parent_token_cost),
@@ -1138,6 +1207,7 @@ class ProjectedGmmTreeBuilder:
             "routing_node": {
                 "node_id": node["node_id"],
                 "kind": "gmm_split",
+                "split_selector": split_selector,
                 "level": int(level),
                 "pca_mean": projection.mean.astype(float).tolist(),
                 "pca_components": projection.components.astype(float).tolist(),
@@ -1185,14 +1255,18 @@ def _candidate_layer_parts(
     items_by_id: dict[str, ExperienceItem],
     token_counts: dict[str, int],
     soft_config: SoftMembershipConfig,
+    clustering_method: str = "weighted_gmm_bic",
 ) -> dict[str, Any] | None:
     child_ids = [f"L{level}_C{component}" for component in range(fit.k)]
     selected_memberships = membership_weight_dicts(input_ids, child_ids, fit.responsibilities, soft_config)
     selected_memberships = {iid: {cid: w for cid, w in weights.items() if float(w) > 1.0e-12} for iid, weights in selected_memberships.items()}
-    full_memberships = {
-        item_id: {child_ids[col]: float(fit.responsibilities[row, col]) for col in range(len(child_ids))}
-        for row, item_id in enumerate(input_ids)
-    }
+    if not soft_config.save_soft_edges or soft_config.recursive_assignment == "primary_argmax":
+        full_memberships = selected_memberships
+    else:
+        full_memberships = {
+            item_id: {child_ids[col]: float(fit.responsibilities[row, col]) for col in range(len(child_ids))}
+            for row, item_id in enumerate(input_ids)
+        }
 
     selected_by_child: dict[str, dict[str, float]] = {cid: {} for cid in child_ids}
     posterior_by_child: dict[str, dict[str, float]] = {cid: {} for cid in child_ids}
@@ -1224,7 +1298,7 @@ def _candidate_layer_parts(
                 level=level,
                 member_weights=member_weights,
                 posterior_member_weights=posterior_by_child.get(child_id, {}),
-                clustering_method="weighted_gmm_bic",
+                clustering_method=clustering_method,
                 support_mass=_support_mass(items_by_id, member_weights),
                 outcome_mode=outcome_mode,
                 success_count=success_count,
@@ -1237,6 +1311,7 @@ def _candidate_layer_parts(
                     "chosen_k": int(fit.k),
                     "bic": float(fit.bic),
                     "log_likelihood": float(fit.log_likelihood),
+                    "selection_score": float(fit.bic),
                 },
             )
         )
@@ -1260,6 +1335,8 @@ def _clustering_from_refinement(
     fit: GmmCandidateFit,
     routing_model: LayerRoutingModel | None,
     refined: dict[str, Any],
+    selection_score_kind: str = "bic",
+    split_selector: str = "weighted_gmm_bic",
 ) -> LayerClusteringResult:
     return LayerClusteringResult(
         level=level,
@@ -1276,8 +1353,14 @@ def _clustering_from_refinement(
         bic_by_k={str(candidate.k): float(candidate.bic) for candidate in selection.candidates},
         log_likelihood_by_k={str(candidate.k): float(candidate.log_likelihood) for candidate in selection.candidates},
         bic_margin=float(selection.bic_margin),
+        selection_score_kind=selection_score_kind,
+        split_selector=split_selector,
         routing_model=routing_model,
-        summary_budget=dict(refined["summary_budget"]),
+        summary_budget={
+            "selection_score_kind": selection_score_kind,
+            "split_selector": split_selector,
+            **dict(refined["summary_budget"]),
+        },
     )
 
 
@@ -1422,7 +1505,16 @@ def _stopped(level: int, input_ids: list[str], reason: str) -> LayerClusteringRe
     return LayerClusteringResult(level=level, input_item_ids=list(input_ids), communities=[], member_item_ids_by_community={}, stop_reason=reason)
 
 
-def _stopped_from_selection(level: int, input_ids: list[str], reason: str, projection: ProjectionResult, selection: GmmBicSelection) -> LayerClusteringResult:
+def _stopped_from_selection(
+    level: int,
+    input_ids: list[str],
+    reason: str,
+    projection: ProjectionResult,
+    selection: GmmBicSelection,
+    *,
+    selection_score_kind: str = "bic",
+    split_selector: str = "weighted_gmm_bic",
+) -> LayerClusteringResult:
     return LayerClusteringResult(
         level=level,
         input_item_ids=list(input_ids),
@@ -1437,6 +1529,8 @@ def _stopped_from_selection(level: int, input_ids: list[str], reason: str, proje
         bic_by_k={str(candidate.k): float(candidate.bic) for candidate in selection.candidates},
         log_likelihood_by_k={str(candidate.k): float(candidate.log_likelihood) for candidate in selection.candidates},
         bic_margin=float(selection.bic_margin),
+        selection_score_kind=selection_score_kind,
+        split_selector=split_selector,
     )
 
 

@@ -157,7 +157,10 @@ def soft_memberships(
     for row_index, item_id in enumerate(item_ids):
         selected = _select_membership_indices(matrix[row_index], config)
         result[item_id] = [
-            {"child_id": child_ids[int(index)], "weight": float(matrix[row_index, int(index)])}
+            {
+                "child_id": child_ids[int(index)],
+                "weight": 1.0 if (not config.save_soft_edges or config.recursive_assignment == "primary_argmax") else float(matrix[row_index, int(index)]),
+            }
             for index in selected
         ]
     return result
