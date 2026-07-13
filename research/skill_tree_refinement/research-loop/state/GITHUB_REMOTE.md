@@ -8,7 +8,7 @@
 | Remote URL | `https://github.com/Feesuu/DynaMix2skill.git` |
 | Default branch | `main` |
 | Current branch | `main` |
-| Current HEAD | `06bb7803c3e4262f6e2a6f5c0dc2859c6dae2c8a` |
+| Current method checkpoint | `c2444dfef4c9fe8ed3c9c738f233863dd6c79302` |
 | First push scope | research-loop artifacts only after user review; never stage unrelated dirty files |
 | `.gitignore` / data exclusion notes | exclude run outputs, datasets, caches, secrets, raw trajectories, and large model artifacts |
 | Auth or remote blockers | working tree already contains unrelated tracked and untracked changes; no automatic commit/push |
