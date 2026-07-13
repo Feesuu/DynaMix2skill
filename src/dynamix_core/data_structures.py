@@ -832,6 +832,7 @@ def _community_allows_no_generated_card(community: ExperienceCommunity) -> bool:
         metadata.get("llm_summary_skipped")
         or metadata.get("dynamic_llm_summary_skipped")
         or metadata.get("oversize_singleton")
+        or metadata.get("higher_level_abstraction_skipped")
     )
 
 

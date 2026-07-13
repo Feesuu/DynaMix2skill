@@ -9,6 +9,7 @@ from sklearn.decomposition import PCA
 from .config import ProjectionConfig
 
 _EPS = 1.0e-12
+_SKLEARN_RANDOM_SEED_MODULUS = 2**32
 
 
 @dataclass(frozen=True)
@@ -32,7 +33,12 @@ async def normalize_rows_async(matrix: np.ndarray) -> np.ndarray:
     return await asyncio.to_thread(normalize_rows, matrix)
 
 
-def local_pca_project(embeddings: np.ndarray, config: ProjectionConfig) -> ProjectionResult:
+def local_pca_project(
+    embeddings: np.ndarray,
+    config: ProjectionConfig,
+    *,
+    random_seed: int,
+) -> ProjectionResult:
     _validate_projection_config(config)
     values = _as_finite_2d_array(embeddings, name="embeddings")
 
@@ -51,6 +57,7 @@ def local_pca_project(embeddings: np.ndarray, config: ProjectionConfig) -> Proje
         n_components=max_components,
         whiten=bool(config.whiten),
         svd_solver="auto",
+        random_state=int(random_seed) % _SKLEARN_RANDOM_SEED_MODULUS,
     )
     projected_full = pca.fit_transform(values)
 
@@ -72,8 +79,18 @@ def local_pca_project(embeddings: np.ndarray, config: ProjectionConfig) -> Proje
     )
 
 
-async def local_pca_project_async(embeddings: np.ndarray, config: ProjectionConfig) -> ProjectionResult:
-    return await asyncio.to_thread(local_pca_project, embeddings, config)
+async def local_pca_project_async(
+    embeddings: np.ndarray,
+    config: ProjectionConfig,
+    *,
+    random_seed: int,
+) -> ProjectionResult:
+    return await asyncio.to_thread(
+        local_pca_project,
+        embeddings,
+        config,
+        random_seed=random_seed,
+    )
 
 
 def project_with_basis(embeddings: np.ndarray, *, mean: np.ndarray, components: np.ndarray) -> np.ndarray:

@@ -1449,6 +1449,13 @@ def main() -> None:
     env["DYNAMIX_SKILLBANK_EMBED_BASE_URL"] = args.embedding_base_url
     env["DYNAMIX_SKILLBANK_EMBED_MODEL"] = args.embedding_model
     env["DYNAMIX_SKILLBANK_EMBED_API_KEY"] = "EMPTY"
+    env["DYNAMIX_SKILLBANK_EMBED_MAX_MODEL_LEN"] = str(args.embedding_max_model_len)
+    env["DYNAMIX_SKILLBANK_EMBED_MAX_INPUT_TOKENS"] = str(args.embedding_max_input_tokens)
+    env["DYNAMIX_SKILLBANK_EMBED_BATCH_SIZE"] = str(args.embedding_batch_size)
+    env["DYNAMIX_SKILLBANK_EMBED_TOKENIZER"] = str(args.embedding_tokenizer)
+    if bool(args.chunked_embedding_enabled):
+        env["DYNAMIX_SKILLBANK_CHUNK_TOKENS"] = str(args.chunked_embedding_chunk_tokens)
+        env["DYNAMIX_SKILLBANK_CHUNK_OVERLAP_TOKENS"] = str(args.chunked_embedding_overlap_tokens)
     skillbank_cache_path = Path(summary.get("skillbank_index") or (skillbank_root / ".dynamix_skillbank_index.json"))
     if not skillbank_cache_path.is_file():
         raise RuntimeError(f"DynaMix skillbank index missing before heldout: {skillbank_cache_path}")

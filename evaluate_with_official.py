@@ -177,9 +177,11 @@ def evaluate(data_path, output_dir, start_idx=0, end_idx=None, verbose=False, re
     passed_test_cases = 0
     fully_correct = 0
     raw_passed_test_cases = 0
+    raw_fully_correct = 0
 
     # Track by instruction type (like official eval)
     type_results = defaultdict(lambda: {"soft": [], "hard": []})
+    raw_type_results = defaultdict(lambda: {"soft": [], "hard": []})
 
     for instance in tqdm(dataset):
         instance_id = str(instance["id"])
@@ -305,16 +307,23 @@ def evaluate(data_path, output_dir, start_idx=0, end_idx=None, verbose=False, re
 
         # Calculate metrics for this instance (matching official eval)
         passed_count = sum(1 for tc in test_case_results if tc["passed"])
+        raw_passed_count = sum(1 for tc in test_case_results if tc.get("raw_passed"))
         total_count = len(test_case_results)
         soft_score = passed_count / total_count if total_count > 0 else 0
         hard_score = 1 if passed_count == total_count else 0
+        raw_soft_score = raw_passed_count / total_count if total_count > 0 else 0
+        raw_hard_score = 1 if raw_passed_count == total_count else 0
 
         if hard_score == 1:
             fully_correct += 1
+        if raw_hard_score == 1:
+            raw_fully_correct += 1
 
         # Track by instruction type
         type_results[instruction_type]["soft"].append(soft_score)
         type_results[instruction_type]["hard"].append(hard_score)
+        raw_type_results[instruction_type]["soft"].append(raw_soft_score)
+        raw_type_results[instruction_type]["hard"].append(raw_hard_score)
 
         results.append({
             "id": instance_id,
@@ -322,9 +331,12 @@ def evaluate(data_path, output_dir, start_idx=0, end_idx=None, verbose=False, re
             "success": hard_score == 1,
             "test_cases": test_case_results,
             "passed_count": passed_count,
+            "raw_passed_count": raw_passed_count,
             "total_count": total_count,
             "soft_score": soft_score,
             "hard_score": hard_score,
+            "raw_soft_score": raw_soft_score,
+            "raw_hard_score": raw_hard_score,
         })
 
     # Calculate overall metrics
@@ -332,14 +344,25 @@ def evaluate(data_path, output_dir, start_idx=0, end_idx=None, verbose=False, re
 
     soft_scores = [r.get("soft_score", 0) for r in results if "soft_score" in r]
     hard_scores = [r.get("hard_score", 0) for r in results if "hard_score" in r]
+    raw_soft_scores = [r.get("raw_soft_score", 0) for r in results if "raw_soft_score" in r]
+    raw_hard_scores = [r.get("raw_hard_score", 0) for r in results if "raw_hard_score" in r]
 
     avg_soft_score = sum(soft_scores) / len(soft_scores) if soft_scores else 0
     avg_hard_score = sum(hard_scores) / len(hard_scores) if hard_scores else 0
+    raw_avg_soft_score = sum(raw_soft_scores) / len(raw_soft_scores) if raw_soft_scores else 0
+    raw_avg_hard_score = sum(raw_hard_scores) / len(raw_hard_scores) if raw_hard_scores else 0
 
     # Calculate per-type metrics
     type_metrics = {}
     for inst_type, scores in type_results.items():
         type_metrics[inst_type] = {
+            "count": len(scores["soft"]),
+            "avg_soft_score": sum(scores["soft"]) / len(scores["soft"]) if scores["soft"] else 0,
+            "avg_hard_score": sum(scores["hard"]) / len(scores["hard"]) if scores["hard"] else 0,
+        }
+    raw_type_metrics = {}
+    for inst_type, scores in raw_type_results.items():
+        raw_type_metrics[inst_type] = {
             "count": len(scores["soft"]),
             "avg_soft_score": sum(scores["soft"]) / len(scores["soft"]) if scores["soft"] else 0,
             "avg_hard_score": sum(scores["hard"]) / len(scores["hard"]) if scores["hard"] else 0,
@@ -352,14 +375,23 @@ def evaluate(data_path, output_dir, start_idx=0, end_idx=None, verbose=False, re
         "total_test_cases": total_test_cases,
         "passed_test_cases": passed_test_cases,
         "test_case_accuracy": passed_test_cases / total_test_cases if total_test_cases > 0 else 0,
-        "raw_passed_test_cases": raw_passed_test_cases,
-        "raw_test_case_accuracy": raw_passed_test_cases / total_test_cases if total_test_cases > 0 else 0,
-        "raw_evaluation_mode": "audit_only_no_recalc",
         "avg_soft_score": avg_soft_score,
         "avg_hard_score": avg_hard_score,
         "by_instruction_type": type_metrics,
         "evaluation_mode": "libreoffice_recalc",
         "recalculated_output_dir": recalc_dir,
+        "trace2skill_compatible_no_recalc": {
+            "total_instances": total_instances,
+            "fully_correct_instances": raw_fully_correct,
+            "instance_accuracy": raw_fully_correct / total_instances if total_instances > 0 else 0,
+            "total_test_cases": total_test_cases,
+            "passed_test_cases": raw_passed_test_cases,
+            "test_case_accuracy": raw_passed_test_cases / total_test_cases if total_test_cases > 0 else 0,
+            "avg_soft_score": raw_avg_soft_score,
+            "avg_hard_score": raw_avg_hard_score,
+            "by_instruction_type": raw_type_metrics,
+            "evaluation_mode": "trace2skill_compatible_no_recalc",
+        },
     }
 
     return {
@@ -458,10 +490,16 @@ def _print_summary(summary: dict, label: str = "") -> None:
     print(f"Total Test Cases:       {summary['total_test_cases']}")
     print(f"Passed Test Cases:      {summary['passed_test_cases']}")
     print(f"Test Case Accuracy:     {summary['test_case_accuracy']*100:.1f}%")
-    print(f"Raw Audit Test Accuracy: {summary.get('raw_test_case_accuracy', 0)*100:.1f}% (audit-only, not official)")
     print(f"Avg Soft Score:         {summary['avg_soft_score']*100:.1f}%")
     print(f"Avg Hard Score:         {summary['avg_hard_score']*100:.1f}%")
     print(f"Evaluation Mode:        {summary.get('evaluation_mode', 'unknown')}")
+    raw_summary = summary.get("trace2skill_compatible_no_recalc", {})
+    if raw_summary:
+        print(
+            "Trace2Skill-Compatible Raw Soft/Hard: "
+            f"{raw_summary.get('avg_soft_score', 0)*100:.1f}% / "
+            f"{raw_summary.get('avg_hard_score', 0)*100:.1f}%"
+        )
     if summary.get("recalculated_output_dir"):
         print(f"Recalculated Outputs:   {summary['recalculated_output_dir']}")
 

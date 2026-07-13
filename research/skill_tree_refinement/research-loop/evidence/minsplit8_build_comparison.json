@@ -1,0 +1,415 @@
+{
+  "experiment": "IDEA-001 min_split_size 4 -> 8 build-only controlled diagnostic",
+  "baseline_run": "/mnt/data/yaodong/codes/DynaMix2skill/runs/spreadsheet_awq_retrain200_recalc_tree_v1_20260709_191319",
+  "candidate_run": "/mnt/data/yaodong/codes/DynaMix2skill/runs/research_minsplit8_build_only_20260710_121345",
+  "baseline": {
+    "record_count": 200,
+    "item_count": 546,
+    "community_count": 208,
+    "reported_layers": 7,
+    "committed_layers": 6,
+    "node_count": 346,
+    "nodes_by_level": {
+      "1": 239,
+      "2": 64,
+      "3": 25,
+      "4": 11,
+      "5": 5,
+      "6": 2
+    },
+    "l0_communities": 101,
+    "l0_singletons": 57,
+    "l0_singleton_fraction": 0.5643564356435643,
+    "l0_mean_members": 2.00990099009901,
+    "l0_max_members": 7,
+    "split_events": {
+      "count": 9,
+      "statistical": 9,
+      "token_pack_fallback": 0,
+      "excluded": 0,
+      "reasons": {
+        "budget_forced_weighted_gmm_bic_progress": 9
+      }
+    },
+    "excluded_oversize_singletons": [],
+    "empty_semantic_fields": [],
+    "usage": {
+      "requests": 208,
+      "prompt_tokens": 3359452,
+      "completion_tokens": 68346,
+      "total_tokens": 3427798
+    },
+    "redundancy": {
+      "all": {
+        "count": 346,
+        "nn_ge_090": 0.47109826589595377,
+        "nn_ge_095": 0.315028901734104,
+        "mean_nn": 0.8754448890686035
+      },
+      "l1": {
+        "count": 239,
+        "nn_ge_090": 0.1799163179916318,
+        "nn_ge_095": 0.06276150627615062,
+        "mean_nn": 0.7962305545806885
+      },
+      "l2plus": {
+        "count": 107,
+        "nn_ge_090": 0.5887850467289719,
+        "nn_ge_095": 0.5233644859813084,
+        "mean_nn": 0.8771376609802246
+      },
+      "exact_duplicate_fraction": 0.043352601156069315,
+      "most_similar": [
+        {
+          "similarity": 1.000000238418579,
+          "left": {
+            "node_id": "E3_d97abc91e3af",
+            "level": 3,
+            "name": "Isolate Data Before Structural Modification"
+          },
+          "right": {
+            "node_id": "E2_34cfdee5c168",
+            "level": 2,
+            "name": "Isolate Data Before Structural Modification"
+          }
+        },
+        {
+          "similarity": 1.000000238418579,
+          "left": {
+            "node_id": "E2_34cfdee5c168",
+            "level": 2,
+            "name": "Isolate Data Before Structural Modification"
+          },
+          "right": {
+            "node_id": "E3_d97abc91e3af",
+            "level": 3,
+            "name": "Isolate Data Before Structural Modification"
+          }
+        },
+        {
+          "similarity": 1.000000238418579,
+          "left": {
+            "node_id": "E3_e698a1cabab6",
+            "level": 3,
+            "name": "Sequential Indexing for Ordered Ranges"
+          },
+          "right": {
+            "node_id": "E2_c80b32ce49d6",
+            "level": 2,
+            "name": "Sequential Indexing for Ordered Ranges"
+          }
+        },
+        {
+          "similarity": 1.000000238418579,
+          "left": {
+            "node_id": "E2_c80b32ce49d6",
+            "level": 2,
+            "name": "Sequential Indexing for Ordered Ranges"
+          },
+          "right": {
+            "node_id": "E3_e698a1cabab6",
+            "level": 3,
+            "name": "Sequential Indexing for Ordered Ranges"
+          }
+        },
+        {
+          "similarity": 1.000000238418579,
+          "left": {
+            "node_id": "E2_a003007e6f26",
+            "level": 2,
+            "name": "Extract and clean currency values from mixed-format cells"
+          },
+          "right": {
+            "node_id": "E1_d810d20464c7",
+            "level": 1,
+            "name": "Extract and clean currency values from mixed-format cells"
+          }
+        },
+        {
+          "similarity": 1.000000238418579,
+          "left": {
+            "node_id": "E1_d810d20464c7",
+            "level": 1,
+            "name": "Extract and clean currency values from mixed-format cells"
+          },
+          "right": {
+            "node_id": "E2_a003007e6f26",
+            "level": 2,
+            "name": "Extract and clean currency values from mixed-format cells"
+          }
+        },
+        {
+          "similarity": 1.0000001192092896,
+          "left": {
+            "node_id": "E3_dd55b562d38b",
+            "level": 3,
+            "name": "Robust Multi-Sheet Data Consolidation"
+          },
+          "right": {
+            "node_id": "E2_879963b610ac",
+            "level": 2,
+            "name": "Robust Multi-Sheet Data Consolidation"
+          }
+        },
+        {
+          "similarity": 1.0000001192092896,
+          "left": {
+            "node_id": "E2_879963b610ac",
+            "level": 2,
+            "name": "Robust Multi-Sheet Data Consolidation"
+          },
+          "right": {
+            "node_id": "E3_dd55b562d38b",
+            "level": 3,
+            "name": "Robust Multi-Sheet Data Consolidation"
+          }
+        },
+        {
+          "similarity": 1.0000001192092896,
+          "left": {
+            "node_id": "E4_e84b989541bc",
+            "level": 4,
+            "name": "State-Reset Iteration for Conditional Segmentation"
+          },
+          "right": {
+            "node_id": "E3_fe46076b9582",
+            "level": 3,
+            "name": "State-Reset Iteration for Conditional Segmentation"
+          }
+        },
+        {
+          "similarity": 1.0000001192092896,
+          "left": {
+            "node_id": "E3_fe46076b9582",
+            "level": 3,
+            "name": "State-Reset Iteration for Conditional Segmentation"
+          },
+          "right": {
+            "node_id": "E4_e84b989541bc",
+            "level": 4,
+            "name": "State-Reset Iteration for Conditional Segmentation"
+          }
+        }
+      ]
+    }
+  },
+  "candidate": {
+    "record_count": 200,
+    "item_count": 542,
+    "community_count": 183,
+    "reported_layers": 6,
+    "committed_layers": 5,
+    "node_count": 342,
+    "nodes_by_level": {
+      "1": 249,
+      "2": 51,
+      "3": 24,
+      "4": 12,
+      "5": 6
+    },
+    "l0_communities": 90,
+    "l0_singletons": 48,
+    "l0_singleton_fraction": 0.5333333333333333,
+    "l0_mean_members": 2.2555555555555555,
+    "l0_max_members": 7,
+    "split_events": {
+      "count": 10,
+      "statistical": 6,
+      "token_pack_fallback": 4,
+      "excluded": 0,
+      "reasons": {
+        "budget_fallback_token_pack_singleton": 4,
+        "budget_forced_weighted_gmm_bic_progress": 6
+      }
+    },
+    "excluded_oversize_singletons": [],
+    "empty_semantic_fields": [],
+    "usage": {
+      "requests": 183,
+      "prompt_tokens": 3208729,
+      "completion_tokens": 68708,
+      "total_tokens": 3277437
+    },
+    "redundancy": {
+      "all": {
+        "count": 342,
+        "nn_ge_090": 0.43567251461988304,
+        "nn_ge_095": 0.24561403508771928,
+        "mean_nn": 0.8728315830230713
+      },
+      "l1": {
+        "count": 249,
+        "nn_ge_090": 0.18875502008032127,
+        "nn_ge_095": 0.0321285140562249,
+        "mean_nn": 0.8131526708602905
+      },
+      "l2plus": {
+        "count": 93,
+        "nn_ge_090": 0.6236559139784946,
+        "nn_ge_095": 0.5268817204301075,
+        "mean_nn": 0.8991732001304626
+      },
+      "exact_duplicate_fraction": 0.052631578947368474,
+      "most_similar": [
+        {
+          "similarity": 1.000000238418579,
+          "left": {
+            "node_id": "E5_f88a3dc13d64",
+            "level": 5,
+            "name": "Robust Data Type and Format Handling in Excel"
+          },
+          "right": {
+            "node_id": "E4_85325c252c44",
+            "level": 4,
+            "name": "Robust Data Type and Format Handling in Excel"
+          }
+        },
+        {
+          "similarity": 1.000000238418579,
+          "left": {
+            "node_id": "E4_85325c252c44",
+            "level": 4,
+            "name": "Robust Data Type and Format Handling in Excel"
+          },
+          "right": {
+            "node_id": "E5_f88a3dc13d64",
+            "level": 5,
+            "name": "Robust Data Type and Format Handling in Excel"
+          }
+        },
+        {
+          "similarity": 1.000000238418579,
+          "left": {
+            "node_id": "E3_4e57994173bb",
+            "level": 3,
+            "name": "Robust Data Type and Format Handling in Excel"
+          },
+          "right": {
+            "node_id": "E5_f88a3dc13d64",
+            "level": 5,
+            "name": "Robust Data Type and Format Handling in Excel"
+          }
+        },
+        {
+          "similarity": 1.000000238418579,
+          "left": {
+            "node_id": "E2_3dd3b512e852",
+            "level": 2,
+            "name": "Robust Data Type and Format Handling in Excel"
+          },
+          "right": {
+            "node_id": "E5_f88a3dc13d64",
+            "level": 5,
+            "name": "Robust Data Type and Format Handling in Excel"
+          }
+        },
+        {
+          "similarity": 1.0000001192092896,
+          "left": {
+            "node_id": "E3_81cba247d5c5",
+            "level": 3,
+            "name": "Handle Merged Cells Before Writing"
+          },
+          "right": {
+            "node_id": "E2_1fae85444393",
+            "level": 2,
+            "name": "Handle Merged Cells Before Writing"
+          }
+        },
+        {
+          "similarity": 1.0000001192092896,
+          "left": {
+            "node_id": "E2_1fae85444393",
+            "level": 2,
+            "name": "Handle Merged Cells Before Writing"
+          },
+          "right": {
+            "node_id": "E3_81cba247d5c5",
+            "level": 3,
+            "name": "Handle Merged Cells Before Writing"
+          }
+        },
+        {
+          "similarity": 1.0,
+          "left": {
+            "node_id": "E5_1ec3c53e323b",
+            "level": 5,
+            "name": "Construct Robust Dynamic Spreadsheet Formulas"
+          },
+          "right": {
+            "node_id": "E4_4106aec3ba26",
+            "level": 4,
+            "name": "Construct Robust Dynamic Spreadsheet Formulas"
+          }
+        },
+        {
+          "similarity": 1.0,
+          "left": {
+            "node_id": "E4_4106aec3ba26",
+            "level": 4,
+            "name": "Construct Robust Dynamic Spreadsheet Formulas"
+          },
+          "right": {
+            "node_id": "E5_1ec3c53e323b",
+            "level": 5,
+            "name": "Construct Robust Dynamic Spreadsheet Formulas"
+          }
+        },
+        {
+          "similarity": 0.9999999403953552,
+          "left": {
+            "node_id": "E5_1f4ef1a8675e",
+            "level": 5,
+            "name": "Manage Excel Sheet Names with openpyxl"
+          },
+          "right": {
+            "node_id": "E4_411ef979a638",
+            "level": 4,
+            "name": "Manage Excel Sheet Names with openpyxl"
+          }
+        },
+        {
+          "similarity": 0.9999999403953552,
+          "left": {
+            "node_id": "E4_411ef979a638",
+            "level": 4,
+            "name": "Manage Excel Sheet Names with openpyxl"
+          },
+          "right": {
+            "node_id": "E5_1f4ef1a8675e",
+            "level": 5,
+            "name": "Manage Excel Sheet Names with openpyxl"
+          }
+        }
+      ]
+    }
+  },
+  "deltas": {
+    "item_count": -4,
+    "community_count": -25,
+    "reported_layers": -1,
+    "committed_layers": -1,
+    "node_count": -4,
+    "l0_communities": -11,
+    "l0_singletons": -9,
+    "total_tokens": -150361,
+    "total_tokens_fraction": -0.04386518692174979,
+    "l1_nn_ge_090": 0.008838702088689476,
+    "exact_duplicate_fraction": 0.009278977791299159
+  },
+  "promotion_gates": {
+    "records_preserved": true,
+    "no_exclusions": true,
+    "semantic_fields_nonempty": true,
+    "committed_layers_reduced_or_nodes_down_5pct": true,
+    "l1_redundancy_not_worse_by_2pp": true,
+    "generation_tokens_not_worse_by_10pct": true
+  },
+  "all_gates_pass": true,
+  "interpretation": [
+    "The candidate is one committed level shallower and uses fewer requests/tokens.",
+    "It does not materially shrink the nodebank because L1 card count increases despite fewer L0 communities.",
+    "Raising min_split_size activates four token-pack fallback events that did not occur in the baseline.",
+    "This is a global split-granularity intervention, not a pure hierarchy-depth intervention."
+  ]
+}

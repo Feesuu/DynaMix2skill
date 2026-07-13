@@ -53,6 +53,28 @@ def _is_context_length_bad_request(exc: Exception) -> bool:
     )
 
 
+def _env_bool(value: str | None, *, default: bool) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _openai_http_client_kwargs(*, async_client: bool = False) -> dict[str, Any]:
+    verify_env = os.environ.get("DYNAMIX_OPENAI_SSL_VERIFY")
+    trust_env = os.environ.get("DYNAMIX_OPENAI_TRUST_ENV")
+    if verify_env is None and trust_env is None:
+        return {}
+    try:
+        import httpx
+    except ImportError:
+        return {}
+
+    verify = _env_bool(verify_env, default=True)
+    use_env = _env_bool(trust_env, default=True)
+    client_cls = httpx.AsyncClient if async_client else httpx.Client
+    return {"http_client": client_cls(verify=verify, trust_env=use_env)}
+
+
 @dataclass
 class Message:
     """A single message in a conversation."""
@@ -286,8 +308,8 @@ class OpenAIClient(LLMClient):
         client_kwargs = {"api_key": self.api_key, "timeout": timeout}
         if self.base_url:
             client_kwargs["base_url"] = self.base_url
-        
-        self._client = OpenAI(**client_kwargs)
+
+        self._client = OpenAI(**client_kwargs, **_openai_http_client_kwargs())
         # Lazily create async client only if chat_async is used
         self._async_client = None
         self._async_client_kwargs = client_kwargs
@@ -365,7 +387,10 @@ class OpenAIClient(LLMClient):
                 from openai import AsyncOpenAI
             except ImportError:
                 from dynamix_trace2skill.openai_compat import AsyncOpenAI
-            self._async_client = AsyncOpenAI(**self._async_client_kwargs)
+            self._async_client = AsyncOpenAI(
+                **self._async_client_kwargs,
+                **_openai_http_client_kwargs(async_client=True),
+            )
         return self._async_client
 
     async def _send_request_with_retry_async(self, messages: list[dict], config: dict):

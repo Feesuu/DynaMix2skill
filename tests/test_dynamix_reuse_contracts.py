@@ -22,12 +22,23 @@ from dynamix_trace2skill.pipeline import DynaMixRunConfig, default_hierarchy_con
 from dynamix_trace2skill.schemas import RawTrajectoryRecord, TrajectoryStep
 from dynamix_trace2skill.trace_views import render_embedding_trace
 from dynamix_core.data_structures import ExperienceCardPatch, ExperienceCommunity, ExperienceHierarchyState, ExperienceItem, ITEM_KIND_EXPERIENCE_CARD, ITEM_KIND_TRAJECTORY
+from dynamix_core.config import ProjectionConfig
+from dynamix_core.projection import local_pca_project
 from dynamix_core.update import ExperienceHierarchyDynamicUpdater
 
 
 def _load_experiment_runner_module():
     path = Path(__file__).resolve().parents[1] / "scripts" / "run_dynamix_trace2skill_experiment.py"
     spec = importlib.util.spec_from_file_location("run_dynamix_trace2skill_experiment", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_full_soft_hard_module():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "run_spreadsheetbench_full_soft_hard_eval.py"
+    spec = importlib.util.spec_from_file_location("run_spreadsheetbench_full_soft_hard_eval", path)
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
     spec.loader.exec_module(module)
@@ -79,6 +90,126 @@ def test_embedding_trace_excludes_answer_position():
     assert "raw_model_output" in text
     assert "answer_position" not in text
     assert "E6:E13" not in text
+
+
+def test_local_pca_project_is_reproducible_for_randomized_solver_shape(monkeypatch):
+    from dynamix_core import projection as projection_module
+
+    values = np.random.default_rng(7).normal(size=(64, 600))
+    config = ProjectionConfig(variance_ratio=0.9, max_dim=8, min_dim=2)
+    solvers = []
+
+    class TrackingPCA(projection_module.PCA):
+        def fit_transform(self, values, y=None):
+            projected = super().fit_transform(values, y)
+            solvers.append(self._fit_svd_solver)
+            return projected
+
+    monkeypatch.setattr(projection_module, "PCA", TrackingPCA)
+
+    first = local_pca_project(values, config, random_seed=42)
+    second = local_pca_project(values, config, random_seed=42)
+
+    np.testing.assert_array_equal(first.projected, second.projected)
+    np.testing.assert_array_equal(first.components, second.components)
+    np.testing.assert_array_equal(first.mean, second.mean)
+    assert solvers == ["randomized", "randomized"]
+
+    wrapped = local_pca_project(values, config, random_seed=2**32 + 42)
+    np.testing.assert_array_equal(first.projected, wrapped.projected)
+
+
+def test_tree_builder_randomized_pca_is_reproducible_across_input_order():
+    from dynamix_core.tree_builder import ProjectedGmmTreeBuilder
+
+    rng = np.random.default_rng(7)
+    values = rng.normal(scale=0.05, size=(64, 600))
+    values[:32, 0] -= 2.0
+    values[32:, 0] += 2.0
+    items = [
+        ExperienceItem(
+            item_id=f"e{index:03d}",
+            level=1,
+            kind=ITEM_KIND_EXPERIENCE_CARD,
+            text=f"card {index}",
+            embedding=row.tolist(),
+        )
+        for index, row in enumerate(values)
+    ]
+    config = default_hierarchy_config({
+        "random_seed": 42,
+        "projection": {"variance_ratio": 0.9, "max_dim": 8, "min_dim": 2},
+        "gmm_bic": {
+            "num_restarts": 2,
+            "max_iter": 40,
+            "min_split_size": 2,
+            "min_effective_samples_per_component": 8,
+            "abs_kmax": 4,
+        },
+    })
+
+    first = asyncio.run(ProjectedGmmTreeBuilder(config).cluster_layer(items, level=1))
+    second = asyncio.run(ProjectedGmmTreeBuilder(config).cluster_layer(list(reversed(items)), level=1))
+
+    def snapshot(result):
+        return {
+            "chosen_k": result.chosen_k,
+            "communities": [community.to_dict() for community in result.communities],
+            "routing_model": result.routing_model.to_dict() if result.routing_model else None,
+        }
+
+    assert snapshot(first) == snapshot(second)
+
+
+def test_budget_refinement_randomized_pca_is_reproducible():
+    from dynamix_core.tree_builder import ProjectedGmmTreeBuilder
+
+    rng = np.random.default_rng(11)
+    values = rng.normal(scale=0.05, size=(16, 600))
+    values[:8, 0] -= 2.0
+    values[8:, 0] += 2.0
+    items = [
+        ExperienceItem(
+            item_id=f"t{index:03d}",
+            level=0,
+            kind=ITEM_KIND_TRAJECTORY,
+            text=f"trace {index}",
+            embedding=row.tolist(),
+            metadata={"analysis_token_count": 20},
+        )
+        for index, row in enumerate(values)
+    ]
+    config = default_hierarchy_config({
+        "random_seed": 2**32 + 42,
+        "projection": {"variance_ratio": 0.9, "max_dim": 8, "min_dim": 2},
+        "gmm_bic": {
+            "num_restarts": 2,
+            "max_iter": 40,
+            "min_split_size": 2,
+            "min_effective_samples_per_component": 8,
+            "abs_kmax": 2,
+        },
+    })
+    node = {
+        "node_id": "L0_R0",
+        "depth": 1,
+        "path_weights": {item.item_id: 1.0 for item in items},
+    }
+    kwargs = {
+        "node": node,
+        "level": 0,
+        "token_counts": {item.item_id: 20 for item in items},
+        "parent_token_cost": 320,
+        "token_budget": 100,
+        "serial_start": 0,
+    }
+
+    first = asyncio.run(ProjectedGmmTreeBuilder(config)._budget_refinement_gmm_split(items, **kwargs))
+    second = asyncio.run(ProjectedGmmTreeBuilder(config)._budget_refinement_gmm_split(items, **kwargs))
+
+    assert first["accepted"] is True
+    assert first == second
+
 
 
 def test_chunked_embedding_uses_project_defaults_when_fields_omitted(tmp_path, monkeypatch):
@@ -1966,6 +2097,7 @@ def test_cluster_prompt_uses_minimal_experience_schema():
     schema = payload["output_schema"]
     assert "task_profile" not in payload
     assert "officeqa_experience_policy" not in payload
+    assert "spreadsheet_experience_policy" in payload
     assert "template_user_prompt_adaptation" in payload
     assert set(schema) == {"cards"}
     card_schema = schema["cards"][0]
@@ -1974,6 +2106,53 @@ def test_cluster_prompt_uses_minimal_experience_schema():
     assert not (forbidden & set(card_schema))
     constraints = " ".join(payload["hard_constraints"])
     assert "Do not output fields except cards and each card's name, trigger, content, placement, confidence" in constraints
+    spreadsheet_policy = json.dumps(payload["spreadsheet_experience_policy"], ensure_ascii=False)
+    assert "formula or API invariants" in spreadsheet_policy
+    assert "recalculation-based verification" in spreadsheet_policy
+
+
+def test_higher_level_prompt_requires_distinct_children_and_allows_no_parent():
+    analyst = ClusterAnalyst(None, None, ClusterAnalystConfig())  # type: ignore[arg-type]
+    community = ExperienceCommunity(community_id="L1_C0", level=1, member_weights={"e1": 1.0, "e2": 1.0})
+    members = [
+        ExperienceItem(item_id="e1", level=1, kind=ITEM_KIND_EXPERIENCE_CARD, text="card one", embedding=[1.0]),
+        ExperienceItem(item_id="e2", level=1, kind=ITEM_KIND_EXPERIENCE_CARD, text="card two", embedding=[0.5]),
+    ]
+    payload = json.loads(analyst._build_prompt(community, members, "experience_abstractor"))
+    combined = "\n".join([
+        analyst._system_prompt("experience_abstractor"),
+        payload["instruction"],
+        " ".join(payload["hard_constraints"]),
+    ])
+    assert "at least two" in combined.lower()
+    assert "shared invariant" in combined.lower()
+    assert "empty cards list" in combined.lower() or "cards=[]" in combined
+
+
+def test_higher_level_analyst_accepts_empty_cards_without_embedding():
+    class DummyGeneration:
+        async def chat_json(self, messages, *, schema_name, guided_json, **kwargs):
+            assert schema_name == "HigherLevelExperienceCardOrEmpty"
+            assert guided_json["properties"]["cards"]["maxItems"] == 1
+            assert "minItems" not in guided_json["properties"]["cards"]
+            return {"cards": []}
+
+    class DummyEmbedding:
+        async def embed_texts(self, texts, *, cache_namespace=None):
+            raise AssertionError("empty higher-level output must not be embedded")
+
+    analyst = ClusterAnalyst(
+        DummyGeneration(),
+        DummyEmbedding(),
+        ClusterAnalystConfig(tokenizer_required=False, allow_regex_tokenizer_fallback=True),
+    )
+    community = ExperienceCommunity(community_id="L1_C0", level=1, member_weights={"e1": 1.0, "e2": 1.0})
+    members = [
+        ExperienceItem(item_id="e1", level=1, kind=ITEM_KIND_EXPERIENCE_CARD, text="card one", embedding=[1.0]),
+        ExperienceItem(item_id="e2", level=1, kind=ITEM_KIND_EXPERIENCE_CARD, text="card two", embedding=[0.5]),
+    ]
+    assert asyncio.run(analyst.summarize(community, members)) == []
+    assert community.metadata["higher_level_abstraction_skipped"] == "no_shared_invariant"
 
 
 def test_static_cluster_analyst_uses_guided_json_without_forcing_thinking():
@@ -2094,7 +2273,15 @@ def test_dynamic_analyst_adds_new_cards_without_position_matching_old_cards():
     assert "new_cards" in prompt
     assert "Never infer update targets from output order or confidence rank" in prompt
     payload = json.loads(prompt)
-    assert set(payload) == {"instruction", "analyst_mode", "dynamic_patch_policy", "hard_constraints", "members", "previous_generated_experiences"}
+    assert set(payload) == {
+        "instruction",
+        "analyst_mode",
+        "dynamic_patch_policy",
+        "hard_constraints",
+        "members",
+        "previous_generated_experiences",
+        "spreadsheet_experience_policy",
+    }
     assert "community" not in payload
     assert "output_schema" not in payload
     assert all("support_mass" not in member for member in payload["members"])
@@ -2175,7 +2362,7 @@ def test_dynamic_analyst_higher_level_prompt_is_updates_only_and_skips_unrepaira
         "placement": {"target": "skill_md", "reference_kind": "procedure"},
         "confidence": 0.7,
     }
-    community = ExperienceCommunity(community_id="L1_C0", level=1, member_weights={"e1": 1.0})
+    community = ExperienceCommunity(community_id="L1_C0", level=1, member_weights={"e1": 1.0, "e2": 1.0})
     member = ExperienceItem(
         item_id="e1",
         level=1,
@@ -2183,6 +2370,14 @@ def test_dynamic_analyst_higher_level_prompt_is_updates_only_and_skips_unrepaira
         text="lower card",
         embedding=[1.0],
         metadata={"name": "Lower", "trigger": "lower", "content": "lower", "confidence": 0.8},
+    )
+    member2 = ExperienceItem(
+        item_id="e2",
+        level=1,
+        kind=ITEM_KIND_EXPERIENCE_CARD,
+        text="another lower card",
+        embedding=[0.5],
+        metadata={"name": "Another", "trigger": "another", "content": "another", "confidence": 0.8},
     )
     previous = [{
         "item_id": "old_l2",
@@ -2198,7 +2393,7 @@ def test_dynamic_analyst_higher_level_prompt_is_updates_only_and_skips_unrepaira
             ClusterAnalystConfig(tokenizer_required=False, allow_regex_tokenizer_fallback=True),
         )
 
-        patches = asyncio.run(analyst.summarize_dynamic_update(community, [member], previous))
+        patches = asyncio.run(analyst.summarize_dynamic_update(community, [member, member2], previous))
 
         assert patches == []
         assert embedding.calls == 0
@@ -2260,7 +2455,7 @@ def test_dynamic_analyst_higher_level_repairs_legacy_schema_and_accepts_update()
         DummyEmbedding(),
         ClusterAnalystConfig(tokenizer_required=False, allow_regex_tokenizer_fallback=True),
     )
-    community = ExperienceCommunity(community_id="L1_C0", level=1, member_weights={"e1": 1.0})
+    community = ExperienceCommunity(community_id="L1_C0", level=1, member_weights={"e1": 1.0, "e2": 1.0})
     member = ExperienceItem(
         item_id="e1",
         level=1,
@@ -2269,12 +2464,20 @@ def test_dynamic_analyst_higher_level_repairs_legacy_schema_and_accepts_update()
         embedding=[1.0],
         metadata={"name": "Lower", "trigger": "lower", "content": "lower", "confidence": 0.8},
     )
+    member2 = ExperienceItem(
+        item_id="e2",
+        level=1,
+        kind=ITEM_KIND_EXPERIENCE_CARD,
+        text="another lower card",
+        embedding=[0.5],
+        metadata={"name": "Another", "trigger": "another", "content": "another", "confidence": 0.8},
+    )
     previous = [{
         "item_id": "old_l2",
         "metadata": {"name": "Old L2", "trigger": "old", "content": "old", "confidence": 0.9},
     }]
 
-    patches = asyncio.run(analyst.summarize_dynamic_update(community, [member], previous))
+    patches = asyncio.run(analyst.summarize_dynamic_update(community, [member, member2], previous))
 
     assert len(patches) == 1
     assert patches[0].operation == "update"
@@ -2319,7 +2522,7 @@ def test_dynamic_analyst_higher_level_skips_unrepairable_json_parse_failure():
         embedding,
         ClusterAnalystConfig(tokenizer_required=False, allow_regex_tokenizer_fallback=True, max_prompt_tokens=100000),
     )
-    community = ExperienceCommunity(community_id="L1_C0", level=1, member_weights={"e1": 1.0})
+    community = ExperienceCommunity(community_id="L1_C0", level=1, member_weights={"e1": 1.0, "e2": 1.0})
     member = ExperienceItem(
         item_id="e1",
         level=1,
@@ -2328,12 +2531,20 @@ def test_dynamic_analyst_higher_level_skips_unrepairable_json_parse_failure():
         embedding=[1.0],
         metadata={"name": "Lower", "trigger": "lower", "content": "lower", "confidence": 0.8},
     )
+    member2 = ExperienceItem(
+        item_id="e2",
+        level=1,
+        kind=ITEM_KIND_EXPERIENCE_CARD,
+        text="another lower card",
+        embedding=[0.5],
+        metadata={"name": "Another", "trigger": "another", "content": "another", "confidence": 0.8},
+    )
     previous = [{
         "item_id": "old_l2",
         "metadata": {"name": "Old L2", "trigger": "old", "content": "old", "confidence": 0.9},
     }]
 
-    patches = asyncio.run(analyst.summarize_dynamic_update(community, [member], previous))
+    patches = asyncio.run(analyst.summarize_dynamic_update(community, [member, member2], previous))
 
     assert patches == []
     assert generation.calls == 3
@@ -2370,7 +2581,7 @@ def test_dynamic_analyst_higher_level_accepts_explicit_updates():
         DummyEmbedding(),
         ClusterAnalystConfig(tokenizer_required=False, allow_regex_tokenizer_fallback=True),
     )
-    community = ExperienceCommunity(community_id="L1_C0", level=1, member_weights={"e1": 1.0})
+    community = ExperienceCommunity(community_id="L1_C0", level=1, member_weights={"e1": 1.0, "e2": 1.0})
     member = ExperienceItem(
         item_id="e1",
         level=1,
@@ -2379,12 +2590,20 @@ def test_dynamic_analyst_higher_level_accepts_explicit_updates():
         embedding=[1.0],
         metadata={"name": "Lower", "trigger": "lower", "content": "lower", "confidence": 0.8},
     )
+    member2 = ExperienceItem(
+        item_id="e2",
+        level=1,
+        kind=ITEM_KIND_EXPERIENCE_CARD,
+        text="another lower card",
+        embedding=[0.5],
+        metadata={"name": "Another", "trigger": "another", "content": "another", "confidence": 0.8},
+    )
     previous = [{
         "item_id": "old_l2",
         "metadata": {"name": "Old L2", "trigger": "old", "content": "old", "confidence": 0.9},
     }]
 
-    patches = asyncio.run(analyst.summarize_dynamic_update(community, [member], previous))
+    patches = asyncio.run(analyst.summarize_dynamic_update(community, [member, member2], previous))
 
     assert len(patches) == 1
     assert patches[0].operation == "update"
@@ -2946,7 +3165,7 @@ def test_agent_runtime_env_uses_relative_io_names(tmp_path, monkeypatch):
     assert str(work_dir) not in captured["task_prompt"]
 
 
-def test_l1_singleton_community_is_summarized_by_analyst():
+def test_l1_singleton_community_skips_analyst_and_records_reason():
     from dynamix_core.tree_builder import ProjectedGmmTreeBuilder, LayerClusteringResult
 
     community = ExperienceCommunity(community_id="L1_C000", level=1, member_weights={"e1": 1.0})
@@ -2980,5 +3199,516 @@ def test_l1_singleton_community_is_summarized_by_analyst():
         )]
 
     generated = asyncio.run(ProjectedGmmTreeBuilder(default_hierarchy_config({}))._summarize_communities(clustering, items_by_id={"e1": member}, summary_fn=summary_fn))
-    assert calls == [("L1_C000", ["e1"])]
-    assert [item.item_id for item in generated] == ["e2"]
+    assert calls == []
+    assert generated == []
+    assert community.metadata["higher_level_distinct_child_count"] == 1
+    assert community.metadata["higher_level_abstraction_skipped"] == "fewer_than_two_distinct_child_cards"
+
+
+def test_dynamic_l1_singleton_skips_analyst_call():
+    class DummyGeneration:
+        async def chat_json(self, *args, **kwargs):
+            raise AssertionError("L1+ singleton must not call the analyst LLM")
+
+    analyst = ClusterAnalyst(
+        DummyGeneration(),
+        None,
+        ClusterAnalystConfig(tokenizer_required=False, allow_regex_tokenizer_fallback=True),
+    )
+    community = ExperienceCommunity(community_id="L1_C0", level=1, member_weights={"e1": 1.0})
+    member = ExperienceItem(item_id="e1", level=1, kind=ITEM_KIND_EXPERIENCE_CARD, text="one lower card", embedding=[1.0])
+    previous = [{"item_id": "old", "metadata": {"name": "Old", "trigger": "old", "content": "old", "confidence": 0.9}}]
+
+    patches = asyncio.run(analyst.summarize_dynamic_update(community, [member], previous))
+    assert patches == []
+    assert community.metadata["higher_level_abstraction_skipped"] == "fewer_than_two_distinct_child_cards"
+
+
+def test_dynamic_l1_update_cannot_duplicate_child_card():
+    class DummyGeneration:
+        async def chat_json(self, *args, **kwargs):
+            return {
+                "updates": [{
+                    "item_id": "old",
+                    "name": "Lower",
+                    "trigger": "lower",
+                    "content": "lower",
+                    "placement": {"target": "skill_md", "reference_kind": "procedure"},
+                    "confidence": 0.9,
+                }]
+            }
+
+    class DummyEmbedding:
+        async def embed_texts(self, *args, **kwargs):
+            raise AssertionError("duplicate higher-level update must not be embedded")
+
+    analyst = ClusterAnalyst(
+        DummyGeneration(),
+        DummyEmbedding(),
+        ClusterAnalystConfig(tokenizer_required=False, allow_regex_tokenizer_fallback=True),
+    )
+    community = ExperienceCommunity(community_id="L1_C0", level=1, member_weights={"e1": 1.0, "e2": 1.0})
+    members = [
+        ExperienceItem(
+            item_id="e1",
+            level=1,
+            kind=ITEM_KIND_EXPERIENCE_CARD,
+            text="# Lower\n\n## Trigger\nlower\n\n## Content\nlower\n",
+            embedding=[1.0],
+        ),
+        ExperienceItem(item_id="e2", level=1, kind=ITEM_KIND_EXPERIENCE_CARD, text="another child", embedding=[0.5]),
+    ]
+    previous = [{"item_id": "old", "metadata": {"name": "Old", "trigger": "old", "content": "old", "confidence": 0.9}}]
+
+    assert asyncio.run(analyst.summarize_dynamic_update(community, members, previous)) == []
+    assert community.metadata["higher_level_duplicate_output_count"] == 1
+    assert community.metadata["higher_level_abstraction_skipped"] == "duplicate_existing_experience"
+
+
+def test_l1_parent_duplicate_of_child_is_not_generated():
+    from dynamix_core.tree_builder import LayerClusteringResult, ProjectedGmmTreeBuilder
+
+    members = {
+        "e1": ExperienceItem(
+            item_id="e1",
+            level=1,
+            kind=ITEM_KIND_EXPERIENCE_CARD,
+            text="name: Operand ledger\ntrigger: arithmetic\ncontent: Track each operand.",
+            embedding=[1.0],
+            metadata={"name": "Operand ledger", "trigger": "arithmetic", "content": "Track each operand.", "confidence": 0.9},
+        ),
+        "e2": ExperienceItem(
+            item_id="e2",
+            level=1,
+            kind=ITEM_KIND_EXPERIENCE_CARD,
+            text="name: Unit alignment\ntrigger: mixed units\ncontent: Normalize units before arithmetic.",
+            embedding=[0.5],
+            metadata={"name": "Unit alignment", "trigger": "mixed units", "content": "Normalize units before arithmetic.", "confidence": 0.9},
+        ),
+    }
+    community = ExperienceCommunity(community_id="L1_C000", level=1, member_weights={"e1": 1.0, "e2": 1.0})
+    clustering = LayerClusteringResult(
+        level=1,
+        input_item_ids=list(members),
+        communities=[community],
+        member_item_ids_by_community={community.community_id: list(members)},
+        stop_reason="",
+    )
+
+    def summary_fn(comm, child_cards, layer):
+        return [ExperienceItem(
+            item_id="e3",
+            level=2,
+            kind=ITEM_KIND_EXPERIENCE_CARD,
+            text=members["e1"].text,
+            embedding=[1.0],
+            generated_from_community_ids=[comm.community_id],
+            metadata={"name": "Operand ledger", "trigger": "arithmetic", "content": "Track each operand.", "confidence": 0.9},
+        )]
+
+    generated = asyncio.run(ProjectedGmmTreeBuilder(default_hierarchy_config({}))._summarize_communities(
+        clustering,
+        items_by_id=members,
+        summary_fn=summary_fn,
+    ))
+    assert generated == []
+    assert community.metadata["higher_level_abstraction_skipped"] == "duplicate_existing_experience"
+    assert community.metadata["higher_level_duplicate_output_count"] == 1
+
+
+def test_l1_distinct_children_can_generate_novel_parent():
+    from dynamix_core.tree_builder import LayerClusteringResult, ProjectedGmmTreeBuilder
+
+    members = {
+        "e1": ExperienceItem(item_id="e1", level=1, kind=ITEM_KIND_EXPERIENCE_CARD, text="operand provenance", embedding=[1.0]),
+        "e2": ExperienceItem(item_id="e2", level=1, kind=ITEM_KIND_EXPERIENCE_CARD, text="unit alignment", embedding=[0.5]),
+    }
+    community = ExperienceCommunity(community_id="L1_C000", level=1, member_weights={"e1": 1.0, "e2": 1.0})
+    clustering = LayerClusteringResult(
+        level=1,
+        input_item_ids=list(members),
+        communities=[community],
+        member_item_ids_by_community={community.community_id: list(members)},
+        stop_reason="",
+    )
+
+    def summary_fn(comm, child_cards, layer):
+        return [ExperienceItem(
+            item_id="e3",
+            level=2,
+            kind=ITEM_KIND_EXPERIENCE_CARD,
+            text="preserve semantic comparability before calculation",
+            embedding=[0.75],
+            generated_from_community_ids=[comm.community_id],
+            metadata={"name": "Semantic comparability", "trigger": "derived values", "content": "Align provenance and units.", "confidence": 0.9},
+        )]
+
+    generated = asyncio.run(ProjectedGmmTreeBuilder(default_hierarchy_config({}))._summarize_communities(
+        clustering,
+        items_by_id=members,
+        summary_fn=summary_fn,
+    ))
+    assert [item.item_id for item in generated] == ["e3"]
+    assert community.metadata["higher_level_distinct_child_count"] == 2
+    assert "higher_level_abstraction_skipped" not in community.metadata
+
+
+def test_higher_level_skipped_community_can_commit_without_parent_card():
+    async def run_case():
+        state = ExperienceHierarchyState()
+        await state.initialize_trajectory_items([
+            ExperienceItem(item_id="t1", level=0, kind=ITEM_KIND_TRAJECTORY, text="trace 1", embedding=[1.0]),
+            ExperienceItem(item_id="t2", level=0, kind=ITEM_KIND_TRAJECTORY, text="trace 2", embedding=[0.5]),
+        ])
+        l0 = ExperienceCommunity(community_id="L0_C0", level=0, member_weights={"t1": 1.0, "t2": 1.0})
+        l1_cards = [
+            ExperienceItem(
+                item_id=item_id,
+                level=1,
+                kind=ITEM_KIND_EXPERIENCE_CARD,
+                text=text,
+                embedding=[embedding],
+                generated_from_community_ids=[l0.community_id],
+                metadata={"confidence": 0.9},
+            )
+            for item_id, text, embedding in [("e1", "card one", 1.0), ("e2", "card two", 0.5)]
+        ]
+        await state.commit_layer(level=0, communities=[l0], generated_items=l1_cards)
+        l1 = ExperienceCommunity(
+            community_id="L1_C0",
+            level=1,
+            member_weights={"e1": 1.0, "e2": 1.0},
+            metadata={"higher_level_abstraction_skipped": "no_shared_invariant"},
+        )
+        await state.commit_layer(
+            level=1,
+            communities=[l1],
+            generated_items=[],
+            stop_reason="no_new_abstractions",
+        )
+        return state
+
+    state = asyncio.run(run_case())
+    committed = asyncio.run(state.community_objects_at_level(1))
+    assert len(committed) == 1
+    assert committed[0].generated_item_ids == []
+    payload = asyncio.run(state.to_dict())
+    assert payload["layers"]["1"]["generated_item_ids"] == []
+    assert payload["layers"]["1"]["stop_reason"] == "no_new_abstractions"
+
+
+def test_build_layer_commits_higher_level_links_when_no_parent_is_generated():
+    from dynamix_core.tree_builder import LayerClusteringResult, ProjectedGmmTreeBuilder
+
+    async def run_case():
+        state = ExperienceHierarchyState()
+        await state.initialize_trajectory_items([
+            ExperienceItem(item_id="t1", level=0, kind=ITEM_KIND_TRAJECTORY, text="trace 1", embedding=[1.0]),
+            ExperienceItem(item_id="t2", level=0, kind=ITEM_KIND_TRAJECTORY, text="trace 2", embedding=[0.5]),
+        ])
+        l0 = ExperienceCommunity(community_id="L0_C0", level=0, member_weights={"t1": 1.0, "t2": 1.0})
+        cards = [
+            ExperienceItem(
+                item_id=item_id,
+                level=1,
+                kind=ITEM_KIND_EXPERIENCE_CARD,
+                text=text,
+                embedding=[embedding],
+                generated_from_community_ids=[l0.community_id],
+                metadata={"confidence": 0.9},
+            )
+            for item_id, text, embedding in [("e1", "card one", 1.0), ("e2", "card two", 0.5)]
+        ]
+        await state.commit_layer(level=0, communities=[l0], generated_items=cards)
+        l1 = ExperienceCommunity(community_id="L1_C0", level=1, member_weights={"e1": 1.0, "e2": 1.0})
+        clustering = LayerClusteringResult(
+            level=1,
+            input_item_ids=["e1", "e2"],
+            communities=[l1],
+            member_item_ids_by_community={l1.community_id: ["e1", "e2"]},
+            stop_reason="",
+        )
+        builder = ProjectedGmmTreeBuilder(default_hierarchy_config({}))
+
+        async def cluster_layer(items, **kwargs):
+            return clustering
+
+        builder.cluster_layer = cluster_layer  # type: ignore[method-assign]
+        result = await builder.build_layer(state, level=1, items=cards, summary_fn=lambda *args: [])
+        return result, await state.to_dict()
+
+    result, payload = asyncio.run(run_case())
+    assert result.committed is True
+    assert result.generated_item_ids == []
+    assert payload["layers"]["1"]["community_ids"] == ["L1_C0"]
+    assert payload["layers"]["1"]["generated_item_ids"] == []
+    assert payload["communities"]["L1_C0"]["metadata"]["higher_level_abstraction_skipped"] == "no_shared_invariant"
+
+
+def test_full_soft_hard_materializer_excludes_testcase_not_task_and_normalizes_input(tmp_path):
+    full_eval = _load_full_soft_hard_module()
+    full = tmp_path / "full"
+    verified = tmp_path / "verified"
+
+    dataset = [
+        {"id": "A", "spreadsheet_path": "spreadsheet/A", "instruction": "do A", "answer_position": "A1"},
+        {"id": "B", "spreadsheet_path": "spreadsheet/B", "instruction": "do B", "answer_position": "A1"},
+    ]
+    (full / "spreadsheet" / "A").mkdir(parents=True)
+    (full / "spreadsheet" / "B").mkdir(parents=True)
+    (verified / "spreadsheet" / "A").mkdir(parents=True)
+    (full / "dataset.json").write_text(json.dumps(dataset), encoding="utf-8")
+    (verified / "dataset.json").write_text(json.dumps(dataset[:1]), encoding="utf-8")
+
+    def write(path: Path, text: str) -> None:
+        path.write_bytes(text.encode("utf-8"))
+
+    write(full / "spreadsheet" / "A" / "1_A_input.xlsx", "verified input")
+    write(full / "spreadsheet" / "A" / "1_A_answer.xlsx", "verified answer")
+    write(full / "spreadsheet" / "A" / "2_A_input .xlsx", "input 2")
+    write(full / "spreadsheet" / "A" / "2_A_answer.xlsx", "answer 2")
+    write(full / "spreadsheet" / "A" / "3_A_input.xlsx", "input 3")
+    write(full / "spreadsheet" / "A" / "3_A_answer.xlsx", "answer 3")
+    for idx in (1, 2, 3):
+        write(full / "spreadsheet" / "B" / f"{idx}_B_input.xlsx", f"input B{idx}")
+        write(full / "spreadsheet" / "B" / f"{idx}_B_answer.xlsx", f"answer B{idx}")
+    write(verified / "spreadsheet" / "A" / "1_A_init.xlsx", "verified input")
+    write(verified / "spreadsheet" / "A" / "1_A_golden.xlsx", "verified answer")
+
+    result = full_eval.materialize_paper_aligned_dataset(
+        full_data_path=full,
+        verified_data_path=verified,
+        output_dir=tmp_path / "prepared",
+        train_start=0,
+        train_end=1,
+        expected_full_testcases=6,
+        expected_excluded_testcases=1,
+        expected_prepared_testcases=5,
+        expected_normalized_input_files=1,
+    )
+
+    prepared_a = tmp_path / "prepared" / "spreadsheet" / "A"
+    prepared_b = tmp_path / "prepared" / "spreadsheet" / "B"
+    assert not (prepared_a / "1_A_input.xlsx").exists()
+    assert not (prepared_a / "1_A_answer.xlsx").exists()
+    assert (prepared_a / "2_A_input.xlsx").exists()
+    assert not (prepared_a / "2_A_input .xlsx").exists()
+    assert len(list(prepared_b.glob("*_answer.xlsx"))) == 3
+    manifest = result["testcase_filter_manifest"]
+    assert manifest["full_answer_testcases"] == 6
+    assert manifest["excluded_testcases"] == 1
+    assert manifest["prepared_answer_testcases"] == 5
+    assert manifest["exclusions"][0]["match_method"] == "hash_input_and_answer"
+    assert result["normalization_manifest"]["normalized_input_files"] == 1
+    result_again = full_eval.materialize_paper_aligned_dataset(
+        full_data_path=full,
+        verified_data_path=verified,
+        output_dir=tmp_path / "prepared_again",
+        train_start=0,
+        train_end=1,
+        expected_full_testcases=6,
+        expected_excluded_testcases=1,
+        expected_prepared_testcases=5,
+        expected_normalized_input_files=1,
+    )
+    assert result_again["stable_materialization_hash"] == result["stable_materialization_hash"]
+    write(full / "spreadsheet" / "A" / "2_A_answer.xlsx", "answer 2 changed")
+    result_changed = full_eval.materialize_paper_aligned_dataset(
+        full_data_path=full,
+        verified_data_path=verified,
+        output_dir=tmp_path / "prepared_changed",
+        train_start=0,
+        train_end=1,
+        expected_full_testcases=6,
+        expected_excluded_testcases=1,
+        expected_prepared_testcases=5,
+        expected_normalized_input_files=1,
+    )
+    assert result_changed["stable_materialization_hash"] != result["stable_materialization_hash"]
+
+
+def test_full_soft_hard_materializer_rejects_output_overlap_with_sources(tmp_path):
+    full_eval = _load_full_soft_hard_module()
+    full = tmp_path / "full"
+    verified = tmp_path / "verified"
+    full.mkdir()
+    verified.mkdir()
+
+    with pytest.raises(RuntimeError, match="must not overlap"):
+        full_eval.materialize_paper_aligned_dataset(
+            full_data_path=full,
+            verified_data_path=verified,
+            output_dir=full / "prepared",
+            expected_full_testcases=None,
+            expected_excluded_testcases=None,
+            expected_prepared_testcases=None,
+            expected_normalized_input_files=None,
+        )
+    assert full.exists()
+
+    with pytest.raises(RuntimeError, match="must not overlap"):
+        full_eval.materialize_paper_aligned_dataset(
+            full_data_path=full,
+            verified_data_path=verified,
+            output_dir=tmp_path,
+            expected_full_testcases=None,
+            expected_excluded_testcases=None,
+            expected_prepared_testcases=None,
+            expected_normalized_input_files=None,
+        )
+    assert verified.exists()
+
+
+def test_full_soft_hard_materializer_rejects_partial_hash_match_without_exact_fallback(tmp_path):
+    full_eval = _load_full_soft_hard_module()
+    full = tmp_path / "full"
+    verified = tmp_path / "verified"
+    dataset = [{"id": "C", "spreadsheet_path": "spreadsheet/C", "instruction": "do C", "answer_position": "A1"}]
+    (full / "spreadsheet" / "C").mkdir(parents=True)
+    (verified / "spreadsheet" / "C").mkdir(parents=True)
+    (full / "dataset.json").write_text(json.dumps(dataset), encoding="utf-8")
+    (verified / "dataset.json").write_text(json.dumps(dataset), encoding="utf-8")
+    (full / "spreadsheet" / "C" / "2_C_input.xlsx").write_text("same input", encoding="utf-8")
+    (full / "spreadsheet" / "C" / "2_C_answer.xlsx").write_text("different answer", encoding="utf-8")
+    (verified / "spreadsheet" / "C" / "1_C_init.xlsx").write_text("same input", encoding="utf-8")
+    (verified / "spreadsheet" / "C" / "1_C_golden.xlsx").write_text("verified answer", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Could not map verified train testcase"):
+        full_eval.materialize_paper_aligned_dataset(
+            full_data_path=full,
+            verified_data_path=verified,
+            output_dir=tmp_path / "prepared",
+            train_start=0,
+            train_end=1,
+            expected_full_testcases=1,
+            expected_excluded_testcases=1,
+            expected_prepared_testcases=None,
+            expected_normalized_input_files=None,
+        )
+
+
+def test_full_soft_hard_runtime_args_inherit_source_summary_and_reject_multi_seed():
+    full_eval = _load_full_soft_hard_module()
+    args = SimpleNamespace(
+        model=None,
+        openai_base_url=None,
+        openai_api_key=None,
+        embedding_base_url=None,
+        embedding_model=None,
+        skillbank_top_k=None,
+        workers=None,
+        max_turns=None,
+        temperature=None,
+        llm_client=None,
+        llm_timeout_seconds=None,
+        llm_retry_wait_seconds=None,
+        num_random_seeds=1,
+        repeat=1,
+    )
+    sources = full_eval.resolve_runtime_args(args, {
+        "model": "Qwen3.5-9B-AWQ",
+        "openai_base_url": "http://llm/v1",
+        "embedding_base_url": "http://embed/v1",
+        "embedding_model": "Qwen3-Embedding-8B",
+        "skillbank_top_k": 10,
+        "workers": 8,
+        "max_turns": 100,
+        "rollout_temperature": 0.0,
+        "rollout_llm_client": "openai",
+        "rollout_client_timeout_seconds": 1200.0,
+        "rollout_client_retry_wait_seconds": [5.0, 10.0],
+    })
+    assert args.model == "Qwen3.5-9B-AWQ"
+    assert args.skillbank_top_k == 10
+    assert args.openai_base_url == "http://llm/v1"
+    assert args.llm_retry_wait_seconds == "5.0,10.0"
+    assert sources["model"].startswith("source_run_dir")
+
+    args.repeat = 2
+    with pytest.raises(ValueError, match="single-run eval"):
+        full_eval.resolve_runtime_args(args, {})
+
+
+def test_evaluator_reports_raw_soft_hard_alongside_recalc(tmp_path, monkeypatch):
+    import evaluate_with_official as evaluator
+
+    data = tmp_path / "data"
+    outputs = tmp_path / "outputs"
+    sheet = data / "spreadsheet" / "A"
+    out_sheet = outputs / "spreadsheet" / "A"
+    sheet.mkdir(parents=True)
+    out_sheet.mkdir(parents=True)
+    (data / "dataset.json").write_text(json.dumps([{
+        "id": "A",
+        "spreadsheet_path": "spreadsheet/A",
+        "instruction": "fill",
+        "instruction_type": "Cell-Level Manipulation",
+        "answer_position": "A1",
+    }]), encoding="utf-8")
+    for idx in (1, 2):
+        (sheet / f"{idx}_A_answer.xlsx").write_text(f"answer {idx}", encoding="utf-8")
+        (out_sheet / f"{idx}_A_output.xlsx").write_text(f"output {idx}", encoding="utf-8")
+
+    monkeypatch.setattr(evaluator, "_preflight_libreoffice", lambda: "soffice")
+
+    def fake_recalc(input_path, recalc_dir, instance_id, *, soffice=None):
+        recalc_path = Path(recalc_dir) / f"{Path(input_path).stem}.recalc.xlsx"
+        recalc_path.parent.mkdir(parents=True, exist_ok=True)
+        recalc_path.write_text("recalc", encoding="utf-8")
+        return str(recalc_path)
+
+    def fake_compare(gt_path, output_path, instruction_type, answer_position):
+        if output_path.endswith(".recalc.xlsx"):
+            return True, "recalc ok"
+        return output_path.endswith("1_A_output.xlsx"), "raw"
+
+    monkeypatch.setattr(evaluator, "_recalculate_workbook", fake_recalc)
+    monkeypatch.setattr(evaluator, "compare_workbooks", fake_compare)
+
+    result = evaluator.evaluate(str(data), str(outputs), recalc_dir=str(tmp_path / "recalc"))
+    summary = result["summary"]
+    assert summary["avg_soft_score"] == 1.0
+    assert summary["avg_hard_score"] == 1.0
+    raw = summary["trace2skill_compatible_no_recalc"]
+    assert raw["avg_soft_score"] == 0.5
+    assert raw["avg_hard_score"] == 0.0
+    assert raw["test_case_accuracy"] == 0.5
+    assert result["results"][0]["raw_soft_score"] == 0.5
+    assert result["results"][0]["raw_hard_score"] == 0
+
+
+def test_full_soft_hard_wrapper_uses_trace2skill_runner_and_evaluator(tmp_path):
+    full_eval = _load_full_soft_hard_module()
+    args = SimpleNamespace(
+        python_executable="/env/bin/python",
+        model="Qwen3.5-9B-AWQ",
+        llm_client="openai",
+        temperature=0.0,
+        llm_timeout_seconds=600.0,
+        llm_retry_wait_seconds="5.0,10.0,30.0",
+        num_random_seeds=1,
+        repeat=1,
+        max_turns=100,
+        workers=8,
+    )
+    rollout = full_eval.build_rollout_command(
+        args,
+        tmp_path / "prepared_dataset",
+        tmp_path / "trace2skill_full_outputs",
+        tmp_path / "trace2skill_full_logs",
+        tmp_path / "trace2skill_full_results.json",
+        tmp_path / "skills",
+        tmp_path / "trace2skill_generation_config.json",
+    )
+    eval_cmd = full_eval.build_eval_command(
+        args,
+        tmp_path / "prepared_dataset",
+        tmp_path / "trace2skill_full_outputs",
+        tmp_path / "full_soft_hard_eval.json",
+        tmp_path / "recalc",
+    )
+    assert "run_spreadsheetbench.py" in rollout
+    assert "evaluate_with_official.py" in eval_cmd
+    assert "--agent" in rollout
+    assert rollout[rollout.index("--agent") + 1] == "cli_skill_preloaded"
+    assert "--recalc_dir" in eval_cmd

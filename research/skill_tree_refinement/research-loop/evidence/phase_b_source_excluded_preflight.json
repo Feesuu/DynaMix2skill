@@ -1,0 +1,3047 @@
+{
+  "format": "phase_b_source_excluded_candidate_preflight_v1",
+  "l1_card_count": 239,
+  "train_task_count": 200,
+  "train_success_count": 97,
+  "train_failure_count": 103,
+  "cards_missing_success_control": 0,
+  "cards_missing_failure_control": 0,
+  "unique_selected_success_tasks": 52,
+  "unique_selected_failure_tasks": 51,
+  "unique_selected_control_tasks": 103,
+  "success_task_reuse_histogram": {
+    "1": 18,
+    "2": 8,
+    "3": 9,
+    "4": 4,
+    "5": 3,
+    "7": 1,
+    "9": 2,
+    "10": 1,
+    "11": 1,
+    "12": 1,
+    "13": 1,
+    "14": 1,
+    "30": 1,
+    "32": 1
+  },
+  "failure_task_reuse_histogram": {
+    "1": 20,
+    "2": 4,
+    "3": 7,
+    "4": 3,
+    "5": 5,
+    "7": 2,
+    "8": 1,
+    "9": 4,
+    "11": 1,
+    "13": 1,
+    "18": 1,
+    "25": 1,
+    "28": 1
+  },
+  "query_policy": "instruction + Task type; answer_position excluded",
+  "source_exclusion_policy": "union of every nonzero L0 community member task",
+  "rows": [
+    {
+      "node_id": "E1_4748af6c0634",
+      "source_community_id": "L0_C0_R000",
+      "source_task_ids": [
+        "160-6",
+        "236-22",
+        "416-27"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.6025457242002364,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.6098037903300205
+    },
+    {
+      "node_id": "E1_888aa8a24bf6",
+      "source_community_id": "L0_C0_R000",
+      "source_task_ids": [
+        "160-6",
+        "236-22",
+        "416-27"
+      ],
+      "nearest_source_excluded_success_task_id": "599-9",
+      "nearest_source_excluded_success_score": 0.6029663916243939,
+      "nearest_source_excluded_failure_task_id": "48983",
+      "nearest_source_excluded_failure_score": 0.6020449027722747
+    },
+    {
+      "node_id": "E1_166e34f66021",
+      "source_community_id": "L0_C0_R000",
+      "source_task_ids": [
+        "160-6",
+        "236-22",
+        "416-27"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.5493978268600785,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.559542043469394
+    },
+    {
+      "node_id": "E1_ee12b1cc6eca",
+      "source_community_id": "L0_C0_R001",
+      "source_task_ids": [
+        "493-18"
+      ],
+      "nearest_source_excluded_success_task_id": "302-1",
+      "nearest_source_excluded_success_score": 0.5843305195367984,
+      "nearest_source_excluded_failure_task_id": "493-5",
+      "nearest_source_excluded_failure_score": 0.6239712996590926
+    },
+    {
+      "node_id": "E1_bfd444c328b1",
+      "source_community_id": "L0_C0_R001",
+      "source_task_ids": [
+        "493-18"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.5995666846075738,
+      "nearest_source_excluded_failure_task_id": "290-1",
+      "nearest_source_excluded_failure_score": 0.5481697306667899
+    },
+    {
+      "node_id": "E1_e0e91b1bf440",
+      "source_community_id": "L0_C0_R001",
+      "source_task_ids": [
+        "493-18"
+      ],
+      "nearest_source_excluded_success_task_id": "353-6",
+      "nearest_source_excluded_success_score": 0.6079329278867647,
+      "nearest_source_excluded_failure_task_id": "24-23",
+      "nearest_source_excluded_failure_score": 0.6195679581052854
+    },
+    {
+      "node_id": "E1_4c689adeac31",
+      "source_community_id": "L0_C0_R002",
+      "source_task_ids": [
+        "367-23"
+      ],
+      "nearest_source_excluded_success_task_id": "51431",
+      "nearest_source_excluded_success_score": 0.4007820041355207,
+      "nearest_source_excluded_failure_task_id": "41691",
+      "nearest_source_excluded_failure_score": 0.399806192013118
+    },
+    {
+      "node_id": "E1_a5db718265d7",
+      "source_community_id": "L0_C0_R002",
+      "source_task_ids": [
+        "367-23"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.5371480740847573,
+      "nearest_source_excluded_failure_task_id": "146-49",
+      "nearest_source_excluded_failure_score": 0.4497685719926888
+    },
+    {
+      "node_id": "E1_459205e1af19",
+      "source_community_id": "L0_C0_R002",
+      "source_task_ids": [
+        "367-23"
+      ],
+      "nearest_source_excluded_success_task_id": "30930",
+      "nearest_source_excluded_success_score": 0.363289065338389,
+      "nearest_source_excluded_failure_task_id": "38074",
+      "nearest_source_excluded_failure_score": 0.40019339233220474
+    },
+    {
+      "node_id": "E1_9336323bdefd",
+      "source_community_id": "L0_C0_R003",
+      "source_task_ids": [
+        "157-4"
+      ],
+      "nearest_source_excluded_success_task_id": "374-18",
+      "nearest_source_excluded_success_score": 0.6264821402633831,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.6376142173768699
+    },
+    {
+      "node_id": "E1_21372f6d2c36",
+      "source_community_id": "L0_C0_R004",
+      "source_task_ids": [
+        "382-10"
+      ],
+      "nearest_source_excluded_success_task_id": "279-23",
+      "nearest_source_excluded_success_score": 0.633608656040219,
+      "nearest_source_excluded_failure_task_id": "493-18",
+      "nearest_source_excluded_failure_score": 0.6354206366033974
+    },
+    {
+      "node_id": "E1_b18f872ec465",
+      "source_community_id": "L0_C0_R005",
+      "source_task_ids": [
+        "97-36"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.519360081868249,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.49802589687423005
+    },
+    {
+      "node_id": "E1_5338011b1cde",
+      "source_community_id": "L0_C0_R006",
+      "source_task_ids": [
+        "304-35"
+      ],
+      "nearest_source_excluded_success_task_id": "41969",
+      "nearest_source_excluded_success_score": 0.5517347937511692,
+      "nearest_source_excluded_failure_task_id": "48983",
+      "nearest_source_excluded_failure_score": 0.5162028326890198
+    },
+    {
+      "node_id": "E1_e9839074bac1",
+      "source_community_id": "L0_C0_R007",
+      "source_task_ids": [
+        "280-17",
+        "448-11"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.6010192587222394,
+      "nearest_source_excluded_failure_task_id": "24-23",
+      "nearest_source_excluded_failure_score": 0.6297768704882581
+    },
+    {
+      "node_id": "E1_f62d565effa2",
+      "source_community_id": "L0_C0_R007",
+      "source_task_ids": [
+        "280-17",
+        "448-11"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.5698808042966241,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.5424809341982103
+    },
+    {
+      "node_id": "E1_bbaf851700c8",
+      "source_community_id": "L0_C0_R007",
+      "source_task_ids": [
+        "280-17",
+        "448-11"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.5243435970033284,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.5469730323628745
+    },
+    {
+      "node_id": "E1_26d843aec9da",
+      "source_community_id": "L0_C0_R008",
+      "source_task_ids": [
+        "156-14",
+        "374-18",
+        "388-47"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.6126143438169771,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.6442446239173671
+    },
+    {
+      "node_id": "E1_c9e998b26c20",
+      "source_community_id": "L0_C0_R008",
+      "source_task_ids": [
+        "156-14",
+        "374-18",
+        "388-47"
+      ],
+      "nearest_source_excluded_success_task_id": "178-22",
+      "nearest_source_excluded_success_score": 0.5487705643794022,
+      "nearest_source_excluded_failure_task_id": "382-29",
+      "nearest_source_excluded_failure_score": 0.502585428155399
+    },
+    {
+      "node_id": "E1_40328bfa9e84",
+      "source_community_id": "L0_C0_R008",
+      "source_task_ids": [
+        "156-14",
+        "374-18",
+        "388-47"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.5158228271589991,
+      "nearest_source_excluded_failure_task_id": "24-23",
+      "nearest_source_excluded_failure_score": 0.5141322471271572
+    },
+    {
+      "node_id": "E1_16969b622460",
+      "source_community_id": "L0_C0_R009",
+      "source_task_ids": [
+        "168-17",
+        "414-20"
+      ],
+      "nearest_source_excluded_success_task_id": "599-9",
+      "nearest_source_excluded_success_score": 0.5752074268447949,
+      "nearest_source_excluded_failure_task_id": "170-13",
+      "nearest_source_excluded_failure_score": 0.5315858370898336
+    },
+    {
+      "node_id": "E1_9a16b45d5365",
+      "source_community_id": "L0_C0_R009",
+      "source_task_ids": [
+        "168-17",
+        "414-20"
+      ],
+      "nearest_source_excluded_success_task_id": "370-43",
+      "nearest_source_excluded_success_score": 0.525357011794744,
+      "nearest_source_excluded_failure_task_id": "24-23",
+      "nearest_source_excluded_failure_score": 0.5188925897155168
+    },
+    {
+      "node_id": "E1_a298b0330ebb",
+      "source_community_id": "L0_C0_R009",
+      "source_task_ids": [
+        "168-17",
+        "414-20"
+      ],
+      "nearest_source_excluded_success_task_id": "178-22",
+      "nearest_source_excluded_success_score": 0.6157679280492605,
+      "nearest_source_excluded_failure_task_id": "66-24",
+      "nearest_source_excluded_failure_score": 0.5580220910689899
+    },
+    {
+      "node_id": "E1_3367023adb29",
+      "source_community_id": "L0_C0_R010",
+      "source_task_ids": [
+        "290-27",
+        "455-35"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.5864567921796694,
+      "nearest_source_excluded_failure_task_id": "325-44",
+      "nearest_source_excluded_failure_score": 0.5868406876542376
+    },
+    {
+      "node_id": "E1_9ee7a88ec4f5",
+      "source_community_id": "L0_C0_R011",
+      "source_task_ids": [
+        "370-43"
+      ],
+      "nearest_source_excluded_success_task_id": "49300",
+      "nearest_source_excluded_success_score": 0.48587508736608787,
+      "nearest_source_excluded_failure_task_id": "41691",
+      "nearest_source_excluded_failure_score": 0.481129387998521
+    },
+    {
+      "node_id": "E1_ffe0fd5444fd",
+      "source_community_id": "L0_C0_R012",
+      "source_task_ids": [
+        "209-30",
+        "28-7",
+        "48921"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.47480992802022975,
+      "nearest_source_excluded_failure_task_id": "290-1",
+      "nearest_source_excluded_failure_score": 0.4456512991698015
+    },
+    {
+      "node_id": "E1_f359876c6ae5",
+      "source_community_id": "L0_C0_R012",
+      "source_task_ids": [
+        "209-30",
+        "28-7",
+        "48921"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.5904950234462925,
+      "nearest_source_excluded_failure_task_id": "24-23",
+      "nearest_source_excluded_failure_score": 0.6064378685922052
+    },
+    {
+      "node_id": "E1_c0e30e7f9dae",
+      "source_community_id": "L0_C0_R012",
+      "source_task_ids": [
+        "209-30",
+        "28-7",
+        "48921"
+      ],
+      "nearest_source_excluded_success_task_id": "51431",
+      "nearest_source_excluded_success_score": 0.5273100398280275,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.4875979038337034
+    },
+    {
+      "node_id": "E1_e39f82c69c74",
+      "source_community_id": "L0_C0_R013",
+      "source_task_ids": [
+        "374-31"
+      ],
+      "nearest_source_excluded_success_task_id": "370-43",
+      "nearest_source_excluded_success_score": 0.305045921213715,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.36483546863683125
+    },
+    {
+      "node_id": "E1_274a72bdef10",
+      "source_community_id": "L0_C0_R014",
+      "source_task_ids": [
+        "24-23"
+      ],
+      "nearest_source_excluded_success_task_id": "359-21",
+      "nearest_source_excluded_success_score": 0.5962712981562028,
+      "nearest_source_excluded_failure_task_id": "66-24",
+      "nearest_source_excluded_failure_score": 0.5688946391178725
+    },
+    {
+      "node_id": "E1_3058c76a4e7a",
+      "source_community_id": "L0_C0_R015",
+      "source_task_ids": [
+        "269-44"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.5700314586039825,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.6222827572762957
+    },
+    {
+      "node_id": "E1_b3aca69cef37",
+      "source_community_id": "L0_C0_R015",
+      "source_task_ids": [
+        "269-44"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.5450598839631025,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.5760880130942323
+    },
+    {
+      "node_id": "E1_8d780a2a859e",
+      "source_community_id": "L0_C0_R016",
+      "source_task_ids": [
+        "334-11"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.5738200876664725,
+      "nearest_source_excluded_failure_task_id": "146-49",
+      "nearest_source_excluded_failure_score": 0.4825331651664627
+    },
+    {
+      "node_id": "E1_85dbf51091b6",
+      "source_community_id": "L0_C0_R016",
+      "source_task_ids": [
+        "334-11"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.5732882920609028,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.563441376360478
+    },
+    {
+      "node_id": "E1_40391af79fc5",
+      "source_community_id": "L0_C0_R016",
+      "source_task_ids": [
+        "334-11"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.6270879232773764,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.622002738237705
+    },
+    {
+      "node_id": "E1_ba5c90e2d3e5",
+      "source_community_id": "L0_C0_R017",
+      "source_task_ids": [
+        "577-40"
+      ],
+      "nearest_source_excluded_success_task_id": "48924",
+      "nearest_source_excluded_success_score": 0.43495035701905493,
+      "nearest_source_excluded_failure_task_id": "41691",
+      "nearest_source_excluded_failure_score": 0.48229665426957935
+    },
+    {
+      "node_id": "E1_6af1689476da",
+      "source_community_id": "L0_C0_R017",
+      "source_task_ids": [
+        "577-40"
+      ],
+      "nearest_source_excluded_success_task_id": "374-18",
+      "nearest_source_excluded_success_score": 0.48550054206493987,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.4871064909745001
+    },
+    {
+      "node_id": "E1_499b25edbdcb",
+      "source_community_id": "L0_C0_R018",
+      "source_task_ids": [
+        "79-7"
+      ],
+      "nearest_source_excluded_success_task_id": "297-42",
+      "nearest_source_excluded_success_score": 0.5366491050366894,
+      "nearest_source_excluded_failure_task_id": "41-47",
+      "nearest_source_excluded_failure_score": 0.5268805876554477
+    },
+    {
+      "node_id": "E1_69c9e23344c9",
+      "source_community_id": "L0_C0_R018",
+      "source_task_ids": [
+        "79-7"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.5811061894719938,
+      "nearest_source_excluded_failure_task_id": "146-49",
+      "nearest_source_excluded_failure_score": 0.5133251136078991
+    },
+    {
+      "node_id": "E1_5e31be198689",
+      "source_community_id": "L0_C0_R018",
+      "source_task_ids": [
+        "79-7"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.4286548811219679,
+      "nearest_source_excluded_failure_task_id": "41691",
+      "nearest_source_excluded_failure_score": 0.36454299005241386
+    },
+    {
+      "node_id": "E1_879a2a0cffe2",
+      "source_community_id": "L0_C0_R019",
+      "source_task_ids": [
+        "534-26"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.5779712568025986,
+      "nearest_source_excluded_failure_task_id": "66-24",
+      "nearest_source_excluded_failure_score": 0.607387526783254
+    },
+    {
+      "node_id": "E1_a8063779d91b",
+      "source_community_id": "L0_C0_R020",
+      "source_task_ids": [
+        "359-21"
+      ],
+      "nearest_source_excluded_success_task_id": "353-6",
+      "nearest_source_excluded_success_score": 0.6220888061438985,
+      "nearest_source_excluded_failure_task_id": "24-23",
+      "nearest_source_excluded_failure_score": 0.6949529240096373
+    },
+    {
+      "node_id": "E1_147b0cc785d0",
+      "source_community_id": "L0_C0_R021",
+      "source_task_ids": [
+        "535-20"
+      ],
+      "nearest_source_excluded_success_task_id": "51431",
+      "nearest_source_excluded_success_score": 0.5715851652404915,
+      "nearest_source_excluded_failure_task_id": "37900",
+      "nearest_source_excluded_failure_score": 0.5053631082420109
+    },
+    {
+      "node_id": "E1_c7d72aa18266",
+      "source_community_id": "L0_C0_R021",
+      "source_task_ids": [
+        "535-20"
+      ],
+      "nearest_source_excluded_success_task_id": "280-17",
+      "nearest_source_excluded_success_score": 0.5317011046047213,
+      "nearest_source_excluded_failure_task_id": "24-23",
+      "nearest_source_excluded_failure_score": 0.5956477579435953
+    },
+    {
+      "node_id": "E1_a906ec03f7b4",
+      "source_community_id": "L0_C0_R021",
+      "source_task_ids": [
+        "535-20"
+      ],
+      "nearest_source_excluded_success_task_id": "30930",
+      "nearest_source_excluded_success_score": 0.4786038153341604,
+      "nearest_source_excluded_failure_task_id": "52216",
+      "nearest_source_excluded_failure_score": 0.47600419503664415
+    },
+    {
+      "node_id": "E1_26ac4fc64fef",
+      "source_community_id": "L0_C0_R022",
+      "source_task_ids": [
+        "493-5"
+      ],
+      "nearest_source_excluded_success_task_id": "141-20",
+      "nearest_source_excluded_success_score": 0.5872715773951358,
+      "nearest_source_excluded_failure_task_id": "493-18",
+      "nearest_source_excluded_failure_score": 0.5534684758124078
+    },
+    {
+      "node_id": "E1_55cb9be1bc03",
+      "source_community_id": "L0_C0_R022",
+      "source_task_ids": [
+        "493-5"
+      ],
+      "nearest_source_excluded_success_task_id": "359-21",
+      "nearest_source_excluded_success_score": 0.45196744833528907,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.46560003966790764
+    },
+    {
+      "node_id": "E1_67e6108d3bea",
+      "source_community_id": "L0_C0_R022",
+      "source_task_ids": [
+        "493-5"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.45188639811872,
+      "nearest_source_excluded_failure_task_id": "170-13",
+      "nearest_source_excluded_failure_score": 0.4471526158373732
+    },
+    {
+      "node_id": "E1_a6c25a8094a9",
+      "source_community_id": "L0_C0_R023",
+      "source_task_ids": [
+        "23-24",
+        "269-43",
+        "353-6",
+        "408-5",
+        "409-45"
+      ],
+      "nearest_source_excluded_success_task_id": "382-10",
+      "nearest_source_excluded_success_score": 0.643444028529838,
+      "nearest_source_excluded_failure_task_id": "493-18",
+      "nearest_source_excluded_failure_score": 0.710977560995639
+    },
+    {
+      "node_id": "E1_c0326f138dbf",
+      "source_community_id": "L0_C0_R023",
+      "source_task_ids": [
+        "23-24",
+        "269-43",
+        "353-6",
+        "408-5",
+        "409-45"
+      ],
+      "nearest_source_excluded_success_task_id": "577-40",
+      "nearest_source_excluded_success_score": 0.5839843185911475,
+      "nearest_source_excluded_failure_task_id": "50088",
+      "nearest_source_excluded_failure_score": 0.5279265409544691
+    },
+    {
+      "node_id": "E1_1ade695d14f8",
+      "source_community_id": "L0_C0_R023",
+      "source_task_ids": [
+        "23-24",
+        "269-43",
+        "353-6",
+        "408-5",
+        "409-45"
+      ],
+      "nearest_source_excluded_success_task_id": "280-17",
+      "nearest_source_excluded_success_score": 0.5844811077357472,
+      "nearest_source_excluded_failure_task_id": "24-23",
+      "nearest_source_excluded_failure_score": 0.6491921509494696
+    },
+    {
+      "node_id": "E1_45a5c86bf75a",
+      "source_community_id": "L0_C0_R023",
+      "source_task_ids": [
+        "23-24",
+        "269-43",
+        "353-6",
+        "408-5",
+        "409-45"
+      ],
+      "nearest_source_excluded_success_task_id": "91-34",
+      "nearest_source_excluded_success_score": 0.5033165212461381,
+      "nearest_source_excluded_failure_task_id": "493-18",
+      "nearest_source_excluded_failure_score": 0.5390368246062227
+    },
+    {
+      "node_id": "E1_eedddd779751",
+      "source_community_id": "L0_C0_R024",
+      "source_task_ids": [
+        "279-23"
+      ],
+      "nearest_source_excluded_success_task_id": "40478",
+      "nearest_source_excluded_success_score": 0.6146121459205318,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.5046839352159034
+    },
+    {
+      "node_id": "E1_6321c1e786e6",
+      "source_community_id": "L0_C0_R025",
+      "source_task_ids": [
+        "165-23"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.6184959663536846,
+      "nearest_source_excluded_failure_task_id": "24-23",
+      "nearest_source_excluded_failure_score": 0.6783140460085437
+    },
+    {
+      "node_id": "E1_05872f95a5fb",
+      "source_community_id": "L0_C0_R025",
+      "source_task_ids": [
+        "165-23"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.6222128439245086,
+      "nearest_source_excluded_failure_task_id": "409-45",
+      "nearest_source_excluded_failure_score": 0.6339123215461187
+    },
+    {
+      "node_id": "E1_191f5ec6641f",
+      "source_community_id": "L0_C0_R025",
+      "source_task_ids": [
+        "165-23"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.5016133351957281,
+      "nearest_source_excluded_failure_task_id": "170-13",
+      "nearest_source_excluded_failure_score": 0.5220658048048781
+    },
+    {
+      "node_id": "E1_c9c957dc7a77",
+      "source_community_id": "L0_C1_R000",
+      "source_task_ids": [
+        "109-21",
+        "45635",
+        "50193",
+        "50768",
+        "51289"
+      ],
+      "nearest_source_excluded_success_task_id": "42526",
+      "nearest_source_excluded_success_score": 0.4999756349115609,
+      "nearest_source_excluded_failure_task_id": "38537",
+      "nearest_source_excluded_failure_score": 0.4634135642275865
+    },
+    {
+      "node_id": "E1_16c20f4235e9",
+      "source_community_id": "L0_C1_R000",
+      "source_task_ids": [
+        "109-21",
+        "45635",
+        "50193",
+        "50768",
+        "51289"
+      ],
+      "nearest_source_excluded_success_task_id": "302-1",
+      "nearest_source_excluded_success_score": 0.5003977230106538,
+      "nearest_source_excluded_failure_task_id": "48983",
+      "nearest_source_excluded_failure_score": 0.5236624292084107
+    },
+    {
+      "node_id": "E1_fee48b377796",
+      "source_community_id": "L0_C1_R000",
+      "source_task_ids": [
+        "109-21",
+        "45635",
+        "50193",
+        "50768",
+        "51289"
+      ],
+      "nearest_source_excluded_success_task_id": "42526",
+      "nearest_source_excluded_success_score": 0.48171709836537857,
+      "nearest_source_excluded_failure_task_id": "560-12",
+      "nearest_source_excluded_failure_score": 0.4973520244417603
+    },
+    {
+      "node_id": "E1_8e6c57e68041",
+      "source_community_id": "L0_C1_R000",
+      "source_task_ids": [
+        "109-21",
+        "45635",
+        "50193",
+        "50768",
+        "51289"
+      ],
+      "nearest_source_excluded_success_task_id": "440-24",
+      "nearest_source_excluded_success_score": 0.5328478712278233,
+      "nearest_source_excluded_failure_task_id": "41691",
+      "nearest_source_excluded_failure_score": 0.5375913787550891
+    },
+    {
+      "node_id": "E1_5b943d11c0e1",
+      "source_community_id": "L0_C1_R000",
+      "source_task_ids": [
+        "109-21",
+        "45635",
+        "50193",
+        "50768",
+        "51289"
+      ],
+      "nearest_source_excluded_success_task_id": "51431",
+      "nearest_source_excluded_success_score": 0.5850540623262133,
+      "nearest_source_excluded_failure_task_id": "325-44",
+      "nearest_source_excluded_failure_score": 0.5895788553383409
+    },
+    {
+      "node_id": "E1_57c9abaca24d",
+      "source_community_id": "L0_C1_R001",
+      "source_task_ids": [
+        "142-12",
+        "82-30"
+      ],
+      "nearest_source_excluded_success_task_id": "585-41",
+      "nearest_source_excluded_success_score": 0.4685327599806999,
+      "nearest_source_excluded_failure_task_id": "545-35",
+      "nearest_source_excluded_failure_score": 0.42541255751875545
+    },
+    {
+      "node_id": "E1_76add489555e",
+      "source_community_id": "L0_C1_R001",
+      "source_task_ids": [
+        "142-12",
+        "82-30"
+      ],
+      "nearest_source_excluded_success_task_id": "599-9",
+      "nearest_source_excluded_success_score": 0.6276504641633034,
+      "nearest_source_excluded_failure_task_id": "170-13",
+      "nearest_source_excluded_failure_score": 0.5923717193810395
+    },
+    {
+      "node_id": "E1_e087fe2519a8",
+      "source_community_id": "L0_C1_R001",
+      "source_task_ids": [
+        "142-12",
+        "82-30"
+      ],
+      "nearest_source_excluded_success_task_id": "178-22",
+      "nearest_source_excluded_success_score": 0.5732227199551375,
+      "nearest_source_excluded_failure_task_id": "402-43",
+      "nearest_source_excluded_failure_score": 0.5286909670992487
+    },
+    {
+      "node_id": "E1_204d44ab6430",
+      "source_community_id": "L0_C1_R002",
+      "source_task_ids": [
+        "51431"
+      ],
+      "nearest_source_excluded_success_task_id": "47798",
+      "nearest_source_excluded_success_score": 0.5513443288418,
+      "nearest_source_excluded_failure_task_id": "48745",
+      "nearest_source_excluded_failure_score": 0.4999992888611901
+    },
+    {
+      "node_id": "E1_c8f922bdd503",
+      "source_community_id": "L0_C1_R003",
+      "source_task_ids": [
+        "41601"
+      ],
+      "nearest_source_excluded_success_task_id": "39515",
+      "nearest_source_excluded_success_score": 0.5180511194981159,
+      "nearest_source_excluded_failure_task_id": "50526",
+      "nearest_source_excluded_failure_score": 0.5420572109409866
+    },
+    {
+      "node_id": "E1_f89f1d8c4fee",
+      "source_community_id": "L0_C1_R004",
+      "source_task_ids": [
+        "50952"
+      ],
+      "nearest_source_excluded_success_task_id": "599-9",
+      "nearest_source_excluded_success_score": 0.4543036595794713,
+      "nearest_source_excluded_failure_task_id": "41691",
+      "nearest_source_excluded_failure_score": 0.47563222890569623
+    },
+    {
+      "node_id": "E1_58273463aaf8",
+      "source_community_id": "L0_C1_R005",
+      "source_task_ids": [
+        "177-6",
+        "267-21",
+        "297-42",
+        "60-7",
+        "80-42"
+      ],
+      "nearest_source_excluded_success_task_id": "38703",
+      "nearest_source_excluded_success_score": 0.5187307312371631,
+      "nearest_source_excluded_failure_task_id": "41691",
+      "nearest_source_excluded_failure_score": 0.5118190326320098
+    },
+    {
+      "node_id": "E1_ed0414a32003",
+      "source_community_id": "L0_C1_R005",
+      "source_task_ids": [
+        "177-6",
+        "267-21",
+        "297-42",
+        "60-7",
+        "80-42"
+      ],
+      "nearest_source_excluded_success_task_id": "302-1",
+      "nearest_source_excluded_success_score": 0.6014175092839912,
+      "nearest_source_excluded_failure_task_id": "170-13",
+      "nearest_source_excluded_failure_score": 0.6641971860066471
+    },
+    {
+      "node_id": "E1_1e52b03cba75",
+      "source_community_id": "L0_C1_R005",
+      "source_task_ids": [
+        "177-6",
+        "267-21",
+        "297-42",
+        "60-7",
+        "80-42"
+      ],
+      "nearest_source_excluded_success_task_id": "440-24",
+      "nearest_source_excluded_success_score": 0.519434650066868,
+      "nearest_source_excluded_failure_task_id": "402-43",
+      "nearest_source_excluded_failure_score": 0.5465816279813833
+    },
+    {
+      "node_id": "E1_5132bd131907",
+      "source_community_id": "L0_C1_R005",
+      "source_task_ids": [
+        "177-6",
+        "267-21",
+        "297-42",
+        "60-7",
+        "80-42"
+      ],
+      "nearest_source_excluded_success_task_id": "17-35",
+      "nearest_source_excluded_success_score": 0.33874463732791726,
+      "nearest_source_excluded_failure_task_id": "416-15",
+      "nearest_source_excluded_failure_score": 0.40740387125831334
+    },
+    {
+      "node_id": "E1_b750f9d31d33",
+      "source_community_id": "L0_C1_R005",
+      "source_task_ids": [
+        "177-6",
+        "267-21",
+        "297-42",
+        "60-7",
+        "80-42"
+      ],
+      "nearest_source_excluded_success_task_id": "178-22",
+      "nearest_source_excluded_success_score": 0.5210696090463938,
+      "nearest_source_excluded_failure_task_id": "398-14",
+      "nearest_source_excluded_failure_score": 0.5447520133275552
+    },
+    {
+      "node_id": "E1_86011d425565",
+      "source_community_id": "L0_C1_R006",
+      "source_task_ids": [
+        "49237"
+      ],
+      "nearest_source_excluded_success_task_id": "48982",
+      "nearest_source_excluded_success_score": 0.5975005373518885,
+      "nearest_source_excluded_failure_task_id": "41691",
+      "nearest_source_excluded_failure_score": 0.6569602034927263
+    },
+    {
+      "node_id": "E1_b58e4cbc28f7",
+      "source_community_id": "L0_C1_R007",
+      "source_task_ids": [
+        "12307"
+      ],
+      "nearest_source_excluded_success_task_id": "30930",
+      "nearest_source_excluded_success_score": 0.5907280669442025,
+      "nearest_source_excluded_failure_task_id": "50088",
+      "nearest_source_excluded_failure_score": 0.5426322086867426
+    },
+    {
+      "node_id": "E1_4bf71a6b8b2f",
+      "source_community_id": "L0_C1_R008",
+      "source_task_ids": [
+        "31202"
+      ],
+      "nearest_source_excluded_success_task_id": "42198",
+      "nearest_source_excluded_success_score": 0.4391600472438957,
+      "nearest_source_excluded_failure_task_id": "398-14",
+      "nearest_source_excluded_failure_score": 0.47147333131096125
+    },
+    {
+      "node_id": "E1_f0de1d4ea856",
+      "source_community_id": "L0_C1_R009",
+      "source_task_ids": [
+        "46240"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.49897248320672005,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.5577304436734389
+    },
+    {
+      "node_id": "E1_e89ab9229331",
+      "source_community_id": "L0_C1_R010",
+      "source_task_ids": [
+        "17-35",
+        "531-18",
+        "66-24"
+      ],
+      "nearest_source_excluded_success_task_id": "297-42",
+      "nearest_source_excluded_success_score": 0.6221417115539045,
+      "nearest_source_excluded_failure_task_id": "170-13",
+      "nearest_source_excluded_failure_score": 0.6212356565582884
+    },
+    {
+      "node_id": "E1_e265268739a8",
+      "source_community_id": "L0_C1_R010",
+      "source_task_ids": [
+        "17-35",
+        "531-18",
+        "66-24"
+      ],
+      "nearest_source_excluded_success_task_id": "599-9",
+      "nearest_source_excluded_success_score": 0.5210481984988551,
+      "nearest_source_excluded_failure_task_id": "34033",
+      "nearest_source_excluded_failure_score": 0.5329139282395883
+    },
+    {
+      "node_id": "E1_832ec599a403",
+      "source_community_id": "L0_C1_R010",
+      "source_task_ids": [
+        "17-35",
+        "531-18",
+        "66-24"
+      ],
+      "nearest_source_excluded_success_task_id": "535-20",
+      "nearest_source_excluded_success_score": 0.531135707525335,
+      "nearest_source_excluded_failure_task_id": "534-26",
+      "nearest_source_excluded_failure_score": 0.5866830884382334
+    },
+    {
+      "node_id": "E1_a03d02c51246",
+      "source_community_id": "L0_C1_R011",
+      "source_task_ids": [
+        "38462",
+        "399-14",
+        "49667",
+        "52575"
+      ],
+      "nearest_source_excluded_success_task_id": "510-3",
+      "nearest_source_excluded_success_score": 0.40331797040052697,
+      "nearest_source_excluded_failure_task_id": "416-15",
+      "nearest_source_excluded_failure_score": 0.4782354127724718
+    },
+    {
+      "node_id": "E1_aeafebe3ed07",
+      "source_community_id": "L0_C1_R011",
+      "source_task_ids": [
+        "38462",
+        "399-14",
+        "49667",
+        "52575"
+      ],
+      "nearest_source_excluded_success_task_id": "304-35",
+      "nearest_source_excluded_success_score": 0.47010741936147415,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.4559971843565977
+    },
+    {
+      "node_id": "E1_9327e37655a5",
+      "source_community_id": "L0_C1_R011",
+      "source_task_ids": [
+        "38462",
+        "399-14",
+        "49667",
+        "52575"
+      ],
+      "nearest_source_excluded_success_task_id": "599-9",
+      "nearest_source_excluded_success_score": 0.451502341747928,
+      "nearest_source_excluded_failure_task_id": "37900",
+      "nearest_source_excluded_failure_score": 0.5043504498866933
+    },
+    {
+      "node_id": "E1_7a84c6738de1",
+      "source_community_id": "L0_C1_R012",
+      "source_task_ids": [
+        "188-39",
+        "194-19",
+        "203-15",
+        "395-36"
+      ],
+      "nearest_source_excluded_success_task_id": "297-42",
+      "nearest_source_excluded_success_score": 0.5790891857017244,
+      "nearest_source_excluded_failure_task_id": "41-47",
+      "nearest_source_excluded_failure_score": 0.5507254513240163
+    },
+    {
+      "node_id": "E1_3602b186c5d7",
+      "source_community_id": "L0_C1_R012",
+      "source_task_ids": [
+        "188-39",
+        "194-19",
+        "203-15",
+        "395-36"
+      ],
+      "nearest_source_excluded_success_task_id": "297-42",
+      "nearest_source_excluded_success_score": 0.5466208353309685,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.53730989212492
+    },
+    {
+      "node_id": "E1_592b757d03af",
+      "source_community_id": "L0_C1_R012",
+      "source_task_ids": [
+        "188-39",
+        "194-19",
+        "203-15",
+        "395-36"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.5924874510974472,
+      "nearest_source_excluded_failure_task_id": "146-49",
+      "nearest_source_excluded_failure_score": 0.5045281866809486
+    },
+    {
+      "node_id": "E1_0735a4f8ea89",
+      "source_community_id": "L0_C1_R013",
+      "source_task_ids": [
+        "227-40",
+        "387-16"
+      ],
+      "nearest_source_excluded_success_task_id": "280-17",
+      "nearest_source_excluded_success_score": 0.6072918193484143,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.5848921616074598
+    },
+    {
+      "node_id": "E1_7a17dad8256d",
+      "source_community_id": "L0_C1_R013",
+      "source_task_ids": [
+        "227-40",
+        "387-16"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.5536193907921064,
+      "nearest_source_excluded_failure_task_id": "41691",
+      "nearest_source_excluded_failure_score": 0.53143984638923
+    },
+    {
+      "node_id": "E1_9b0b7d4635f7",
+      "source_community_id": "L0_C1_R013",
+      "source_task_ids": [
+        "227-40",
+        "387-16"
+      ],
+      "nearest_source_excluded_success_task_id": "448-11",
+      "nearest_source_excluded_success_score": 0.6132819942027989,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.5926815939269918
+    },
+    {
+      "node_id": "E1_e152a82d9133",
+      "source_community_id": "L0_C1_R014",
+      "source_task_ids": [
+        "398-14",
+        "41-47"
+      ],
+      "nearest_source_excluded_success_task_id": "297-42",
+      "nearest_source_excluded_success_score": 0.5928801660310703,
+      "nearest_source_excluded_failure_task_id": "80-42",
+      "nearest_source_excluded_failure_score": 0.5620688484310404
+    },
+    {
+      "node_id": "E1_fdac70649fab",
+      "source_community_id": "L0_C1_R014",
+      "source_task_ids": [
+        "398-14",
+        "41-47"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.5432351907851132,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.42304778275021754
+    },
+    {
+      "node_id": "E1_de2469e422fa",
+      "source_community_id": "L0_C1_R014",
+      "source_task_ids": [
+        "398-14",
+        "41-47"
+      ],
+      "nearest_source_excluded_success_task_id": "297-42",
+      "nearest_source_excluded_success_score": 0.5969261407162818,
+      "nearest_source_excluded_failure_task_id": "560-12",
+      "nearest_source_excluded_failure_score": 0.6088055076007158
+    },
+    {
+      "node_id": "E1_73a21231422c",
+      "source_community_id": "L0_C1_R015",
+      "source_task_ids": [
+        "402-43"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.5975191128768513,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.5819038202927524
+    },
+    {
+      "node_id": "E1_a8db5102eae9",
+      "source_community_id": "L0_C1_R015",
+      "source_task_ids": [
+        "402-43"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.5106545296617003,
+      "nearest_source_excluded_failure_task_id": "41691",
+      "nearest_source_excluded_failure_score": 0.5484238488544385
+    },
+    {
+      "node_id": "E1_78f04978b3ab",
+      "source_community_id": "L0_C1_R015",
+      "source_task_ids": [
+        "402-43"
+      ],
+      "nearest_source_excluded_success_task_id": "585-41",
+      "nearest_source_excluded_success_score": 0.5270807907547846,
+      "nearest_source_excluded_failure_task_id": "38074",
+      "nearest_source_excluded_failure_score": 0.49928947851144034
+    },
+    {
+      "node_id": "E1_fb93e31be68a",
+      "source_community_id": "L0_C1_R016",
+      "source_task_ids": [
+        "38985",
+        "48745",
+        "50324"
+      ],
+      "nearest_source_excluded_success_task_id": "463-17",
+      "nearest_source_excluded_success_score": 0.5021575325926253,
+      "nearest_source_excluded_failure_task_id": "39931",
+      "nearest_source_excluded_failure_score": 0.5145277340420567
+    },
+    {
+      "node_id": "E1_6dc12716ae6d",
+      "source_community_id": "L0_C1_R016",
+      "source_task_ids": [
+        "38985",
+        "48745",
+        "50324"
+      ],
+      "nearest_source_excluded_success_task_id": "51431",
+      "nearest_source_excluded_success_score": 0.605999470339655,
+      "nearest_source_excluded_failure_task_id": "325-44",
+      "nearest_source_excluded_failure_score": 0.5023082717995269
+    },
+    {
+      "node_id": "E1_5463d3d519b4",
+      "source_community_id": "L0_C1_R016",
+      "source_task_ids": [
+        "38985",
+        "48745",
+        "50324"
+      ],
+      "nearest_source_excluded_success_task_id": "531-18",
+      "nearest_source_excluded_success_score": 0.4071191022219029,
+      "nearest_source_excluded_failure_task_id": "50768",
+      "nearest_source_excluded_failure_score": 0.4310426907161496
+    },
+    {
+      "node_id": "E1_78fefb649bae",
+      "source_community_id": "L0_C1_R017",
+      "source_task_ids": [
+        "516-46",
+        "567-21",
+        "91-34"
+      ],
+      "nearest_source_excluded_success_task_id": "156-14",
+      "nearest_source_excluded_success_score": 0.5701121370907059,
+      "nearest_source_excluded_failure_task_id": "24-23",
+      "nearest_source_excluded_failure_score": 0.613189483615854
+    },
+    {
+      "node_id": "E1_296f10056c6c",
+      "source_community_id": "L0_C1_R017",
+      "source_task_ids": [
+        "516-46",
+        "567-21",
+        "91-34"
+      ],
+      "nearest_source_excluded_success_task_id": "109-21",
+      "nearest_source_excluded_success_score": 0.5209132697499452,
+      "nearest_source_excluded_failure_task_id": "177-6",
+      "nearest_source_excluded_failure_score": 0.5372359605955865
+    },
+    {
+      "node_id": "E1_deff6e05f7fd",
+      "source_community_id": "L0_C1_R017",
+      "source_task_ids": [
+        "516-46",
+        "567-21",
+        "91-34"
+      ],
+      "nearest_source_excluded_success_task_id": "353-6",
+      "nearest_source_excluded_success_score": 0.598153061696072,
+      "nearest_source_excluded_failure_task_id": "24-23",
+      "nearest_source_excluded_failure_score": 0.645917564129143
+    },
+    {
+      "node_id": "E1_0607ccc3254c",
+      "source_community_id": "L0_C1_R018",
+      "source_task_ids": [
+        "39432"
+      ],
+      "nearest_source_excluded_success_task_id": "38703",
+      "nearest_source_excluded_success_score": 0.3822655463311868,
+      "nearest_source_excluded_failure_task_id": "433-47",
+      "nearest_source_excluded_failure_score": 0.3926663485043016
+    },
+    {
+      "node_id": "E1_bf8c908d88d9",
+      "source_community_id": "L0_C1_R019",
+      "source_task_ids": [
+        "41410"
+      ],
+      "nearest_source_excluded_success_task_id": "178-22",
+      "nearest_source_excluded_success_score": 0.7044899584820437,
+      "nearest_source_excluded_failure_task_id": "325-44",
+      "nearest_source_excluded_failure_score": 0.5765646287966621
+    },
+    {
+      "node_id": "E1_8ba5cbd67837",
+      "source_community_id": "L0_C1_R019",
+      "source_task_ids": [
+        "41410"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.531813471794985,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.48589409241023224
+    },
+    {
+      "node_id": "E1_87fb90ce76df",
+      "source_community_id": "L0_C1_R019",
+      "source_task_ids": [
+        "41410"
+      ],
+      "nearest_source_excluded_success_task_id": "178-22",
+      "nearest_source_excluded_success_score": 0.5299424591342565,
+      "nearest_source_excluded_failure_task_id": "66-24",
+      "nearest_source_excluded_failure_score": 0.49851564446192637
+    },
+    {
+      "node_id": "E1_687cb8ec4b69",
+      "source_community_id": "L0_C1_R020",
+      "source_task_ids": [
+        "416-15",
+        "45896",
+        "486-17",
+        "510-3"
+      ],
+      "nearest_source_excluded_success_task_id": "599-9",
+      "nearest_source_excluded_success_score": 0.5151697749585384,
+      "nearest_source_excluded_failure_task_id": "66-24",
+      "nearest_source_excluded_failure_score": 0.5246824860727193
+    },
+    {
+      "node_id": "E1_cd50f34babaf",
+      "source_community_id": "L0_C1_R020",
+      "source_task_ids": [
+        "416-15",
+        "45896",
+        "486-17",
+        "510-3"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.557477711116115,
+      "nearest_source_excluded_failure_task_id": "545-35",
+      "nearest_source_excluded_failure_score": 0.49475526697319266
+    },
+    {
+      "node_id": "E1_19a56b8ec581",
+      "source_community_id": "L0_C1_R020",
+      "source_task_ids": [
+        "416-15",
+        "45896",
+        "486-17",
+        "510-3"
+      ],
+      "nearest_source_excluded_success_task_id": "51431",
+      "nearest_source_excluded_success_score": 0.5025645214466803,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.5720020631159073
+    },
+    {
+      "node_id": "E1_189bcbd42bc2",
+      "source_community_id": "L0_C1_R021",
+      "source_task_ids": [
+        "105-24"
+      ],
+      "nearest_source_excluded_success_task_id": "302-1",
+      "nearest_source_excluded_success_score": 0.6012949688558917,
+      "nearest_source_excluded_failure_task_id": "50526",
+      "nearest_source_excluded_failure_score": 0.5881675270093221
+    },
+    {
+      "node_id": "E1_0be74156362c",
+      "source_community_id": "L0_C1_R022",
+      "source_task_ids": [
+        "30930",
+        "48080",
+        "50088",
+        "51-12"
+      ],
+      "nearest_source_excluded_success_task_id": "51359",
+      "nearest_source_excluded_success_score": 0.5470286677403312,
+      "nearest_source_excluded_failure_task_id": "38537",
+      "nearest_source_excluded_failure_score": 0.5058209811143037
+    },
+    {
+      "node_id": "E1_5af1b91045b3",
+      "source_community_id": "L0_C1_R022",
+      "source_task_ids": [
+        "30930",
+        "48080",
+        "50088",
+        "51-12"
+      ],
+      "nearest_source_excluded_success_task_id": "50796",
+      "nearest_source_excluded_success_score": 0.598114515503612,
+      "nearest_source_excluded_failure_task_id": "12307",
+      "nearest_source_excluded_failure_score": 0.5227164513435579
+    },
+    {
+      "node_id": "E1_d311b04874f1",
+      "source_community_id": "L0_C1_R022",
+      "source_task_ids": [
+        "30930",
+        "48080",
+        "50088",
+        "51-12"
+      ],
+      "nearest_source_excluded_success_task_id": "49300",
+      "nearest_source_excluded_success_score": 0.5254970491377544,
+      "nearest_source_excluded_failure_task_id": "37900",
+      "nearest_source_excluded_failure_score": 0.5247296502053356
+    },
+    {
+      "node_id": "E1_b031204b43de",
+      "source_community_id": "L0_C1_R022",
+      "source_task_ids": [
+        "30930",
+        "48080",
+        "50088",
+        "51-12"
+      ],
+      "nearest_source_excluded_success_task_id": "50796",
+      "nearest_source_excluded_success_score": 0.532453945566234,
+      "nearest_source_excluded_failure_task_id": "560-12",
+      "nearest_source_excluded_failure_score": 0.47418814474580384
+    },
+    {
+      "node_id": "E1_1a785a2ce218",
+      "source_community_id": "L0_C1_R022",
+      "source_task_ids": [
+        "30930",
+        "48080",
+        "50088",
+        "51-12"
+      ],
+      "nearest_source_excluded_success_task_id": "49300",
+      "nearest_source_excluded_success_score": 0.4942962238898985,
+      "nearest_source_excluded_failure_task_id": "37900",
+      "nearest_source_excluded_failure_score": 0.508429830644745
+    },
+    {
+      "node_id": "E1_d810d20464c7",
+      "source_community_id": "L0_C1_R023",
+      "source_task_ids": [
+        "48257"
+      ],
+      "nearest_source_excluded_success_task_id": "585-41",
+      "nearest_source_excluded_success_score": 0.5927797543060939,
+      "nearest_source_excluded_failure_task_id": "49036",
+      "nearest_source_excluded_failure_score": 0.518316268930445
+    },
+    {
+      "node_id": "E1_bca0ffa1d885",
+      "source_community_id": "L0_C1_R024",
+      "source_task_ids": [
+        "192-22",
+        "341-40",
+        "379-36",
+        "39046",
+        "41691",
+        "48975",
+        "496-15"
+      ],
+      "nearest_source_excluded_success_task_id": "178-22",
+      "nearest_source_excluded_success_score": 0.492570404818464,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.5489218719853226
+    },
+    {
+      "node_id": "E1_8693c401edbe",
+      "source_community_id": "L0_C1_R024",
+      "source_task_ids": [
+        "192-22",
+        "341-40",
+        "379-36",
+        "39046",
+        "41691",
+        "48975",
+        "496-15"
+      ],
+      "nearest_source_excluded_success_task_id": "48982",
+      "nearest_source_excluded_success_score": 0.30246232443009746,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.26823509854981914
+    },
+    {
+      "node_id": "E1_1c82aef69492",
+      "source_community_id": "L0_C1_R024",
+      "source_task_ids": [
+        "192-22",
+        "341-40",
+        "379-36",
+        "39046",
+        "41691",
+        "48975",
+        "496-15"
+      ],
+      "nearest_source_excluded_success_task_id": "51586",
+      "nearest_source_excluded_success_score": 0.6731486060024746,
+      "nearest_source_excluded_failure_task_id": "38823",
+      "nearest_source_excluded_failure_score": 0.5357891930458967
+    },
+    {
+      "node_id": "E1_e6db62d1e68b",
+      "source_community_id": "L0_C1_R024",
+      "source_task_ids": [
+        "192-22",
+        "341-40",
+        "379-36",
+        "39046",
+        "41691",
+        "48975",
+        "496-15"
+      ],
+      "nearest_source_excluded_success_task_id": "30930",
+      "nearest_source_excluded_success_score": 0.5515584125075074,
+      "nearest_source_excluded_failure_task_id": "560-12",
+      "nearest_source_excluded_failure_score": 0.5547531918433686
+    },
+    {
+      "node_id": "E1_c0ad309d055c",
+      "source_community_id": "L0_C1_R025",
+      "source_task_ids": [
+        "48608",
+        "49333"
+      ],
+      "nearest_source_excluded_success_task_id": "49300",
+      "nearest_source_excluded_success_score": 0.5340298207471663,
+      "nearest_source_excluded_failure_task_id": "39931",
+      "nearest_source_excluded_failure_score": 0.596268106856153
+    },
+    {
+      "node_id": "E1_4d86707d9eb3",
+      "source_community_id": "L0_C1_R025",
+      "source_task_ids": [
+        "48608",
+        "49333"
+      ],
+      "nearest_source_excluded_success_task_id": "49300",
+      "nearest_source_excluded_success_score": 0.5347371925266508,
+      "nearest_source_excluded_failure_task_id": "39931",
+      "nearest_source_excluded_failure_score": 0.5659296332128863
+    },
+    {
+      "node_id": "E1_7d05effccb08",
+      "source_community_id": "L0_C1_R025",
+      "source_task_ids": [
+        "48608",
+        "49333"
+      ],
+      "nearest_source_excluded_success_task_id": "49300",
+      "nearest_source_excluded_success_score": 0.479539977345211,
+      "nearest_source_excluded_failure_task_id": "37900",
+      "nearest_source_excluded_failure_score": 0.5144314754735854
+    },
+    {
+      "node_id": "E1_abda9253fb50",
+      "source_community_id": "L0_C1_R026",
+      "source_task_ids": [
+        "183-8",
+        "48643"
+      ],
+      "nearest_source_excluded_success_task_id": "41969",
+      "nearest_source_excluded_success_score": 0.5668865015974998,
+      "nearest_source_excluded_failure_task_id": "52216",
+      "nearest_source_excluded_failure_score": 0.5083214480391417
+    },
+    {
+      "node_id": "E1_d57cbe3b6156",
+      "source_community_id": "L0_C1_R026",
+      "source_task_ids": [
+        "183-8",
+        "48643"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.48293815352022756,
+      "nearest_source_excluded_failure_task_id": "37900",
+      "nearest_source_excluded_failure_score": 0.5156908636377816
+    },
+    {
+      "node_id": "E1_68d6164da58c",
+      "source_community_id": "L0_C1_R027",
+      "source_task_ids": [
+        "51359"
+      ],
+      "nearest_source_excluded_success_task_id": "30930",
+      "nearest_source_excluded_success_score": 0.49653344500212737,
+      "nearest_source_excluded_failure_task_id": "61-4",
+      "nearest_source_excluded_failure_score": 0.4901829965196888
+    },
+    {
+      "node_id": "E1_628f5d78ad2f",
+      "source_community_id": "L0_C1_R028",
+      "source_task_ids": [
+        "39931",
+        "42198",
+        "49300",
+        "52216"
+      ],
+      "nearest_source_excluded_success_task_id": "41969",
+      "nearest_source_excluded_success_score": 0.5130173357018901,
+      "nearest_source_excluded_failure_task_id": "50526",
+      "nearest_source_excluded_failure_score": 0.5129612816562181
+    },
+    {
+      "node_id": "E1_2758ff81981f",
+      "source_community_id": "L0_C1_R028",
+      "source_task_ids": [
+        "39931",
+        "42198",
+        "49300",
+        "52216"
+      ],
+      "nearest_source_excluded_success_task_id": "41969",
+      "nearest_source_excluded_success_score": 0.5573076629706207,
+      "nearest_source_excluded_failure_task_id": "267-18",
+      "nearest_source_excluded_failure_score": 0.5160263982157556
+    },
+    {
+      "node_id": "E1_2cfd950b479d",
+      "source_community_id": "L0_C1_R028",
+      "source_task_ids": [
+        "39931",
+        "42198",
+        "49300",
+        "52216"
+      ],
+      "nearest_source_excluded_success_task_id": "50796",
+      "nearest_source_excluded_success_score": 0.49482749413300986,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.5448678758985539
+    },
+    {
+      "node_id": "E1_dfad7e787baf",
+      "source_community_id": "L0_C1_R029",
+      "source_task_ids": [
+        "41969"
+      ],
+      "nearest_source_excluded_success_task_id": "30930",
+      "nearest_source_excluded_success_score": 0.5822494968657617,
+      "nearest_source_excluded_failure_task_id": "50088",
+      "nearest_source_excluded_failure_score": 0.5773526969555042
+    },
+    {
+      "node_id": "E1_9a24d08b968c",
+      "source_community_id": "L0_C1_R030",
+      "source_task_ids": [
+        "230-16",
+        "279-23",
+        "45300"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.5505881796242786,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.555050759131655
+    },
+    {
+      "node_id": "E1_e14f0ad1f39e",
+      "source_community_id": "L0_C1_R030",
+      "source_task_ids": [
+        "230-16",
+        "279-23",
+        "45300"
+      ],
+      "nearest_source_excluded_success_task_id": "41969",
+      "nearest_source_excluded_success_score": 0.5662590618884509,
+      "nearest_source_excluded_failure_task_id": "50088",
+      "nearest_source_excluded_failure_score": 0.5387649271496585
+    },
+    {
+      "node_id": "E1_dfc5ba702da0",
+      "source_community_id": "L0_C1_R030",
+      "source_task_ids": [
+        "230-16",
+        "279-23",
+        "45300"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.46872606273908773,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.4832788996949404
+    },
+    {
+      "node_id": "E1_b6bc018c12c8",
+      "source_community_id": "L0_C1_R031",
+      "source_task_ids": [
+        "49196"
+      ],
+      "nearest_source_excluded_success_task_id": "39515",
+      "nearest_source_excluded_success_score": 0.5645930702643629,
+      "nearest_source_excluded_failure_task_id": "37900",
+      "nearest_source_excluded_failure_score": 0.5667594438907296
+    },
+    {
+      "node_id": "E1_c7c9f5d231fb",
+      "source_community_id": "L0_C1_R032",
+      "source_task_ids": [
+        "108-24",
+        "170-13",
+        "178-22",
+        "325-44",
+        "47798"
+      ],
+      "nearest_source_excluded_success_task_id": "279-23",
+      "nearest_source_excluded_success_score": 0.4786291061937775,
+      "nearest_source_excluded_failure_task_id": "41691",
+      "nearest_source_excluded_failure_score": 0.4888421615078229
+    },
+    {
+      "node_id": "E1_cb1045f67500",
+      "source_community_id": "L0_C1_R032",
+      "source_task_ids": [
+        "108-24",
+        "170-13",
+        "178-22",
+        "325-44",
+        "47798"
+      ],
+      "nearest_source_excluded_success_task_id": "599-9",
+      "nearest_source_excluded_success_score": 0.5253411965572466,
+      "nearest_source_excluded_failure_task_id": "395-36",
+      "nearest_source_excluded_failure_score": 0.49064170058590595
+    },
+    {
+      "node_id": "E1_4fd796207646",
+      "source_community_id": "L0_C1_R032",
+      "source_task_ids": [
+        "108-24",
+        "170-13",
+        "178-22",
+        "325-44",
+        "47798"
+      ],
+      "nearest_source_excluded_success_task_id": "48924",
+      "nearest_source_excluded_success_score": 0.43994917814136353,
+      "nearest_source_excluded_failure_task_id": "493-18",
+      "nearest_source_excluded_failure_score": 0.48897536873732245
+    },
+    {
+      "node_id": "E1_dd00ce08bcb0",
+      "source_community_id": "L0_C1_R033",
+      "source_task_ids": [
+        "38703",
+        "39903",
+        "560-12"
+      ],
+      "nearest_source_excluded_success_task_id": "51431",
+      "nearest_source_excluded_success_score": 0.5925377848824778,
+      "nearest_source_excluded_failure_task_id": "41-47",
+      "nearest_source_excluded_failure_score": 0.5727607318171325
+    },
+    {
+      "node_id": "E1_c0a91f6392ff",
+      "source_community_id": "L0_C1_R033",
+      "source_task_ids": [
+        "38703",
+        "39903",
+        "560-12"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.5231054022520844,
+      "nearest_source_excluded_failure_task_id": "41-47",
+      "nearest_source_excluded_failure_score": 0.48388967549276607
+    },
+    {
+      "node_id": "E1_4edf7048c177",
+      "source_community_id": "L0_C1_R033",
+      "source_task_ids": [
+        "38703",
+        "39903",
+        "560-12"
+      ],
+      "nearest_source_excluded_success_task_id": "17-35",
+      "nearest_source_excluded_success_score": 0.5328040812252532,
+      "nearest_source_excluded_failure_task_id": "41691",
+      "nearest_source_excluded_failure_score": 0.521224384506653
+    },
+    {
+      "node_id": "E1_6452bfc458f1",
+      "source_community_id": "L0_C1_R034",
+      "source_task_ids": [
+        "22-47"
+      ],
+      "nearest_source_excluded_success_task_id": "297-42",
+      "nearest_source_excluded_success_score": 0.4876812400882117,
+      "nearest_source_excluded_failure_task_id": "170-13",
+      "nearest_source_excluded_failure_score": 0.4884936717503235
+    },
+    {
+      "node_id": "E1_1dafcc52562a",
+      "source_community_id": "L0_C1_R035",
+      "source_task_ids": [
+        "118-50",
+        "146-49"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.5387702184614869,
+      "nearest_source_excluded_failure_task_id": "290-1",
+      "nearest_source_excluded_failure_score": 0.4489471770967291
+    },
+    {
+      "node_id": "E1_b6959f8c14be",
+      "source_community_id": "L0_C1_R035",
+      "source_task_ids": [
+        "118-50",
+        "146-49"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.5417376381419646,
+      "nearest_source_excluded_failure_task_id": "22-47",
+      "nearest_source_excluded_failure_score": 0.554408248153569
+    },
+    {
+      "node_id": "E1_5bb416d76f5a",
+      "source_community_id": "L0_C1_R035",
+      "source_task_ids": [
+        "118-50",
+        "146-49"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.4542039148502799,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.41424910712907703
+    },
+    {
+      "node_id": "E1_e135fd3c6dd7",
+      "source_community_id": "L0_C1_R036",
+      "source_task_ids": [
+        "142-19",
+        "191-40",
+        "208-20",
+        "262-17",
+        "488-14"
+      ],
+      "nearest_source_excluded_success_task_id": "41969",
+      "nearest_source_excluded_success_score": 0.5607509590480799,
+      "nearest_source_excluded_failure_task_id": "22-47",
+      "nearest_source_excluded_failure_score": 0.6002963009977073
+    },
+    {
+      "node_id": "E1_4dc8428cbe52",
+      "source_community_id": "L0_C1_R036",
+      "source_task_ids": [
+        "142-19",
+        "191-40",
+        "208-20",
+        "262-17",
+        "488-14"
+      ],
+      "nearest_source_excluded_success_task_id": "48588",
+      "nearest_source_excluded_success_score": 0.5129631600342861,
+      "nearest_source_excluded_failure_task_id": "22-47",
+      "nearest_source_excluded_failure_score": 0.5707137108373375
+    },
+    {
+      "node_id": "E1_3cd06d21ba59",
+      "source_community_id": "L0_C1_R036",
+      "source_task_ids": [
+        "142-19",
+        "191-40",
+        "208-20",
+        "262-17",
+        "488-14"
+      ],
+      "nearest_source_excluded_success_task_id": "38703",
+      "nearest_source_excluded_success_score": 0.6020670690801813,
+      "nearest_source_excluded_failure_task_id": "177-6",
+      "nearest_source_excluded_failure_score": 0.6041463478416407
+    },
+    {
+      "node_id": "E1_01f9255da6ad",
+      "source_community_id": "L0_C1_R036",
+      "source_task_ids": [
+        "142-19",
+        "191-40",
+        "208-20",
+        "262-17",
+        "488-14"
+      ],
+      "nearest_source_excluded_success_task_id": "48924",
+      "nearest_source_excluded_success_score": 0.3822186801873494,
+      "nearest_source_excluded_failure_task_id": "22-47",
+      "nearest_source_excluded_failure_score": 0.45590363016120117
+    },
+    {
+      "node_id": "E1_bd9da1d597ea",
+      "source_community_id": "L0_C1_R036",
+      "source_task_ids": [
+        "142-19",
+        "191-40",
+        "208-20",
+        "262-17",
+        "488-14"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.5062526635041926,
+      "nearest_source_excluded_failure_task_id": "22-47",
+      "nearest_source_excluded_failure_score": 0.5815056602125493
+    },
+    {
+      "node_id": "E1_9954efe6dd5f",
+      "source_community_id": "L0_C1_R037",
+      "source_task_ids": [
+        "263-1",
+        "477-45"
+      ],
+      "nearest_source_excluded_success_task_id": "516-46",
+      "nearest_source_excluded_success_score": 0.5592562440695407,
+      "nearest_source_excluded_failure_task_id": "250-20",
+      "nearest_source_excluded_failure_score": 0.5521766926236102
+    },
+    {
+      "node_id": "E1_3c30018a22d6",
+      "source_community_id": "L0_C1_R037",
+      "source_task_ids": [
+        "263-1",
+        "477-45"
+      ],
+      "nearest_source_excluded_success_task_id": "38703",
+      "nearest_source_excluded_success_score": 0.49887699923695267,
+      "nearest_source_excluded_failure_task_id": "41-47",
+      "nearest_source_excluded_failure_score": 0.5328405718813974
+    },
+    {
+      "node_id": "E1_08160d817963",
+      "source_community_id": "L0_C1_R037",
+      "source_task_ids": [
+        "263-1",
+        "477-45"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.4222566563366864,
+      "nearest_source_excluded_failure_task_id": "170-13",
+      "nearest_source_excluded_failure_score": 0.4268053619743284
+    },
+    {
+      "node_id": "E1_7287980803e9",
+      "source_community_id": "L0_C1_R038",
+      "source_task_ids": [
+        "283-32",
+        "384-4"
+      ],
+      "nearest_source_excluded_success_task_id": "91-34",
+      "nearest_source_excluded_success_score": 0.5502570486106473,
+      "nearest_source_excluded_failure_task_id": "395-36",
+      "nearest_source_excluded_failure_score": 0.6621562921573909
+    },
+    {
+      "node_id": "E1_744b7f61b5b8",
+      "source_community_id": "L0_C1_R038",
+      "source_task_ids": [
+        "283-32",
+        "384-4"
+      ],
+      "nearest_source_excluded_success_task_id": "178-22",
+      "nearest_source_excluded_success_score": 0.44481360081330806,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.4740303499100199
+    },
+    {
+      "node_id": "E1_135cc44ebebc",
+      "source_community_id": "L0_C1_R038",
+      "source_task_ids": [
+        "283-32",
+        "384-4"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.5309562290941379,
+      "nearest_source_excluded_failure_task_id": "66-24",
+      "nearest_source_excluded_failure_score": 0.5296924854725512
+    },
+    {
+      "node_id": "E1_ae001f6e4d0d",
+      "source_community_id": "L0_C1_R039",
+      "source_task_ids": [
+        "353-29",
+        "38537",
+        "48982"
+      ],
+      "nearest_source_excluded_success_task_id": "41969",
+      "nearest_source_excluded_success_score": 0.5982564516160642,
+      "nearest_source_excluded_failure_task_id": "50088",
+      "nearest_source_excluded_failure_score": 0.5734811919165335
+    },
+    {
+      "node_id": "E1_4046c2562438",
+      "source_community_id": "L0_C1_R039",
+      "source_task_ids": [
+        "353-29",
+        "38537",
+        "48982"
+      ],
+      "nearest_source_excluded_success_task_id": "49300",
+      "nearest_source_excluded_success_score": 0.47361435495046755,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.530223898224663
+    },
+    {
+      "node_id": "E1_ed82a84c9a79",
+      "source_community_id": "L0_C1_R039",
+      "source_task_ids": [
+        "353-29",
+        "38537",
+        "48982"
+      ],
+      "nearest_source_excluded_success_task_id": "41969",
+      "nearest_source_excluded_success_score": 0.4911652387939845,
+      "nearest_source_excluded_failure_task_id": "41691",
+      "nearest_source_excluded_failure_score": 0.6441250636922244
+    },
+    {
+      "node_id": "E1_e60a8378550a",
+      "source_community_id": "L0_C1_R040",
+      "source_task_ids": [
+        "47842"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.5310545558585111,
+      "nearest_source_excluded_failure_task_id": "146-49",
+      "nearest_source_excluded_failure_score": 0.48579525372415355
+    },
+    {
+      "node_id": "E1_b745ef5901ff",
+      "source_community_id": "L0_C1_R041",
+      "source_task_ids": [
+        "472-15"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.6110776403481178,
+      "nearest_source_excluded_failure_task_id": "38074",
+      "nearest_source_excluded_failure_score": 0.5489710772930965
+    },
+    {
+      "node_id": "E1_6e251064e746",
+      "source_community_id": "L0_C1_R042",
+      "source_task_ids": [
+        "141-20",
+        "82-38"
+      ],
+      "nearest_source_excluded_success_task_id": "156-14",
+      "nearest_source_excluded_success_score": 0.6081690743313202,
+      "nearest_source_excluded_failure_task_id": "24-23",
+      "nearest_source_excluded_failure_score": 0.6356624334672227
+    },
+    {
+      "node_id": "E1_970df2f7619f",
+      "source_community_id": "L0_C1_R042",
+      "source_task_ids": [
+        "141-20",
+        "82-38"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.5383063872834988,
+      "nearest_source_excluded_failure_task_id": "170-13",
+      "nearest_source_excluded_failure_score": 0.49381757689346517
+    },
+    {
+      "node_id": "E1_818517aa41ac",
+      "source_community_id": "L0_C1_R042",
+      "source_task_ids": [
+        "141-20",
+        "82-38"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.5443529854527409,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.4812820972886661
+    },
+    {
+      "node_id": "E1_1704b2b44601",
+      "source_community_id": "L0_C1_R043",
+      "source_task_ids": [
+        "247-24",
+        "547-43"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.4985309946372444,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.5429998224581842
+    },
+    {
+      "node_id": "E1_0d4ced8a2329",
+      "source_community_id": "L0_C1_R043",
+      "source_task_ids": [
+        "247-24",
+        "547-43"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.578627797378954,
+      "nearest_source_excluded_failure_task_id": "66-24",
+      "nearest_source_excluded_failure_score": 0.5574162322728581
+    },
+    {
+      "node_id": "E1_4e36b5afdbbf",
+      "source_community_id": "L0_C1_R043",
+      "source_task_ids": [
+        "247-24",
+        "547-43"
+      ],
+      "nearest_source_excluded_success_task_id": "531-18",
+      "nearest_source_excluded_success_score": 0.5817817376573783,
+      "nearest_source_excluded_failure_task_id": "41-47",
+      "nearest_source_excluded_failure_score": 0.5739316272579668
+    },
+    {
+      "node_id": "E1_8273a48f8508",
+      "source_community_id": "L0_C1_R044",
+      "source_task_ids": [
+        "524-31"
+      ],
+      "nearest_source_excluded_success_task_id": "51431",
+      "nearest_source_excluded_success_score": 0.5441687854297745,
+      "nearest_source_excluded_failure_task_id": "39667",
+      "nearest_source_excluded_failure_score": 0.3895984266682312
+    },
+    {
+      "node_id": "E1_90a8078c0c8f",
+      "source_community_id": "L0_C1_R044",
+      "source_task_ids": [
+        "524-31"
+      ],
+      "nearest_source_excluded_success_task_id": "51431",
+      "nearest_source_excluded_success_score": 0.43111267583504964,
+      "nearest_source_excluded_failure_task_id": "146-49",
+      "nearest_source_excluded_failure_score": 0.4465926997160673
+    },
+    {
+      "node_id": "E1_4762704731e3",
+      "source_community_id": "L0_C1_R044",
+      "source_task_ids": [
+        "524-31"
+      ],
+      "nearest_source_excluded_success_task_id": "279-23",
+      "nearest_source_excluded_success_score": 0.533860137735794,
+      "nearest_source_excluded_failure_task_id": "50088",
+      "nearest_source_excluded_failure_score": 0.5384912472803558
+    },
+    {
+      "node_id": "E1_c1e6ce351d0f",
+      "source_community_id": "L0_C1_R045",
+      "source_task_ids": [
+        "33722"
+      ],
+      "nearest_source_excluded_success_task_id": "30930",
+      "nearest_source_excluded_success_score": 0.4498548402358463,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.43657145673232683
+    },
+    {
+      "node_id": "E1_b1bbb7bf95e9",
+      "source_community_id": "L0_C1_R046",
+      "source_task_ids": [
+        "40478",
+        "49036",
+        "49801"
+      ],
+      "nearest_source_excluded_success_task_id": "51431",
+      "nearest_source_excluded_success_score": 0.6059348602348562,
+      "nearest_source_excluded_failure_task_id": "50952",
+      "nearest_source_excluded_failure_score": 0.5192924578048874
+    },
+    {
+      "node_id": "E1_eb6e4f3f7305",
+      "source_community_id": "L0_C1_R046",
+      "source_task_ids": [
+        "40478",
+        "49036",
+        "49801"
+      ],
+      "nearest_source_excluded_success_task_id": "50796",
+      "nearest_source_excluded_success_score": 0.4942934666377183,
+      "nearest_source_excluded_failure_task_id": "37900",
+      "nearest_source_excluded_failure_score": 0.5366512730222909
+    },
+    {
+      "node_id": "E1_f1b7359bc952",
+      "source_community_id": "L0_C1_R046",
+      "source_task_ids": [
+        "40478",
+        "49036",
+        "49801"
+      ],
+      "nearest_source_excluded_success_task_id": "49300",
+      "nearest_source_excluded_success_score": 0.47432615566064473,
+      "nearest_source_excluded_failure_task_id": "267-18",
+      "nearest_source_excluded_failure_score": 0.48063183363684436
+    },
+    {
+      "node_id": "E1_396ba2d39ca0",
+      "source_community_id": "L0_C1_R047",
+      "source_task_ids": [
+        "545-35",
+        "585-41"
+      ],
+      "nearest_source_excluded_success_task_id": "48257",
+      "nearest_source_excluded_success_score": 0.5583234383167247,
+      "nearest_source_excluded_failure_task_id": "48921",
+      "nearest_source_excluded_failure_score": 0.46952912616548537
+    },
+    {
+      "node_id": "E1_320fdbb4549f",
+      "source_community_id": "L0_C1_R047",
+      "source_task_ids": [
+        "545-35",
+        "585-41"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.5409853025141104,
+      "nearest_source_excluded_failure_task_id": "38074",
+      "nearest_source_excluded_failure_score": 0.4805593229893508
+    },
+    {
+      "node_id": "E1_6d3aea995657",
+      "source_community_id": "L0_C1_R047",
+      "source_task_ids": [
+        "545-35",
+        "585-41"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.5512746447500985,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.49307864942865465
+    },
+    {
+      "node_id": "E1_1a0a36498e7e",
+      "source_community_id": "L0_C1_R048",
+      "source_task_ids": [
+        "463-17",
+        "48588"
+      ],
+      "nearest_source_excluded_success_task_id": "30930",
+      "nearest_source_excluded_success_score": 0.5187364368806416,
+      "nearest_source_excluded_failure_task_id": "50088",
+      "nearest_source_excluded_failure_score": 0.5385487518313176
+    },
+    {
+      "node_id": "E1_208b8ca0ef64",
+      "source_community_id": "L0_C1_R048",
+      "source_task_ids": [
+        "463-17",
+        "48588"
+      ],
+      "nearest_source_excluded_success_task_id": "38703",
+      "nearest_source_excluded_success_score": 0.42607819910492223,
+      "nearest_source_excluded_failure_task_id": "560-12",
+      "nearest_source_excluded_failure_score": 0.4528413342358902
+    },
+    {
+      "node_id": "E1_7219173128a4",
+      "source_community_id": "L0_C1_R048",
+      "source_task_ids": [
+        "463-17",
+        "48588"
+      ],
+      "nearest_source_excluded_success_task_id": "38703",
+      "nearest_source_excluded_success_score": 0.4556502021262191,
+      "nearest_source_excluded_failure_task_id": "524-31",
+      "nearest_source_excluded_failure_score": 0.4193174137727267
+    },
+    {
+      "node_id": "E1_92433306b064",
+      "source_community_id": "L0_C1_R049",
+      "source_task_ids": [
+        "51262"
+      ],
+      "nearest_source_excluded_success_task_id": "48365",
+      "nearest_source_excluded_success_score": 0.5602966706539523,
+      "nearest_source_excluded_failure_task_id": "38823",
+      "nearest_source_excluded_failure_score": 0.4925851670320921
+    },
+    {
+      "node_id": "E1_b1e8488c2a3b",
+      "source_community_id": "L0_C1_R049",
+      "source_task_ids": [
+        "51262"
+      ],
+      "nearest_source_excluded_success_task_id": "47766",
+      "nearest_source_excluded_success_score": 0.5913897092830385,
+      "nearest_source_excluded_failure_task_id": "38823",
+      "nearest_source_excluded_failure_score": 0.5890518826916872
+    },
+    {
+      "node_id": "E1_1ea00738f206",
+      "source_community_id": "L0_C1_R049",
+      "source_task_ids": [
+        "51262"
+      ],
+      "nearest_source_excluded_success_task_id": "48365",
+      "nearest_source_excluded_success_score": 0.5681396025763688,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.5492626947536676
+    },
+    {
+      "node_id": "E1_efaad9342d8e",
+      "source_community_id": "L0_C1_R050",
+      "source_task_ids": [
+        "42526"
+      ],
+      "nearest_source_excluded_success_task_id": "254-34",
+      "nearest_source_excluded_success_score": 0.4027365146791887,
+      "nearest_source_excluded_failure_task_id": "267-18",
+      "nearest_source_excluded_failure_score": 0.48905921461981494
+    },
+    {
+      "node_id": "E1_e3299e93ede4",
+      "source_community_id": "L0_C1_R051",
+      "source_task_ids": [
+        "382-29",
+        "46167",
+        "50682",
+        "50796"
+      ],
+      "nearest_source_excluded_success_task_id": "51431",
+      "nearest_source_excluded_success_score": 0.5533170589531309,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.5834281164982871
+    },
+    {
+      "node_id": "E1_1824ff8cbf9d",
+      "source_community_id": "L0_C1_R051",
+      "source_task_ids": [
+        "382-29",
+        "46167",
+        "50682",
+        "50796"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.4713038892264876,
+      "nearest_source_excluded_failure_task_id": "37900",
+      "nearest_source_excluded_failure_score": 0.5375362621237749
+    },
+    {
+      "node_id": "E1_f09137711141",
+      "source_community_id": "L0_C1_R051",
+      "source_task_ids": [
+        "382-29",
+        "46167",
+        "50682",
+        "50796"
+      ],
+      "nearest_source_excluded_success_task_id": "585-41",
+      "nearest_source_excluded_success_score": 0.4781090424149614,
+      "nearest_source_excluded_failure_task_id": "38074",
+      "nearest_source_excluded_failure_score": 0.5122703872363441
+    },
+    {
+      "node_id": "E1_194d116b9dc3",
+      "source_community_id": "L0_C1_R052",
+      "source_task_ids": [
+        "48365"
+      ],
+      "nearest_source_excluded_success_task_id": "49801",
+      "nearest_source_excluded_success_score": 0.470948026821,
+      "nearest_source_excluded_failure_task_id": "267-18",
+      "nearest_source_excluded_failure_score": 0.48458213366411595
+    },
+    {
+      "node_id": "E1_c9c94ef073f7",
+      "source_community_id": "L0_C1_R052",
+      "source_task_ids": [
+        "48365"
+      ],
+      "nearest_source_excluded_success_task_id": "48982",
+      "nearest_source_excluded_success_score": 0.4904506087173128,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.5168621628456008
+    },
+    {
+      "node_id": "E1_f74193a47723",
+      "source_community_id": "L0_C1_R052",
+      "source_task_ids": [
+        "48365"
+      ],
+      "nearest_source_excluded_success_task_id": "48982",
+      "nearest_source_excluded_success_score": 0.5006107226779363,
+      "nearest_source_excluded_failure_task_id": "37900",
+      "nearest_source_excluded_failure_score": 0.5075315832971526
+    },
+    {
+      "node_id": "E1_dd163357baed",
+      "source_community_id": "L0_C1_R053",
+      "source_task_ids": [
+        "302-1",
+        "438-18",
+        "440-24",
+        "48969",
+        "48983"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.5646165745915983,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.5318483400816889
+    },
+    {
+      "node_id": "E1_3caf820cde7d",
+      "source_community_id": "L0_C1_R053",
+      "source_task_ids": [
+        "302-1",
+        "438-18",
+        "440-24",
+        "48969",
+        "48983"
+      ],
+      "nearest_source_excluded_success_task_id": "531-18",
+      "nearest_source_excluded_success_score": 0.5221252346575633,
+      "nearest_source_excluded_failure_task_id": "341-14",
+      "nearest_source_excluded_failure_score": 0.5647312042757722
+    },
+    {
+      "node_id": "E1_9a30ab43e134",
+      "source_community_id": "L0_C1_R053",
+      "source_task_ids": [
+        "302-1",
+        "438-18",
+        "440-24",
+        "48969",
+        "48983"
+      ],
+      "nearest_source_excluded_success_task_id": "48924",
+      "nearest_source_excluded_success_score": 0.5280705883944449,
+      "nearest_source_excluded_failure_task_id": "66-24",
+      "nearest_source_excluded_failure_score": 0.5300374590308629
+    },
+    {
+      "node_id": "E1_208f5130467b",
+      "source_community_id": "L0_C1_R054",
+      "source_task_ids": [
+        "44389"
+      ],
+      "nearest_source_excluded_success_task_id": "585-41",
+      "nearest_source_excluded_success_score": 0.5278981431054018,
+      "nearest_source_excluded_failure_task_id": "545-35",
+      "nearest_source_excluded_failure_score": 0.5173218087383162
+    },
+    {
+      "node_id": "E1_96e28fa92b16",
+      "source_community_id": "L0_C1_R054",
+      "source_task_ids": [
+        "44389"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.5639370440226088,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.49251041656676453
+    },
+    {
+      "node_id": "E1_b14addc6c3ad",
+      "source_community_id": "L0_C1_R054",
+      "source_task_ids": [
+        "44389"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.44591669989820604,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.4751492499158076
+    },
+    {
+      "node_id": "E1_3be29f682ff6",
+      "source_community_id": "L0_C1_R055",
+      "source_task_ids": [
+        "254-34"
+      ],
+      "nearest_source_excluded_success_task_id": "47766",
+      "nearest_source_excluded_success_score": 0.5230973442639475,
+      "nearest_source_excluded_failure_task_id": "38823",
+      "nearest_source_excluded_failure_score": 0.5940614309761262
+    },
+    {
+      "node_id": "E1_5cdc8450bd48",
+      "source_community_id": "L0_C1_R055",
+      "source_task_ids": [
+        "254-34"
+      ],
+      "nearest_source_excluded_success_task_id": "178-22",
+      "nearest_source_excluded_success_score": 0.5468794161034649,
+      "nearest_source_excluded_failure_task_id": "50526",
+      "nearest_source_excluded_failure_score": 0.548659704234421
+    },
+    {
+      "node_id": "E1_3697ec259f9a",
+      "source_community_id": "L0_C1_R055",
+      "source_task_ids": [
+        "254-34"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.5244858249208875,
+      "nearest_source_excluded_failure_task_id": "66-24",
+      "nearest_source_excluded_failure_score": 0.5448801365482623
+    },
+    {
+      "node_id": "E1_c3be17ab5330",
+      "source_community_id": "L0_C1_R056",
+      "source_task_ids": [
+        "34033",
+        "37900",
+        "39515",
+        "47933",
+        "50916"
+      ],
+      "nearest_source_excluded_success_task_id": "41969",
+      "nearest_source_excluded_success_score": 0.512506817285765,
+      "nearest_source_excluded_failure_task_id": "50526",
+      "nearest_source_excluded_failure_score": 0.5858943629297171
+    },
+    {
+      "node_id": "E1_fa1a17f2c285",
+      "source_community_id": "L0_C1_R056",
+      "source_task_ids": [
+        "34033",
+        "37900",
+        "39515",
+        "47933",
+        "50916"
+      ],
+      "nearest_source_excluded_success_task_id": "51586",
+      "nearest_source_excluded_success_score": 0.5252188695279525,
+      "nearest_source_excluded_failure_task_id": "48608",
+      "nearest_source_excluded_failure_score": 0.4922869753685165
+    },
+    {
+      "node_id": "E1_8579b8f20af7",
+      "source_community_id": "L0_C1_R056",
+      "source_task_ids": [
+        "34033",
+        "37900",
+        "39515",
+        "47933",
+        "50916"
+      ],
+      "nearest_source_excluded_success_task_id": "38703",
+      "nearest_source_excluded_success_score": 0.545279977964608,
+      "nearest_source_excluded_failure_task_id": "177-6",
+      "nearest_source_excluded_failure_score": 0.5297037528724544
+    },
+    {
+      "node_id": "E1_f18e14651f23",
+      "source_community_id": "L0_C1_R057",
+      "source_task_ids": [
+        "343-20",
+        "547-18"
+      ],
+      "nearest_source_excluded_success_task_id": "47842",
+      "nearest_source_excluded_success_score": 0.5644733909897754,
+      "nearest_source_excluded_failure_task_id": "41-47",
+      "nearest_source_excluded_failure_score": 0.48564320766959024
+    },
+    {
+      "node_id": "E1_aa8ec2aeadff",
+      "source_community_id": "L0_C1_R057",
+      "source_task_ids": [
+        "343-20",
+        "547-18"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.532387845627756,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.4832270714020232
+    },
+    {
+      "node_id": "E1_53a7538e4d91",
+      "source_community_id": "L0_C1_R057",
+      "source_task_ids": [
+        "343-20",
+        "547-18"
+      ],
+      "nearest_source_excluded_success_task_id": "486-17",
+      "nearest_source_excluded_success_score": 0.4716812424826547,
+      "nearest_source_excluded_failure_task_id": "45896",
+      "nearest_source_excluded_failure_score": 0.5156570839828138
+    },
+    {
+      "node_id": "E1_05fb3c486c6a",
+      "source_community_id": "L0_C1_R058",
+      "source_task_ids": [
+        "15380",
+        "333-29",
+        "599-9"
+      ],
+      "nearest_source_excluded_success_task_id": "39515",
+      "nearest_source_excluded_success_score": 0.6039980962469235,
+      "nearest_source_excluded_failure_task_id": "39931",
+      "nearest_source_excluded_failure_score": 0.5682042046600837
+    },
+    {
+      "node_id": "E1_ed289bbb2b1f",
+      "source_community_id": "L0_C1_R058",
+      "source_task_ids": [
+        "15380",
+        "333-29",
+        "599-9"
+      ],
+      "nearest_source_excluded_success_task_id": "178-22",
+      "nearest_source_excluded_success_score": 0.49488350989633967,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.5365912902650006
+    },
+    {
+      "node_id": "E1_c1a2e651bde9",
+      "source_community_id": "L0_C1_R058",
+      "source_task_ids": [
+        "15380",
+        "333-29",
+        "599-9"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.5145693663787275,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.49174406293041545
+    },
+    {
+      "node_id": "E1_8960b121cd6c",
+      "source_community_id": "L0_C1_R059",
+      "source_task_ids": [
+        "51090"
+      ],
+      "nearest_source_excluded_success_task_id": "178-22",
+      "nearest_source_excluded_success_score": 0.5280748998448379,
+      "nearest_source_excluded_failure_task_id": "34033",
+      "nearest_source_excluded_failure_score": 0.5147321513965646
+    },
+    {
+      "node_id": "E1_f3031f1e37cf",
+      "source_community_id": "L0_C1_R059",
+      "source_task_ids": [
+        "51090"
+      ],
+      "nearest_source_excluded_success_task_id": "178-22",
+      "nearest_source_excluded_success_score": 0.5941369814467641,
+      "nearest_source_excluded_failure_task_id": "325-44",
+      "nearest_source_excluded_failure_score": 0.6018526375056246
+    },
+    {
+      "node_id": "E1_a86f0434fd06",
+      "source_community_id": "L0_C1_R059",
+      "source_task_ids": [
+        "51090"
+      ],
+      "nearest_source_excluded_success_task_id": "178-22",
+      "nearest_source_excluded_success_score": 0.5400075060634366,
+      "nearest_source_excluded_failure_task_id": "325-44",
+      "nearest_source_excluded_failure_score": 0.5680353575800934
+    },
+    {
+      "node_id": "E1_53b035c3e5a3",
+      "source_community_id": "L0_C1_R060",
+      "source_task_ids": [
+        "48924"
+      ],
+      "nearest_source_excluded_success_task_id": "17-35",
+      "nearest_source_excluded_success_score": 0.5252116141649359,
+      "nearest_source_excluded_failure_task_id": "395-36",
+      "nearest_source_excluded_failure_score": 0.5478633159301997
+    },
+    {
+      "node_id": "E1_64abe5beebf2",
+      "source_community_id": "L0_C1_R061",
+      "source_task_ids": [
+        "38074"
+      ],
+      "nearest_source_excluded_success_task_id": "47842",
+      "nearest_source_excluded_success_score": 0.6253212426608311,
+      "nearest_source_excluded_failure_task_id": "146-49",
+      "nearest_source_excluded_failure_score": 0.5455172305203542
+    },
+    {
+      "node_id": "E1_591eef15eb4a",
+      "source_community_id": "L0_C1_R061",
+      "source_task_ids": [
+        "38074"
+      ],
+      "nearest_source_excluded_success_task_id": "30930",
+      "nearest_source_excluded_success_score": 0.5647494205788027,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.6169610255504112
+    },
+    {
+      "node_id": "E1_f88dc8ce5ebd",
+      "source_community_id": "L0_C1_R061",
+      "source_task_ids": [
+        "38074"
+      ],
+      "nearest_source_excluded_success_task_id": "30930",
+      "nearest_source_excluded_success_score": 0.5460768082927627,
+      "nearest_source_excluded_failure_task_id": "50088",
+      "nearest_source_excluded_failure_score": 0.5279849923920986
+    },
+    {
+      "node_id": "E1_97c04539922b",
+      "source_community_id": "L0_C1_R062",
+      "source_task_ids": [
+        "433-47"
+      ],
+      "nearest_source_excluded_success_task_id": "49300",
+      "nearest_source_excluded_success_score": 0.43773595420005795,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.44325790476282134
+    },
+    {
+      "node_id": "E1_20bedb5bf754",
+      "source_community_id": "L0_C1_R063",
+      "source_task_ids": [
+        "48921"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.5243601304660596,
+      "nearest_source_excluded_failure_task_id": "290-1",
+      "nearest_source_excluded_failure_score": 0.4541745192093944
+    },
+    {
+      "node_id": "E1_ad9f5b13bae1",
+      "source_community_id": "L0_C1_R064",
+      "source_task_ids": [
+        "408-39"
+      ],
+      "nearest_source_excluded_success_task_id": "414-20",
+      "nearest_source_excluded_success_score": 0.5607293548038956,
+      "nearest_source_excluded_failure_task_id": "50526",
+      "nearest_source_excluded_failure_score": 0.6000298707305969
+    },
+    {
+      "node_id": "E1_449d61931777",
+      "source_community_id": "L0_C1_R065",
+      "source_task_ids": [
+        "73-45"
+      ],
+      "nearest_source_excluded_success_task_id": "49801",
+      "nearest_source_excluded_success_score": 0.24842201678849551,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.2443010858272959
+    },
+    {
+      "node_id": "E1_ccd890d5f079",
+      "source_community_id": "L0_C1_R065",
+      "source_task_ids": [
+        "73-45"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.53645568710342,
+      "nearest_source_excluded_failure_task_id": "41691",
+      "nearest_source_excluded_failure_score": 0.5443867932614997
+    },
+    {
+      "node_id": "E1_7afcc870287a",
+      "source_community_id": "L0_C1_R065",
+      "source_task_ids": [
+        "73-45"
+      ],
+      "nearest_source_excluded_success_task_id": "440-24",
+      "nearest_source_excluded_success_score": 0.2757199105913601,
+      "nearest_source_excluded_failure_task_id": "38969",
+      "nearest_source_excluded_failure_score": 0.28137415778279046
+    },
+    {
+      "node_id": "E1_e995f3202fac",
+      "source_community_id": "L0_C1_R066",
+      "source_task_ids": [
+        "120-24",
+        "267-18",
+        "423-16",
+        "48620",
+        "50526"
+      ],
+      "nearest_source_excluded_success_task_id": "496-15",
+      "nearest_source_excluded_success_score": 0.5752295835189021,
+      "nearest_source_excluded_failure_task_id": "325-44",
+      "nearest_source_excluded_failure_score": 0.5419983709657213
+    },
+    {
+      "node_id": "E1_c6ce44e86eca",
+      "source_community_id": "L0_C1_R066",
+      "source_task_ids": [
+        "120-24",
+        "267-18",
+        "423-16",
+        "48620",
+        "50526"
+      ],
+      "nearest_source_excluded_success_task_id": "254-34",
+      "nearest_source_excluded_success_score": 0.4438996870918073,
+      "nearest_source_excluded_failure_task_id": "41691",
+      "nearest_source_excluded_failure_score": 0.4803843137269206
+    },
+    {
+      "node_id": "E1_e6b6d43b8d11",
+      "source_community_id": "L0_C1_R066",
+      "source_task_ids": [
+        "120-24",
+        "267-18",
+        "423-16",
+        "48620",
+        "50526"
+      ],
+      "nearest_source_excluded_success_task_id": "178-22",
+      "nearest_source_excluded_success_score": 0.5494067949457812,
+      "nearest_source_excluded_failure_task_id": "24-23",
+      "nearest_source_excluded_failure_score": 0.5318544423133342
+    },
+    {
+      "node_id": "E1_3128478badd5",
+      "source_community_id": "L0_C1_R066",
+      "source_task_ids": [
+        "120-24",
+        "267-18",
+        "423-16",
+        "48620",
+        "50526"
+      ],
+      "nearest_source_excluded_success_task_id": "599-9",
+      "nearest_source_excluded_success_score": 0.46279776177747783,
+      "nearest_source_excluded_failure_task_id": "41691",
+      "nearest_source_excluded_failure_score": 0.4344428979045144
+    },
+    {
+      "node_id": "E1_16ad836a9e89",
+      "source_community_id": "L0_C1_R066",
+      "source_task_ids": [
+        "120-24",
+        "267-18",
+        "423-16",
+        "48620",
+        "50526"
+      ],
+      "nearest_source_excluded_success_task_id": "49300",
+      "nearest_source_excluded_success_score": 0.5066722365256551,
+      "nearest_source_excluded_failure_task_id": "41691",
+      "nearest_source_excluded_failure_score": 0.5422449115247125
+    },
+    {
+      "node_id": "E1_d8bc8d81942c",
+      "source_community_id": "L0_C1_R066",
+      "source_task_ids": [
+        "120-24",
+        "267-18",
+        "423-16",
+        "48620",
+        "50526"
+      ],
+      "nearest_source_excluded_success_task_id": "254-34",
+      "nearest_source_excluded_success_score": 0.4311776587818258,
+      "nearest_source_excluded_failure_task_id": "41691",
+      "nearest_source_excluded_failure_score": 0.45753773612791093
+    },
+    {
+      "node_id": "E1_89d4bba92177",
+      "source_community_id": "L0_C1_R066",
+      "source_task_ids": [
+        "120-24",
+        "267-18",
+        "423-16",
+        "48620",
+        "50526"
+      ],
+      "nearest_source_excluded_success_task_id": "49300",
+      "nearest_source_excluded_success_score": 0.6032570634389406,
+      "nearest_source_excluded_failure_task_id": "52216",
+      "nearest_source_excluded_failure_score": 0.6192304352025583
+    },
+    {
+      "node_id": "E1_56890805da70",
+      "source_community_id": "L0_C1_R067",
+      "source_task_ids": [
+        "39667"
+      ],
+      "nearest_source_excluded_success_task_id": "49300",
+      "nearest_source_excluded_success_score": 0.48723063644962133,
+      "nearest_source_excluded_failure_task_id": "50526",
+      "nearest_source_excluded_failure_score": 0.5529146137389072
+    },
+    {
+      "node_id": "E1_fc372b99614d",
+      "source_community_id": "L0_C1_R068",
+      "source_task_ids": [
+        "51586"
+      ],
+      "nearest_source_excluded_success_task_id": "15380",
+      "nearest_source_excluded_success_score": 0.41155837835331105,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.3650421105210475
+    },
+    {
+      "node_id": "E1_c24544670880",
+      "source_community_id": "L0_C1_R069",
+      "source_task_ids": [
+        "38823"
+      ],
+      "nearest_source_excluded_success_task_id": "47766",
+      "nearest_source_excluded_success_score": 0.6232718351179024,
+      "nearest_source_excluded_failure_task_id": "34033",
+      "nearest_source_excluded_failure_score": 0.5958499028309376
+    },
+    {
+      "node_id": "E1_51b2289eb60c",
+      "source_community_id": "L0_C1_R070",
+      "source_task_ids": [
+        "47766"
+      ],
+      "nearest_source_excluded_success_task_id": "599-9",
+      "nearest_source_excluded_success_score": 0.48619976484132477,
+      "nearest_source_excluded_failure_task_id": "37900",
+      "nearest_source_excluded_failure_score": 0.5410021544845578
+    },
+    {
+      "node_id": "E1_f7af58583088",
+      "source_community_id": "L0_C1_R071",
+      "source_task_ids": [
+        "13-1",
+        "250-20",
+        "496-34",
+        "61-4",
+        "84-40"
+      ],
+      "nearest_source_excluded_success_task_id": "297-42",
+      "nearest_source_excluded_success_score": 0.6383777967660882,
+      "nearest_source_excluded_failure_task_id": "398-14",
+      "nearest_source_excluded_failure_score": 0.6435436185186485
+    },
+    {
+      "node_id": "E1_9acf9c517782",
+      "source_community_id": "L0_C1_R071",
+      "source_task_ids": [
+        "13-1",
+        "250-20",
+        "496-34",
+        "61-4",
+        "84-40"
+      ],
+      "nearest_source_excluded_success_task_id": "599-9",
+      "nearest_source_excluded_success_score": 0.5157951903950384,
+      "nearest_source_excluded_failure_task_id": "41-47",
+      "nearest_source_excluded_failure_score": 0.485669406265395
+    },
+    {
+      "node_id": "E1_ea8e0359dc5d",
+      "source_community_id": "L0_C1_R071",
+      "source_task_ids": [
+        "13-1",
+        "250-20",
+        "496-34",
+        "61-4",
+        "84-40"
+      ],
+      "nearest_source_excluded_success_task_id": "17-35",
+      "nearest_source_excluded_success_score": 0.5502096947597805,
+      "nearest_source_excluded_failure_task_id": "45896",
+      "nearest_source_excluded_failure_score": 0.5793244473999648
+    },
+    {
+      "node_id": "E1_9e86a337e921",
+      "source_community_id": "L0_C1_R071",
+      "source_task_ids": [
+        "13-1",
+        "250-20",
+        "496-34",
+        "61-4",
+        "84-40"
+      ],
+      "nearest_source_excluded_success_task_id": "48924",
+      "nearest_source_excluded_success_score": 0.4863665987689648,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.39143489019148947
+    },
+    {
+      "node_id": "E1_30ec28e61511",
+      "source_community_id": "L0_C1_R071",
+      "source_task_ids": [
+        "13-1",
+        "250-20",
+        "496-34",
+        "61-4",
+        "84-40"
+      ],
+      "nearest_source_excluded_success_task_id": "297-42",
+      "nearest_source_excluded_success_score": 0.613095298641678,
+      "nearest_source_excluded_failure_task_id": "41-47",
+      "nearest_source_excluded_failure_score": 0.7006462563840541
+    },
+    {
+      "node_id": "E1_7e09444f446a",
+      "source_community_id": "L0_C1_R072",
+      "source_task_ids": [
+        "469-9"
+      ],
+      "nearest_source_excluded_success_task_id": "51431",
+      "nearest_source_excluded_success_score": 0.4716556912562379,
+      "nearest_source_excluded_failure_task_id": "325-44",
+      "nearest_source_excluded_failure_score": 0.5279077742009032
+    },
+    {
+      "node_id": "E1_dd32339b29d6",
+      "source_community_id": "L0_C1_R073",
+      "source_task_ids": [
+        "38969"
+      ],
+      "nearest_source_excluded_success_task_id": "49801",
+      "nearest_source_excluded_success_score": 0.47914440198859876,
+      "nearest_source_excluded_failure_task_id": "267-18",
+      "nearest_source_excluded_failure_score": 0.5061420094656193
+    },
+    {
+      "node_id": "E1_924fa9ae44cb",
+      "source_community_id": "L0_C1_R074",
+      "source_task_ids": [
+        "130-9",
+        "147-48",
+        "290-1",
+        "341-14",
+        "408-5"
+      ],
+      "nearest_source_excluded_success_task_id": "51431",
+      "nearest_source_excluded_success_score": 0.6165335773256493,
+      "nearest_source_excluded_failure_task_id": "325-44",
+      "nearest_source_excluded_failure_score": 0.582879304036793
+    },
+    {
+      "node_id": "E1_c91886402e41",
+      "source_community_id": "L0_C1_R074",
+      "source_task_ids": [
+        "130-9",
+        "147-48",
+        "290-1",
+        "341-14",
+        "408-5"
+      ],
+      "nearest_source_excluded_success_task_id": "531-18",
+      "nearest_source_excluded_success_score": 0.6506759004532061,
+      "nearest_source_excluded_failure_task_id": "547-43",
+      "nearest_source_excluded_failure_score": 0.6150053768318513
+    },
+    {
+      "node_id": "E1_1e091b7fcb1a",
+      "source_community_id": "L0_C1_R074",
+      "source_task_ids": [
+        "130-9",
+        "147-48",
+        "290-1",
+        "341-14",
+        "408-5"
+      ],
+      "nearest_source_excluded_success_task_id": "359-21",
+      "nearest_source_excluded_success_score": 0.6262272976515101,
+      "nearest_source_excluded_failure_task_id": "28-7",
+      "nearest_source_excluded_failure_score": 0.6515356986184981
+    },
+    {
+      "node_id": "E1_c465c1291306",
+      "source_community_id": "L0_C1_R074",
+      "source_task_ids": [
+        "130-9",
+        "147-48",
+        "290-1",
+        "341-14",
+        "408-5"
+      ],
+      "nearest_source_excluded_success_task_id": "531-18",
+      "nearest_source_excluded_success_score": 0.5996224870817891,
+      "nearest_source_excluded_failure_task_id": "423-16",
+      "nearest_source_excluded_failure_score": 0.5399680230113932
+    }
+  ]
+}

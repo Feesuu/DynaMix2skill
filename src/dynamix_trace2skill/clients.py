@@ -217,7 +217,12 @@ class GenerationClient:
             kwargs["extra_body"] = body
         if response_format:
             kwargs["response_format"] = response_format
-        client = OpenAI(api_key=self.config.resolved_api_key, base_url=self.config.base_url, timeout=timeout or self.config.timeout_seconds)
+        client = OpenAI(
+            api_key=self.config.resolved_api_key,
+            base_url=self.config.base_url,
+            timeout=timeout or self.config.timeout_seconds,
+            **_openai_http_client_kwargs(),
+        )
         response = None
         wait_schedule = (0.0, *tuple(float(x) for x in self.config.retry_wait_seconds))
         for attempt, wait_seconds in enumerate(wait_schedule):
@@ -479,7 +484,7 @@ class EmbeddingClient:
             from openai import OpenAI
         except ImportError:
             from .openai_compat import OpenAI
-        client = OpenAI(api_key=self.config.resolved_api_key, base_url=self.config.base_url)
+        client = OpenAI(api_key=self.config.resolved_api_key, base_url=self.config.base_url, **_openai_http_client_kwargs())
         response = client.embeddings.create(model=model_name, input=texts)
         _append_usage_record(
             "DYNAMIX_EMBEDDING_USAGE_LOG",
@@ -804,6 +809,26 @@ def _is_retryable_openai_error(exc: Exception) -> bool:
             return False
         return code == 408 or code == 409 or code == 429 or code >= 500
     return True
+
+
+def _openai_http_client_kwargs() -> dict[str, Any]:
+    verify_env = os.environ.get("DYNAMIX_OPENAI_SSL_VERIFY")
+    trust_env = os.environ.get("DYNAMIX_OPENAI_TRUST_ENV")
+    if verify_env is None and trust_env is None:
+        return {}
+    try:
+        import httpx
+    except ImportError:
+        return {}
+    verify = _env_bool(verify_env, default=True)
+    use_env = _env_bool(trust_env, default=True)
+    return {"http_client": httpx.Client(verify=verify, trust_env=use_env)}
+
+
+def _env_bool(value: str | None, *, default: bool) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _openai_status_code(exc: Exception) -> Any:

@@ -250,7 +250,8 @@ def _openai_client(config: OfficeQARolloutConfig):
         from openai import OpenAI
     except ImportError:
         from dynamix_trace2skill.openai_compat import OpenAI
-    return OpenAI(api_key=config.api_key, base_url=config.base_url, timeout=config.timeout_seconds)
+    from dynamix_trace2skill.clients import _openai_http_client_kwargs
+    return OpenAI(api_key=config.api_key, base_url=config.base_url, timeout=config.timeout_seconds, **_openai_http_client_kwargs())
 
 
 def _chat_once(

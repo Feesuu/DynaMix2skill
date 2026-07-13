@@ -161,8 +161,20 @@ class ProjectedGmmTreeBuilder:
             return LayerBuildResult(clustering=clustering, generated_item_ids=[], committed=False)
 
         items_by_id = {item.item_id: item for item in layer_items}
-        generated = await self._summarize_communities(clustering, items_by_id=items_by_id, summary_fn=summary_fn)
-        if not generated:
+        existing_cards: list[ExperienceItem] = []
+        for card_level in range(1, level + 1):
+            existing_cards.extend(await state.item_objects_at_level(card_level))
+        existing_card_text_keys = {
+            _normalized_experience_text(item.text)
+            for item in existing_cards
+        }
+        generated = await self._summarize_communities(
+            clustering,
+            items_by_id=items_by_id,
+            summary_fn=summary_fn,
+            existing_card_text_keys=existing_card_text_keys,
+        )
+        if not generated and level == 0:
             return LayerBuildResult(clustering=clustering, generated_item_ids=[], committed=False)
 
         metadata = {
@@ -183,7 +195,7 @@ class ProjectedGmmTreeBuilder:
             level=level,
             communities=clustering.communities,
             generated_items=generated,
-            stop_reason="split",
+            stop_reason="split" if generated else "no_new_abstractions",
             metadata=metadata,
             excluded_input_item_ids=clustering.excluded_input_item_ids,
         )
@@ -313,13 +325,18 @@ class ProjectedGmmTreeBuilder:
             )
 
         embeddings = normalize_rows(np.asarray([item.embedding for item in ordered], dtype=float))
-        projection = local_pca_project(embeddings, self.config.projection)
+        layer_seed = int(self.config.random_seed) + level * 100003 + n_items
+        projection = local_pca_project(
+            embeddings,
+            self.config.projection,
+            random_seed=layer_seed,
+        )
         weights = _normalized_gmm_sample_weights(ordered)
         selection = await self._select_projected_split(
             projection.projected,
             level=level,
             n_items=n_items,
-            random_seed=int(self.config.random_seed) + level * 100003 + n_items,
+            random_seed=layer_seed,
             sample_weights=weights,
             kmax_effective_n=float(n_items),
         )
@@ -1094,14 +1111,24 @@ class ProjectedGmmTreeBuilder:
             return {"accepted": False, "reason": "too_few_items_for_gmm_refinement"}
         local_ids = [item.item_id for item in local_items]
         embeddings = normalize_rows(np.asarray([item.embedding for item in local_items], dtype=float))
-        projection = local_pca_project(embeddings, self.config.projection)
+        split_seed = (
+            int(self.config.random_seed)
+            + level * 100003
+            + len(local_items)
+            + int(node["depth"]) * 7919
+        )
+        projection = local_pca_project(
+            embeddings,
+            self.config.projection,
+            random_seed=split_seed,
+        )
         path_weights = dict(node["path_weights"])
         weights = _normalized_gmm_sample_weights(local_items, path_weights=path_weights)
         selection = await self._select_projected_split(
             projection.projected,
             level=level,
             n_items=len(local_items),
-            random_seed=int(self.config.random_seed) + level * 100003 + len(local_items) + int(node["depth"]) * 7919,
+            random_seed=split_seed,
             sample_weights=weights,
             kmax_effective_n=float(len(local_items)),
         )
@@ -1224,23 +1251,56 @@ class ProjectedGmmTreeBuilder:
             "children": children,
         }
 
-    async def _summarize_communities(self, clustering: LayerClusteringResult, *, items_by_id: dict[str, ExperienceItem], summary_fn: SummaryFn) -> list[ExperienceItem]:
-        async def run_one(index: int, community: ExperienceCommunity) -> tuple[int, list[ExperienceItem]]:
+    async def _summarize_communities(
+        self,
+        clustering: LayerClusteringResult,
+        *,
+        items_by_id: dict[str, ExperienceItem],
+        summary_fn: SummaryFn,
+        existing_card_text_keys: set[str] | None = None,
+    ) -> list[ExperienceItem]:
+        async def run_one(index: int, community: ExperienceCommunity) -> tuple[int, ExperienceCommunity, list[ExperienceItem]]:
             member_ids = clustering.member_item_ids_by_community[community.community_id]
             members = [items_by_id[item_id] for item_id in member_ids]
             if _community_skips_llm_summary(community):
-                return index, []
+                return index, community, []
+            if community.level > 0:
+                members = _distinct_experience_cards(members)
+                community.metadata["higher_level_distinct_child_count"] = len(members)
+                if len(members) < 2:
+                    community.metadata["higher_level_abstraction_skipped"] = "fewer_than_two_distinct_child_cards"
+                    return index, community, []
             produced = summary_fn(community, members, clustering)
             if inspect.isawaitable(produced):
                 produced = await produced
             cards = list(produced)
+            if not cards and community.level > 0:
+                community.metadata.setdefault("higher_level_abstraction_skipped", "no_shared_invariant")
             _validate_generated_cards(community, cards)
-            return index, cards
+            return index, community, cards
 
         results = await asyncio.gather(*(run_one(index, community) for index, community in enumerate(clustering.communities)))
         generated: list[ExperienceItem] = []
-        for _, cards in sorted(results, key=lambda pair: pair[0]):
-            generated.extend(cards)
+        seen_texts = set(existing_card_text_keys or ())
+        seen_texts.update(
+            _normalized_experience_text(item.text)
+            for item in items_by_id.values()
+            if item.kind == ITEM_KIND_EXPERIENCE_CARD
+        )
+        for _, community, cards in sorted(results, key=lambda pair: pair[0]):
+            retained: list[ExperienceItem] = []
+            for card in cards:
+                text_key = _normalized_experience_text(card.text)
+                if community.level > 0 and text_key in seen_texts:
+                    community.metadata["higher_level_duplicate_output_count"] = int(
+                        community.metadata.get("higher_level_duplicate_output_count", 0)
+                    ) + 1
+                    continue
+                seen_texts.add(text_key)
+                retained.append(card)
+            if cards and not retained and community.level > 0:
+                community.metadata["higher_level_abstraction_skipped"] = "duplicate_existing_experience"
+            generated.extend(retained)
         return generated
 
 
@@ -1418,9 +1478,29 @@ def _normalized_gmm_sample_weights(items: Sequence[ExperienceItem], *, path_weig
     return masses * (float(n_items) / total)
 
 
+def _normalized_experience_text(text: str) -> str:
+    return " ".join(str(text).split()).casefold()
+
+
+def _distinct_experience_cards(items: Sequence[ExperienceItem]) -> list[ExperienceItem]:
+    distinct: list[ExperienceItem] = []
+    seen: set[str] = set()
+    for item in items:
+        key = _normalized_experience_text(item.text)
+        if key in seen:
+            continue
+        seen.add(key)
+        distinct.append(item)
+    return distinct
+
+
 def _community_skips_llm_summary(community: ExperienceCommunity) -> bool:
     metadata = dict(community.metadata or {})
-    return bool(metadata.get("llm_summary_skipped") or metadata.get("oversize_singleton"))
+    return bool(
+        metadata.get("llm_summary_skipped")
+        or metadata.get("oversize_singleton")
+        or metadata.get("higher_level_abstraction_skipped")
+    )
 
 
 def items_support_weight(item: ExperienceItem, path_weights: dict[str, float]) -> float:

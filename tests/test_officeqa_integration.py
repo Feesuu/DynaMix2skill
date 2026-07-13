@@ -631,6 +631,9 @@ def test_officeqa_cluster_analyst_prompt_is_dataset_bound() -> None:
     assert "generic advice to use available actions" in json.dumps(payload["officeqa_experience_policy"], ensure_ascii=False)
     assert "predicted_answer" in payload["officeqa_experience_policy"]["train_diagnostic_use"]
     assert "ground_truth" in payload["officeqa_experience_policy"]["train_diagnostic_use"]
+    assert "evidence scope" in combined
+    assert "missing evidence as zero" in combined
+    assert "successful final answer alone" in combined.lower()
     for token in OFFICEQA_ANALYST_FORBIDDEN_TOKENS:
         assert token not in combined
 

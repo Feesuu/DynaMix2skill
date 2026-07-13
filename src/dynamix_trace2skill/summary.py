@@ -57,6 +57,15 @@ MINIMAL_CLUSTER_EXPERIENCE_CARDS_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+HIGHER_LEVEL_EXPERIENCE_CARD_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "cards": {"type": "array", "items": _CARD_SCHEMA, "maxItems": 1},
+    },
+    "required": ["cards"],
+    "additionalProperties": False,
+}
+
 DYNAMIC_EXPERIENCE_CARD_PATCH_SET_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -145,6 +154,15 @@ class ClusterAnalyst:
         if _is_diagnostic_community(community):
             return []
         analyst_mode = _infer_analyst_mode(community, members, self.config)
+        higher_level = analyst_mode == "experience_abstractor"
+        if higher_level:
+            members = _distinct_experience_card_members(members)
+            community.metadata["higher_level_distinct_child_count"] = len(members)
+            if len(members) < 2:
+                community.metadata["higher_level_abstraction_skipped"] = "fewer_than_two_distinct_child_cards"
+                return []
+        schema_name = "HigherLevelExperienceCardOrEmpty" if higher_level else "MinimalClusterExperienceCards"
+        output_schema = HIGHER_LEVEL_EXPERIENCE_CARD_SCHEMA if higher_level else MINIMAL_CLUSTER_EXPERIENCE_CARDS_SCHEMA
         system_prompt = self._system_prompt(analyst_mode)
         prompt = self._build_prompt(community, members, analyst_mode)
         token_event = self._preflight_prompt_budget(community, system_prompt, prompt, len(members))
@@ -153,14 +171,14 @@ class ClusterAnalyst:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
-            schema_name="MinimalClusterExperienceCards",
-            guided_json=MINIMAL_CLUSTER_EXPERIENCE_CARDS_SCHEMA,
+            schema_name=schema_name,
+            guided_json=output_schema,
             max_tokens=self.config.max_output_tokens,
             debug_metadata=self._generation_debug_metadata(
                 community,
                 members,
                 analyst_mode,
-                "MinimalClusterExperienceCards",
+                schema_name,
                 token_event,
             ),
         )
@@ -188,6 +206,8 @@ class ClusterAnalyst:
             rendered_texts.append(_render_card_text(normalized))
 
         if not normalized_cards:
+            if higher_level:
+                community.metadata["higher_level_abstraction_skipped"] = "no_shared_invariant"
             return []
 
         embeddings = await self.embedding.embed_texts(rendered_texts, cache_namespace="experience_card")
@@ -240,6 +260,12 @@ class ClusterAnalyst:
         if _is_diagnostic_community(community):
             return []
         analyst_mode = _infer_analyst_mode(community, members, self.config)
+        if analyst_mode == "experience_abstractor":
+            members = _distinct_experience_card_members(members)
+            community.metadata["higher_level_distinct_child_count"] = len(members)
+            if len(members) < 2:
+                community.metadata["higher_level_abstraction_skipped"] = "fewer_than_two_distinct_child_cards"
+                return []
         system_prompt = self._dynamic_system_prompt(analyst_mode)
         prompt = self._build_dynamic_update_prompt(community, members, previous_generated_experiences, analyst_mode)
         token_event = self._preflight_prompt_budget(community, system_prompt, prompt, len(members))
@@ -325,6 +351,24 @@ class ClusterAnalyst:
 
         if not patch_specs:
             return []
+
+        if analyst_mode == "experience_abstractor":
+            child_texts = {" ".join(member.text.split()).casefold() for member in members}
+            retained = [
+                (rendered, spec)
+                for rendered, spec in zip(rendered_texts, patch_specs)
+                if " ".join(rendered.split()).casefold() not in child_texts
+            ]
+            dropped = len(patch_specs) - len(retained)
+            if dropped:
+                community.metadata["higher_level_duplicate_output_count"] = int(
+                    community.metadata.get("higher_level_duplicate_output_count", 0)
+                ) + dropped
+            if not retained:
+                community.metadata["higher_level_abstraction_skipped"] = "duplicate_existing_experience"
+                return []
+            rendered_texts = [rendered for rendered, _ in retained]
+            patch_specs = [spec for _, spec in retained]
 
         patches: list[ExperienceCardPatch] = []
         embeddings = await self.embedding.embed_texts(rendered_texts, cache_namespace="experience_card")
@@ -477,11 +521,12 @@ class ClusterAnalyst:
 - If the cluster is mixed, analyze success and failure evidence together, and split the output into multiple cards when the raw trajectory cluster supports multiple distinct reusable lessons.
 - If the cluster supports only one reusable lesson, return one card."""
         else:
-            mission = "Analyze one cluster of lower-level ExperienceCards and produce exactly one higher-level ExperienceCard."
+            mission = "Analyze one cluster of lower-level ExperienceCards and conditionally produce one higher-level ExperienceCard."
             rewrite_policy = """- The input members are already lower-level ExperienceCards, not raw trajectories.
-- Your job is abstraction, not further extraction: identify the shared higher-level principle behind the lower-level cards.
-- Return exactly one card. Do not split the cluster into multiple cards.
-- If the community is somewhat mixed, write the broadest valid abstraction and lower the confidence instead of producing multiple cards."""
+- Generate a parent only when at least two semantically distinct child cards support the same reusable invariant.
+- The parent must add a shared abstraction that is not merely a copy or paraphrase of one child.
+- If no such invariant exists, return an empty cards list. Do not manufacture a broad generic parent.
+- Return at most one card. Do not split the cluster into multiple cards."""
         if self._task_profile() == "officeqa":
             return f"""# Role
 You are an expert OfficeQA trajectory analyst for evidence-grounded document question answering tasks.
@@ -495,14 +540,16 @@ The target agent answers document-based questions using only evidence available 
 # Trajectory evidence discipline
 - Ground every card in observable trajectory behavior, actions, observations, and final answer behavior.
 - For successful members, distill the lean solution path and keep only steps that materially led to the answer.
+- A successful final answer alone does not prove that every preceding action was useful or causally correct. Do not turn an unsupported workaround into reusable guidance.
 - For failed members, identify causal failure mechanisms and reusable prevention lessons; do not guess beyond the log.
 - Some members may include train-only predicted_answer, ground_truth, fail_reason, verifier/evaluator details, or reward audit fields. These are private diagnostic inputs. Use them only to infer the error category internally.
 - The ExperienceCard output is public reusable guidance for future heldout tasks. It must not contain private diagnostic inputs, exact train answers, predicted answers, gold answers, fail_reason labels, verifier/evaluator field names, or task-specific literals copied from members.
 - If a useful lesson depends on a private diagnostic value, replace the value with an abstract placeholder such as <computed_value>, <expected_value>, <requested_precision>, <source_period>, <target_period>, <unit>, or <metric>.
 
 # OfficeQA reusable experience focus
-- Extract reusable lessons about evidence selection, document-structure interpretation, operand tracking, period/basis/unit handling, numeric reasoning, and final answer formatting.
-- Prefer general OfficeQA behaviors: identify the requested entity, measure, period, and output format; verify that the evidence span matches the question constraints; track each operand's period, basis, unit, and semantic role; and check the final answer against the requested format.
+- Extract reusable lessons about evidence scope, entity, measure, period, basis, unit, calculation, and final answer format.
+- A useful card must explain how to align the question with the exact supporting evidence span and, when calculation is required, how to track each operand's source, period, basis, unit, sign, and semantic role.
+- Never infer that the question contains a typo, substitute a nearby period/entity, or treat blank or missing evidence as zero unless the observed evidence explicitly justifies that operation.
 - Do not produce generic cards that merely restate base agent rules such as using available actions, avoiding hallucination, verifying evidence, or returning a final answer. Those belong in the target agent system prompt.
 - Do not mention specific tool names, exact document names, absolute paths, page identifiers, dataset source names, or implementation details. If such details matter, translate them into tool-agnostic evidence-access or document-navigation behavior.
 - Do not hardcode task-specific answers, files, years, page numbers, or labels as reusable guidance.
@@ -513,7 +560,7 @@ The target agent answers document-based questions using only evidence available 
 - Do not claim root causes are externally verified. State only lessons supported by trajectory evidence.
 
 # Minimal output schema
-Return one JSON object with a top-level cards list. For higher-level abstraction mode, that list must contain exactly one card. Each card must contain only these fields:
+Return one JSON object with a top-level cards list. For higher-level abstraction mode, that list must contain zero or one card. Each card must contain only these fields:
 - name: short name of the OfficeQA experience.
 - trigger: when a future OfficeQA document question should use this experience.
 - content: the concrete reusable OfficeQA guidance. This is the main body.
@@ -539,12 +586,18 @@ You must follow the evidence discipline of the Trace2Skill success/error analysi
 {self._templates.get('error_system_llm', '')}
 </adapted_error_system_template>
 
+# Spreadsheet reusable experience focus
+- Extract concrete reusable lessons about workbook operations, formula and API invariants, sheet/cell/range alignment, preservation of workbook structure, and recalculation-based output verification.
+- A successful output alone does not prove that hard-coded coordinates, incidental column positions, or unexplained workarounds are reusable. Preserve only behavior causally supported by the trajectory evidence.
+- Do not turn task-specific filenames, coordinates, constants, or accidental success paths into general guidance.
+- Prefer precise operational invariants over generic advice such as inspect carefully, verify the workbook, or retry the operation.
+
 # Cluster-level rewrite
 {rewrite_policy}
 - v1 does not run Trace2Skill's iterative minimal-fix verifier loop, so do not claim verified root causes.
 
 # Minimal output schema
-Return one JSON object with a top-level cards list. For higher-level abstraction mode, that list must contain exactly one card. Each card must contain only these fields:
+Return one JSON object with a top-level cards list. For higher-level abstraction mode, that list must contain zero or one card. Each card must contain only these fields:
 - name: short name of the experience.
 - trigger: when a future agent should use this experience.
 - content: the concrete reusable experience/guidance. This is the main body.
@@ -589,6 +642,7 @@ The target agent answers document-based questions using only evidence available 
 # Trajectory evidence discipline
 - Ground every update/new card in observable trajectory behavior, actions, observations, and final answer behavior.
 - For successful members, preserve the lean solution path and keep only steps that materially led to the answer.
+- A successful final answer alone does not prove that every preceding action was useful or causally correct. Do not preserve unsupported workarounds as reusable guidance.
 - For failed members, identify causal failure mechanisms and reusable prevention lessons; do not guess beyond the log.
 - Some members may include train-only predicted_answer, ground_truth, fail_reason, verifier/evaluator details, or reward audit fields. These are private diagnostic inputs. Use them only to infer the error category internally.
 - The ExperienceCard output is public reusable guidance for future heldout tasks. It must not contain private diagnostic inputs, exact train answers, predicted answers, gold answers, fail_reason labels, verifier/evaluator field names, or task-specific literals copied from members.
@@ -596,7 +650,9 @@ The target agent answers document-based questions using only evidence available 
 
 # Dynamic OfficeQA rewrite
 {rewrite_policy}
-- Preserve or add only OfficeQA-specific reusable lessons about evidence selection, document-structure interpretation, operand tracking, period/basis/unit handling, numeric reasoning, and final answer formatting.
+- Preserve or add only OfficeQA-specific reusable lessons about evidence scope, entity, measure, period, basis, unit, calculation, and final answer formatting.
+- Require guidance to align the question with an exact supporting evidence span and to track each calculation operand's source, period, basis, unit, sign, and semantic role.
+- Never infer that the question contains a typo, substitute a nearby period/entity, or treat blank or missing evidence as zero unless the observed evidence explicitly justifies that operation.
 - Do not create/update cards that merely repeat base agent rules such as using available actions, avoiding hallucination, verifying evidence, or returning a final answer.
 - Do not mention specific tool names, exact document names, absolute paths, page identifiers, dataset source names, or implementation details. If such details matter, translate them into tool-agnostic evidence-access or document-navigation behavior.
 - Do not use concrete numeric examples copied from input members. Avoid exact percentages, exact decimals, exact answer strings, exact bracketed values, exact years, or exact vectors from trajectories. Use symbolic wording or placeholders instead, such as <computed_value>, <expected_value>, <requested_precision>, <source_period>, <target_period>, <unit>, or <metric>.
@@ -627,6 +683,11 @@ You must follow the evidence discipline of the Trace2Skill success/error analysi
 <adapted_error_system_template>
 {self._templates.get('error_system_llm', '')}
 </adapted_error_system_template>
+
+# Spreadsheet reusable experience focus
+- Preserve or add concrete reusable lessons about workbook operations, formula and API invariants, sheet/cell/range alignment, workbook-structure preservation, and recalculation-based output verification.
+- A successful output alone does not validate hard-coded coordinates, incidental column positions, task-specific constants, or unexplained workarounds.
+- Prefer precise operational invariants over generic advice to inspect, verify, or retry.
 
 # Dynamic community rewrite
 {rewrite_policy}
@@ -782,7 +843,7 @@ Return valid JSON only.
             "analyst_mode": analyst_mode,
             "cardinality_policy": {
                 "raw_extractor": "L0 raw trajectory communities may return one or more cards.",
-                "experience_abstractor": "L1+ ExperienceCard communities must return exactly one higher-level card.",
+                "experience_abstractor": "L1+ communities return one parent only when at least two distinct child cards support a shared invariant; otherwise return cards=[].",
             },
             "hard_constraints": [
                 "Use all provided members. Do not ignore later members or silently truncate the cluster.",
@@ -816,6 +877,12 @@ Return valid JSON only.
                 "Do not put raw trajectory text, local paths, output paths, or ground-truth-specific content into any placement."
             ]
         }
+        if analyst_mode == "experience_abstractor":
+            payload["hard_constraints"].extend([
+                "Use at least two semantically distinct child cards as evidence for every parent abstraction.",
+                "The parent must state a shared invariant supported across those children, not copy or paraphrase one child.",
+                "If the children do not support a non-generic shared invariant, return an empty cards list.",
+            ])
         if self._task_profile() == "officeqa":
             payload["task_profile"] = "officeqa"
             payload["hard_constraints"].extend([
@@ -834,9 +901,9 @@ Return valid JSON only.
                     "<target_period>, <unit>, or <metric> when a value is needed."
                 ),
                 "high_value_lessons": [
-                    "task decomposition into requested entity, measure, period, and output format",
-                    "evidence-span verification against the question constraints before numeric reasoning",
-                    "operand ledger with period, basis, unit, and semantic role",
+                    "task decomposition into evidence scope, requested entity, measure, period, basis, unit, calculation, and output format",
+                    "exact evidence-span verification against every question constraint before extraction or calculation",
+                    "operand ledger with source, period, basis, unit, sign, and semantic role",
                     "document-structure alignment, subtotal/category inclusion, and exclusion criteria",
                     "numeric reasoning checks such as sign, absolute value, aggregation, rounding, and unit preservation",
                     "final answer formatting discipline when it changes correctness",
@@ -847,9 +914,25 @@ Return valid JSON only.
                     "generic advice to avoid hallucination",
                     "generic advice to return a final answer",
                     "tool-specific, file-specific, page-specific, or dataset-source-specific guidance",
+                    "assuming that a question contains a typo without explicit evidence",
+                    "substituting a nearby period or entity for the requested one without explicit evidence",
+                    "treating blank or missing evidence as zero without explicit evidence",
                 ],
             }
         else:
+            payload["spreadsheet_experience_policy"] = {
+                "high_value_lessons": [
+                    "workbook operation and formula or API invariants",
+                    "sheet, cell, and range alignment",
+                    "workbook structure and formatting preservation",
+                    "recalculation-based verification of the final workbook",
+                ],
+                "avoid_low_value_lessons": [
+                    "hard-coded task-specific coordinates or constants",
+                    "incidental column positions or unexplained successful workarounds",
+                    "generic advice to inspect, verify, or retry",
+                ],
+            }
             payload["template_user_prompt_adaptation"] = {
                 "success_user_template": self._templates.get("success_user_llm", ""),
                 "error_user_template": self._templates.get("error_user_llm", ""),
@@ -931,6 +1014,7 @@ Return valid JSON only.
                 "Treat predicted_answer, ground_truth, fail_reason, verifier/evaluator fields, and reward audit fields as private diagnostics only.",
                 f"Do not copy or paraphrase exact train answers, predicted answers, gold answers, diagnostic labels, exact percentages, exact decimals, exact years, exact bracketed values, or exact vectors into {output_scope}.",
                 "Use symbolic placeholders such as <computed_value>, <expected_value>, <requested_precision>, <source_period>, <target_period>, <unit>, or <metric> instead of concrete diagnostic values.",
+                "Do not preserve or create guidance that assumes a question typo, substitutes a nearby period/entity, or treats missing evidence as zero without explicit evidence.",
             ])
         payload: dict[str, Any] = {
             "instruction": instruction,
@@ -944,7 +1028,12 @@ Return valid JSON only.
             payload["task_profile"] = "officeqa"
             payload["officeqa_experience_policy"] = {
                 "target_agent_context": "OfficeQA evidence-grounded document question answering with task-provided document context and trajectory observations.",
-                "update_only_when": "The updated evidence changes a reusable OfficeQA evidence-selection, document-structure interpretation, operand-tracking, numeric-reasoning, or answer-formatting lesson.",
+                "update_only_when": "The updated evidence changes a reusable OfficeQA lesson about evidence scope, entity, measure, period, basis, unit, calculation, or answer format.",
+                "high_value_lessons": [
+                    "exact evidence-span alignment with question constraints",
+                    "operand provenance including source, period, basis, unit, sign, and semantic role",
+                    "calculation and final answer format checks supported by observed evidence",
+                ],
                 "avoid_low_value_lessons": [
                     "generic advice to use available actions",
                     "generic advice to verify evidence",
@@ -953,8 +1042,29 @@ Return valid JSON only.
                     "tool-specific, file-specific, page-specific, or dataset-source-specific guidance",
                 ],
             }
+        else:
+            payload["spreadsheet_experience_policy"] = {
+                "update_only_when": "The updated evidence changes a reusable workbook operation, formula/API invariant, coordinate/range alignment rule, structure-preservation rule, or recalculation check.",
+                "avoid_low_value_lessons": [
+                    "hard-coded task-specific coordinates or constants",
+                    "incidental column positions or unexplained successful workarounds",
+                    "generic advice to inspect, verify, or retry",
+                ],
+            }
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
+
+
+def _distinct_experience_card_members(members: Sequence[ExperienceItem]) -> list[ExperienceItem]:
+    distinct: list[ExperienceItem] = []
+    seen: set[str] = set()
+    for member in members:
+        key = " ".join(member.text.split()).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        distinct.append(member)
+    return distinct
 
 
 def _infer_analyst_mode(community: ExperienceCommunity, members: Sequence[ExperienceItem], config: ClusterAnalystConfig) -> str:
@@ -979,8 +1089,8 @@ def _mode_instruction(analyst_mode: str, task_profile: str | None = None) -> str
                 "Follow the trajectory evidence discipline inherited in the system prompt, but output the minimal cards-list schema only."
             )
         return (
-            "Analyze this cluster of lower-level OfficeQA ExperienceCards once and produce exactly one higher-level ExperienceCard. "
-            "Do not split the cluster into multiple cards. Your task is to identify the shared higher-level principle behind the lower-level cards. "
+            "Analyze this cluster of lower-level OfficeQA ExperienceCards once and produce zero or one higher-level ExperienceCard. "
+            "Create a parent only when at least two distinct child cards support a non-generic shared invariant; otherwise return cards=[]. "
             "Follow the trajectory evidence discipline inherited in the system prompt, but output the minimal cards-list schema only."
         )
     if analyst_mode == "raw_extractor":
@@ -991,9 +1101,9 @@ def _mode_instruction(analyst_mode: str, task_profile: str | None = None) -> str
             "but output the minimal cards-list schema only."
         )
     return (
-        "Analyze this cluster of lower-level ExperienceCards once and produce exactly one higher-level ExperienceCard. "
-        "Do not split the cluster into multiple cards. Your task is to identify the shared higher-level principle "
-        "behind the lower-level cards. Follow the Trace2Skill evidence discipline inherited in the system prompt, "
+        "Analyze this cluster of lower-level ExperienceCards once and produce zero or one higher-level ExperienceCard. "
+        "Create a parent only when at least two distinct child cards support a non-generic shared invariant; otherwise return cards=[]. "
+        "Follow the Trace2Skill evidence discipline inherited in the system prompt, "
         "but output the minimal cards-list schema only."
     )
 
