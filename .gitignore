@@ -18,6 +18,7 @@ env/
 .idea/
 .vscode/
 .serena/
+.codebase-memory/
 
 # Runtime artifacts and experiment outputs
 runs/

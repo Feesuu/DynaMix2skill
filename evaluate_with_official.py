@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Evaluation script that uses the official SpreadsheetBench evaluation logic.
+SpreadsheetBench workbook evaluation with mandatory LibreOffice recalculation.
 
-This script imports and calls the official SpreadsheetBench evaluation functions
-to ensure 100% compatibility with their evaluation methodology.
+The workbook comparator backend is explicit and recorded in the output.  The
+``official`` backend fails closed when ``evaluation_official`` is unavailable;
+``local`` uses this repository's compatible comparator.
 
 Usage:
     python evaluate_with_official.py --data_path data/sample_data_200 --output_dir outputs/spreadsheetbench
@@ -11,6 +12,7 @@ Usage:
 
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -20,6 +22,7 @@ import sys
 import tempfile
 from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 from tqdm import tqdm
 
@@ -31,15 +34,100 @@ from spreadsheetbench_support import (
 )
 
 try:
-    from evaluation_official import compare_workbooks as official_compare_workbooks
+    from evaluation_official import (  # type: ignore[import-not-found]
+        compare_workbooks as official_compare_workbooks,
+    )
 except ImportError:
     official_compare_workbooks = None
 
 
-def compare_workbooks(gt_path, output_path, instruction_type, answer_position):
-    if official_compare_workbooks is not None:
-        return official_compare_workbooks(gt_path, output_path, instruction_type, answer_position)
-    return local_compare_workbooks(gt_path, output_path, answer_position)
+def _source_identity(function) -> dict[str, str | None]:
+    source_path = inspect.getsourcefile(function)
+    resolved = Path(source_path).resolve() if source_path else None
+    module = sys.modules.get(function.__module__)
+    return {
+        "module": function.__module__,
+        "qualname": function.__qualname__,
+        "module_version": (
+            str(getattr(module, "__version__"))
+            if module is not None and getattr(module, "__version__", None)
+            else None
+        ),
+        "source_path": str(resolved) if resolved else None,
+        "source_sha256": (
+            hashlib.sha256(resolved.read_bytes()).hexdigest()
+            if resolved and resolved.is_file()
+            else None
+        ),
+    }
+
+
+def _resolve_comparator(
+    requested_backend: str,
+):
+    if requested_backend not in {"auto", "official", "local"}:
+        raise ValueError(
+            f"unsupported evaluator backend: {requested_backend!r}"
+        )
+    resolved_backend = requested_backend
+    if requested_backend == "auto":
+        resolved_backend = (
+            "official"
+            if official_compare_workbooks is not None
+            else "local"
+        )
+    if resolved_backend == "official":
+        if official_compare_workbooks is None:
+            raise RuntimeError(
+                "official SpreadsheetBench comparator requested, but "
+                "evaluation_official is unavailable"
+            )
+        comparator = official_compare_workbooks
+    else:
+        comparator = local_compare_workbooks
+    identity = {
+        "requested_backend": requested_backend,
+        "resolved_backend": resolved_backend,
+        **_source_identity(comparator),
+    }
+    return comparator, identity
+
+
+def _compare_workbooks(
+    comparator,
+    resolved_backend: str,
+    gt_path,
+    output_path,
+    instruction_type,
+    answer_position,
+):
+    if resolved_backend == "official":
+        return comparator(
+            gt_path,
+            output_path,
+            instruction_type,
+            answer_position,
+        )
+    return comparator(gt_path, output_path, answer_position)
+
+
+def compare_workbooks(
+    gt_path,
+    output_path,
+    instruction_type,
+    answer_position,
+    *,
+    evaluator_backend: str = "auto",
+):
+    comparator, identity = _resolve_comparator(evaluator_backend)
+    return _compare_workbooks(
+        comparator,
+        str(identity["resolved_backend"]),
+        gt_path,
+        output_path,
+        instruction_type,
+        answer_position,
+    )
 
 
 def _soffice_executable() -> str:
@@ -65,7 +153,9 @@ def _ensure_within(parent: Path, child: Path) -> None:
         raise RuntimeError(f"path escapes recalc audit root: {child}") from exc
 
 
-def _preflight_libreoffice(timeout_seconds: int = 30) -> str:
+def _preflight_libreoffice(
+    timeout_seconds: int = 30,
+) -> tuple[str, str]:
     soffice = _soffice_executable()
     try:
         proc = subprocess.run(
@@ -79,7 +169,29 @@ def _preflight_libreoffice(timeout_seconds: int = 30) -> str:
         raise RuntimeError(f"LibreOffice preflight timed out after {timeout_seconds}s") from exc
     if proc.returncode != 0:
         raise RuntimeError(f"LibreOffice preflight failed with exit {proc.returncode}: {proc.stdout.strip()}")
-    return soffice
+    return soffice, proc.stdout.strip()
+
+
+def evaluation_runtime_identity(
+    evaluator_backend: str,
+    *,
+    libreoffice_timeout_seconds: int = 30,
+    comparator_identity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve the exact comparator and LibreOffice identities used by eval."""
+
+    if comparator_identity is None:
+        _, comparator_identity = _resolve_comparator(evaluator_backend)
+    soffice, soffice_version = _preflight_libreoffice(
+        libreoffice_timeout_seconds
+    )
+    return {
+        "workbook_comparator": comparator_identity,
+        "libreoffice": {
+            "executable": str(Path(soffice).resolve()),
+            "version": soffice_version,
+        },
+    }
 
 
 def _recalculate_workbook(
@@ -153,9 +265,17 @@ def _recalculate_workbook(
     return str(output_file)
 
 
-def evaluate(data_path, output_dir, start_idx=0, end_idx=None, verbose=False, recalc_dir=None):
+def evaluate(
+    data_path,
+    output_dir,
+    start_idx=0,
+    end_idx=None,
+    verbose=False,
+    recalc_dir=None,
+    evaluator_backend="auto",
+):
     """
-    Evaluate outputs against ground truth using official SpreadsheetBench logic.
+    Evaluate outputs with an explicit SpreadsheetBench comparator backend.
 
     Returns:
         dict with evaluation results
@@ -168,9 +288,21 @@ def evaluate(data_path, output_dir, start_idx=0, end_idx=None, verbose=False, re
 
     if recalc_dir is None:
         recalc_dir = os.path.join(output_dir, "eval_artifacts", "libreoffice_recalculated_outputs")
-    soffice = _preflight_libreoffice()
-    print(f"Evaluating {len(dataset)} instances using official SpreadsheetBench evaluation with LibreOffice recalc...")
+    comparator, comparator_identity = _resolve_comparator(evaluator_backend)
+    resolved_backend = str(comparator_identity["resolved_backend"])
+    runtime_identity = evaluation_runtime_identity(
+        evaluator_backend,
+        comparator_identity=comparator_identity,
+    )
+    libreoffice_identity = dict(runtime_identity["libreoffice"])
+    soffice = str(libreoffice_identity["executable"])
+    soffice_version = str(libreoffice_identity["version"])
+    print(
+        f"Evaluating {len(dataset)} instances using {resolved_backend} "
+        "SpreadsheetBench comparison with LibreOffice recalc..."
+    )
     print(f"LibreOffice executable: {soffice}")
+    print(f"LibreOffice version: {soffice_version}")
 
     results = []
     total_test_cases = 0
@@ -259,8 +391,13 @@ def evaluate(data_path, output_dir, start_idx=0, end_idx=None, verbose=False, re
             raw_result = False
             raw_msg = ""
             try:
-                raw_result, raw_msg = compare_workbooks(
-                    gt_path, output_path, instruction_type, answer_position
+                raw_result, raw_msg = _compare_workbooks(
+                    comparator,
+                    resolved_backend,
+                    gt_path,
+                    output_path,
+                    instruction_type,
+                    answer_position,
                 )
             except Exception as e:
                 raw_msg = str(e)
@@ -272,8 +409,13 @@ def evaluate(data_path, output_dir, start_idx=0, end_idx=None, verbose=False, re
             recalc_error = ""
             try:
                 recalculated_output_path = _recalculate_workbook(output_path, recalc_dir, instance_id, soffice=soffice)
-                result, msg = compare_workbooks(
-                    gt_path, recalculated_output_path, instruction_type, answer_position
+                result, msg = _compare_workbooks(
+                    comparator,
+                    resolved_backend,
+                    gt_path,
+                    recalculated_output_path,
+                    instruction_type,
+                    answer_position,
                 )
             except FileNotFoundError as e:
                 result = False
@@ -360,6 +502,11 @@ def evaluate(data_path, output_dir, start_idx=0, end_idx=None, verbose=False, re
         "by_instruction_type": type_metrics,
         "evaluation_mode": "libreoffice_recalc",
         "recalculated_output_dir": recalc_dir,
+        "workbook_comparator": comparator_identity,
+        "libreoffice": {
+            "executable": str(Path(soffice).resolve()),
+            "version": soffice_version,
+        },
     }
 
     return {
@@ -395,6 +542,17 @@ def main():
         type=str,
         default=None,
         help="Directory for LibreOffice-recalculated workbook audit copies",
+    )
+    parser.add_argument(
+        "--evaluator-backend",
+        choices=["auto", "official", "local"],
+        default="auto",
+        help=(
+            "Workbook comparator backend. 'official' fails closed if "
+            "evaluation_official is unavailable; 'local' uses this "
+            "repository's comparator; 'auto' preserves legacy discovery "
+            "while recording the resolved backend."
+        ),
     )
     parser.add_argument(
         "--start_idx",
@@ -434,6 +592,7 @@ def main():
         end_idx=args.end_idx,
         verbose=args.verbose,
         recalc_dir=args.recalc_dir,
+        evaluator_backend=args.evaluator_backend,
     )
 
     # Print summary
@@ -448,7 +607,12 @@ def main():
 
 def _print_summary(summary: dict, label: str = "") -> None:
     """Print a formatted evaluation summary."""
-    header = f"EVALUATION RESULTS{' (' + label + ')' if label else ''} (Official SpreadsheetBench Logic)"
+    comparator = summary.get("workbook_comparator", {})
+    resolved_backend = comparator.get("resolved_backend", "unknown")
+    header = (
+        f"EVALUATION RESULTS{' (' + label + ')' if label else ''} "
+        f"(SpreadsheetBench comparator: {resolved_backend})"
+    )
     print("\n" + "=" * 60)
     print(header)
     print("=" * 60)
@@ -462,6 +626,7 @@ def _print_summary(summary: dict, label: str = "") -> None:
     print(f"Avg Soft Score:         {summary['avg_soft_score']*100:.1f}%")
     print(f"Avg Hard Score:         {summary['avg_hard_score']*100:.1f}%")
     print(f"Evaluation Mode:        {summary.get('evaluation_mode', 'unknown')}")
+    print(f"Comparator Backend:     {resolved_backend}")
     if summary.get("recalculated_output_dir"):
         print(f"Recalculated Outputs:   {summary['recalculated_output_dir']}")
 
@@ -480,8 +645,12 @@ def _print_summary(summary: dict, label: str = "") -> None:
 def _run_repeat_evaluation(args) -> None:
     """Evaluate all seed_* subdirectories under args.output_dir."""
     seed_dirs = sorted(
-        d for d in os.scandir(args.output_dir)
-        if d.is_dir() and d.name.startswith("seed_")
+        (
+            d
+            for d in os.scandir(args.output_dir)
+            if d.is_dir() and d.name.startswith("seed_")
+        ),
+        key=lambda entry: entry.name,
     )
     if not seed_dirs:
         print(f"No seed_* subdirectories found in {args.output_dir}", file=__import__("sys").stderr)
@@ -500,6 +669,7 @@ def _run_repeat_evaluation(args) -> None:
             end_idx=args.end_idx,
             verbose=args.verbose,
             recalc_dir=os.path.join(args.recalc_dir, seed_name) if args.recalc_dir else None,
+            evaluator_backend=args.evaluator_backend,
         )
         all_seed_results[seed_name] = result
         per_seed_file = os.path.join(seed_dir.path, "eval_official_results.json")

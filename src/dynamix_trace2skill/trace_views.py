@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import copy
 import json
+from collections.abc import Mapping
+
 from .schemas import RawTrajectoryRecord
 
 
@@ -99,7 +102,10 @@ def render_compact_analysis_bundle_text(
         "trajectory_steps": _compact_steps(record, max_steps=max_steps, max_step_chars=max_step_chars, preserve_all=True),
         "runtime_metadata": _compact_json_value(record.runtime_metadata, max_chars=4000),
         "service_metadata": _compact_json_value(record.service_metadata, max_chars=2000),
-        "extra": _compact_json_value(record.extra, max_chars=max_chars // 3),
+        "extra": _compact_json_value(
+            _authoritative_analysis_extra(record.extra),
+            max_chars=max_chars // 3,
+        ),
     }
     rendered = json.dumps(payload, ensure_ascii=False, indent=2)
     if len(rendered) <= max_chars:
@@ -109,7 +115,10 @@ def render_compact_analysis_bundle_text(
     if len(rendered) <= max_chars:
         return rendered
     payload["trajectory_steps"] = _compact_steps(record, max_steps=min(max_steps, 6), max_step_chars=max(800, max_step_chars // 2), preserve_all=False)
-    payload["extra"] = _compact_json_value(record.extra, max_chars=max(1000, max_chars // 6))
+    payload["extra"] = _compact_json_value(
+        _authoritative_analysis_extra(record.extra),
+        max_chars=max(1000, max_chars // 6),
+    )
     rendered = json.dumps(payload, ensure_ascii=False, indent=2)
     if len(rendered) <= max_chars:
         return rendered
@@ -150,6 +159,36 @@ def _compact_json_value(value: object, *, max_chars: int) -> object:
         "original_char_count": len(rendered),
         "preview": _clip_text(rendered, max_chars),
     }
+
+
+def _authoritative_analysis_extra(extra: object) -> object:
+    """Hide cached-value audits from analyst evidence, not from records."""
+
+    copied = copy.deepcopy(extra)
+    if not isinstance(copied, Mapping):
+        return copied
+    result = copied.get("trace2skill_result")
+    if not isinstance(result, Mapping):
+        return copied
+    cleaned_result = dict(result)
+    for key in tuple(cleaned_result):
+        if key.startswith("raw_") or "no_recalc" in key:
+            cleaned_result.pop(key, None)
+    test_cases = cleaned_result.get("test_cases")
+    if isinstance(test_cases, list):
+        cleaned_result["test_cases"] = [
+            {
+                key: value
+                for key, value in test_case.items()
+                if not key.startswith("raw_") and "no_recalc" not in key
+            }
+            if isinstance(test_case, Mapping)
+            else test_case
+            for test_case in test_cases
+        ]
+    cleaned = dict(copied)
+    cleaned["trace2skill_result"] = cleaned_result
+    return cleaned
 
 
 def _clip_text(value: object, max_chars: int) -> str | None:

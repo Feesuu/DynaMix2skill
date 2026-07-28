@@ -8,6 +8,8 @@ Supports both the CLI-only baseline and the skill-preloaded spreadsheet agent.
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import json
 import os
 import random
@@ -120,6 +122,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=_parse_float_csv,
         default=(5.0, 10.0, 30.0),
         help="Comma-separated retry wait seconds for LLM requests",
+    )
+    parser.add_argument(
+        "--disable_response_cache",
+        action="store_true",
+        help="Disable the global OpenAI response cache for a clean benchmark run",
     )
     parser.add_argument(
         "--num_random_seeds",
@@ -246,6 +253,7 @@ def _parse_generation_config(generation_config: str | None) -> dict:
 
 def _build_generation_config(args) -> dict:
     generation_config = _parse_generation_config(args.generation_config)
+    generation_config["temperature"] = float(args.temperature)
     run_seed = getattr(args, "run_seed", None)
     if run_seed is not None:
         generation_config["seed"] = run_seed
@@ -255,7 +263,10 @@ def _build_generation_config(args) -> dict:
 def _build_client(args):
     generation_config = _build_generation_config(args)
     run_seed = generation_config.get("seed")
-    use_cache = run_seed is None
+    use_cache = (
+        run_seed is None
+        and not bool(getattr(args, "disable_response_cache", False))
+    )
     if args.llm_client == "api_chat":
         return ApiChatClient(
             model=args.model,
@@ -389,7 +400,13 @@ def instance_has_outputs(instance, output_dir: str, data_path: str) -> bool:
     return True
 
 
-def filter_instances(instances, args, data_path: str):
+def filter_instances(
+    instances,
+    args,
+    data_path: str,
+    *,
+    use_output_resume: bool = True,
+):
     if args.instance_ids:
         requested_ids = {item.strip() for item in args.instance_ids.split(",")}
         instances = [inst for inst in instances if str(inst.id) in requested_ids]
@@ -397,7 +414,7 @@ def filter_instances(instances, args, data_path: str):
         not_found = requested_ids - found_ids
         if not_found:
             print(f"Warning: Instance IDs not found in dataset: {', '.join(sorted(not_found))}")
-    if args.missing_only:
+    if args.missing_only and use_output_resume:
         original_count = len(instances)
         instances = [
             inst for inst in instances
@@ -406,6 +423,319 @@ def filter_instances(instances, args, data_path: str):
         skipped = original_count - len(instances)
         print(f"Skipping {skipped} instances with existing outputs, {len(instances)} remaining")
     return instances
+
+
+def _serialize_result(result) -> dict:
+    return {
+        "id": result.id,
+        "instruction": result.instruction,
+        "success": result.success,
+        "error": result.error,
+        "test_cases": [
+            {
+                "input_file": tc.input_file,
+                "output_file": tc.output_file,
+                "success": tc.success,
+                "agent_answer": tc.agent_answer,
+                "turns": tc.turns,
+                "error": tc.error,
+            }
+            for tc in result.test_cases
+        ],
+    }
+
+
+def _sha256_file(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(temporary, path)
+
+
+def _result_ledger_manifest_path(results_jsonl: Path) -> Path:
+    return results_jsonl.with_suffix(
+        results_jsonl.suffix + ".manifest.json"
+    )
+
+
+def _result_ledger_lock_path(results_jsonl: Path) -> Path:
+    return results_jsonl.with_suffix(results_jsonl.suffix + ".lock")
+
+
+def _acquire_result_ledger_lock(results_jsonl: Path):
+    lock_path = _result_ledger_lock_path(results_jsonl)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        lock_handle.close()
+        raise RuntimeError(
+            f"another process is already running this result ledger: {results_jsonl}"
+        ) from exc
+    return lock_handle
+
+
+def _result_ledger_identity(
+    args,
+    instances: list,
+    *,
+    results_file: Path,
+) -> dict:
+    data_path = Path(args.data_path).resolve()
+    dataset_source = (
+        data_path / "dataset.json"
+        if data_path.is_dir()
+        else data_path
+    )
+    skills_dir_value = getattr(args, "skills_dir", None)
+    skills_dir = (
+        Path(skills_dir_value).resolve()
+        if skills_dir_value
+        else None
+    )
+    skillbank_manifest = (
+        skills_dir / "node_bank_manifest.json"
+        if skills_dir is not None
+        else None
+    )
+    protocol = {
+        "agent": getattr(args, "agent", None),
+        "data_path": str(data_path),
+        "dataset_sha256": _sha256_file(dataset_source),
+        "output_dir": str(Path(args.output_dir).resolve()),
+        "results_file": str(results_file.resolve()),
+        "model": args.model,
+        "llm_client": getattr(args, "llm_client", None),
+        "openai_base_url": os.getenv("OPENAI_BASE_URL"),
+        "generation_config": _build_generation_config(args),
+        "max_turns": getattr(args, "max_turns", None),
+        "timeout_seconds": getattr(args, "llm_timeout_seconds", None),
+        "retry_wait_seconds": list(
+            getattr(args, "llm_retry_wait_seconds", ())
+        ),
+        "disable_response_cache": bool(
+            getattr(args, "disable_response_cache", False)
+        ),
+        "workers": int(args.workers),
+        "start_idx": int(args.start_idx),
+        "end_idx": args.end_idx,
+        "instance_ids": getattr(args, "instance_ids", None),
+        "repeat": int(getattr(args, "repeat", 1)),
+        "shuffle_seed": getattr(args, "shuffle_seed", None),
+        "sample": getattr(args, "sample", None),
+        "task_ids": [str(instance.id) for instance in instances],
+        "skills_dir": str(skills_dir) if skills_dir is not None else None,
+        "skillbank_manifest_sha256": (
+            _sha256_file(skillbank_manifest)
+            if skillbank_manifest is not None
+            else None
+        ),
+        "skillbank_top_k": os.getenv("DYNAMIX_SKILLBANK_TOP_K"),
+        "skillbank_embed_base_url": os.getenv(
+            "DYNAMIX_SKILLBANK_EMBED_BASE_URL"
+        ),
+        "skillbank_embed_model": os.getenv(
+            "DYNAMIX_SKILLBANK_EMBED_MODEL"
+        ),
+        "expected_tree_policy": os.getenv(
+            "DYNAMIX_SKILLBANK_EXPECT_TREE_POLICY"
+        ),
+        "runner_sha256": _sha256_file(Path(__file__).resolve()),
+        "react_models_sha256": _sha256_file(
+            Path(__file__).resolve().parent
+            / "src"
+            / "react_agent"
+            / "models.py"
+        ),
+        "spreadsheet_runner_sha256": _sha256_file(
+            Path(__file__).resolve().parent
+            / "spreadsheet_agent"
+            / "runner.py"
+        ),
+    }
+    canonical = json.dumps(
+        protocol,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        "format": "spreadsheetbench_result_ledger_v1",
+        "fingerprint": hashlib.sha256(
+            canonical.encode("utf-8")
+        ).hexdigest(),
+        "protocol": protocol,
+    }
+
+
+def _validate_result_row(row: object, *, line_number: int) -> dict:
+    if not isinstance(row, dict):
+        raise RuntimeError(
+            f"results JSONL line {line_number} is not an object"
+        )
+    required = {
+        "id",
+        "instruction",
+        "success",
+        "error",
+        "test_cases",
+    }
+    missing = sorted(required - set(row))
+    if missing:
+        raise RuntimeError(
+            f"results JSONL line {line_number} is missing {missing}"
+        )
+    if not isinstance(row["success"], bool):
+        raise RuntimeError(
+            f"results JSONL line {line_number} has non-boolean success"
+        )
+    if not isinstance(row["test_cases"], list):
+        raise RuntimeError(
+            f"results JSONL line {line_number} has invalid test_cases"
+        )
+    return row
+
+
+def _load_result_jsonl(
+    path: Path,
+    *,
+    valid_ids: set[str],
+) -> dict[str, dict]:
+    rows: dict[str, dict] = {}
+    if not path.exists():
+        return rows
+    raw = path.read_bytes()
+    if raw and not raw.endswith(b"\n"):
+        last_newline = raw.rfind(b"\n")
+        raw = raw[: last_newline + 1] if last_newline >= 0 else b""
+        with path.open("r+b") as result_log:
+            result_log.truncate(len(raw))
+            result_log.flush()
+            os.fsync(result_log.fileno())
+    for line_number, line in enumerate(raw.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            decoded = line.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(
+                f"results JSONL line {line_number} is not UTF-8"
+            ) from exc
+        try:
+            row = json.loads(decoded)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"results JSONL line {line_number} is malformed"
+            ) from exc
+        row = _validate_result_row(row, line_number=line_number)
+        item_id = str(row["id"])
+        if item_id not in valid_ids:
+            raise RuntimeError(
+                f"results JSONL contains out-of-scope task id {item_id}"
+            )
+        if item_id in rows:
+            raise RuntimeError(
+                f"results JSONL contains duplicate task id {item_id}"
+            )
+        rows[item_id] = row
+    return rows
+
+
+def _prepare_result_ledger(
+    results_jsonl: Path,
+    *,
+    identity: dict,
+    valid_ids: set[str],
+    resume: bool,
+) -> dict[str, dict]:
+    manifest_path = _result_ledger_manifest_path(results_jsonl)
+    has_ledger = results_jsonl.exists()
+    has_manifest = manifest_path.exists()
+    if resume and (has_ledger or has_manifest):
+        if not (has_ledger and has_manifest):
+            raise RuntimeError(
+                "results ledger and manifest must either both exist or both "
+                "be absent"
+            )
+        try:
+            recorded_identity = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"invalid results ledger manifest: {manifest_path}"
+            ) from exc
+        if recorded_identity != identity:
+            raise RuntimeError(
+                "results ledger identity does not match the current run"
+            )
+        return _load_result_jsonl(
+            results_jsonl,
+            valid_ids=valid_ids,
+        )
+    with results_jsonl.open("wb") as result_log:
+        result_log.flush()
+        os.fsync(result_log.fileno())
+    _write_json_atomic(manifest_path, identity)
+    return {}
+
+
+def _append_result_row(result_log, row: dict) -> None:
+    result_log.write(
+        json.dumps(
+            row,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    result_log.flush()
+    os.fsync(result_log.fileno())
+
+
+def _merge_serialized_results(
+    payload: dict,
+    instances: list,
+    rows: dict[str, dict],
+) -> dict:
+    missing_ids = [
+        str(instance.id)
+        for instance in instances
+        if str(instance.id) not in rows
+    ]
+    if missing_ids:
+        raise RuntimeError(
+            "results ledger is incomplete; missing task ids: "
+            + ", ".join(missing_ids)
+        )
+    payload["results"] = [
+        rows[str(instance.id)]
+        for instance in instances
+    ]
+    payload["total_instances"] = len(instances)
+    payload["successful_instances"] = sum(
+        bool(row["success"]) for row in payload["results"]
+    )
+    payload["success_rate"] = (
+        payload["successful_instances"] / payload["total_instances"]
+        if payload["total_instances"]
+        else 0
+    )
+    return payload
 
 
 def _serialize_results(args, agent_name: str, instances: list, results: list, extra: dict | None = None) -> dict:
@@ -418,26 +748,7 @@ def _serialize_results(args, agent_name: str, instances: list, results: list, ex
         "total_instances": len(instances),
         "successful_instances": success_count,
         "success_rate": success_count / len(instances) if instances else 0,
-        "results": [
-            {
-                "id": result.id,
-                "instruction": result.instruction,
-                "success": result.success,
-                "error": result.error,
-                "test_cases": [
-                    {
-                        "input_file": tc.input_file,
-                        "output_file": tc.output_file,
-                        "success": tc.success,
-                        "agent_answer": tc.agent_answer,
-                        "turns": tc.turns,
-                        "error": tc.error,
-                    }
-                    for tc in result.test_cases
-                ],
-            }
-            for result in results
-        ],
+        "results": [_serialize_result(result) for result in results],
     }
     if extra:
         payload.update(extra)
@@ -499,40 +810,7 @@ def run_sequential(args):
     print(f"\nResults saved to: {results_file}")
 
 
-def run_worker(worker_id, instances, args, working_dir, progress_callback=None):
-    agent = create_agent(args)
-    runner = SpreadsheetBenchRunner(
-        agent=agent,
-        data_path=args.data_path,
-        output_dir=args.output_dir,
-        working_dir=working_dir,
-    )
-    results = []
-    for instance in instances:
-        try:
-            result = runner.run_instance(instance)
-            results.append((instance.id, result))
-            if progress_callback:
-                progress_callback(instance.id, result.success)
-        except Exception as exc:
-            from spreadsheet_agent.runner import InstanceResult
-
-            results.append((
-                instance.id,
-                InstanceResult(
-                    id=instance.id,
-                    instruction=instance.instruction,
-                    success=False,
-                    error=str(exc),
-                ),
-            ))
-            tqdm.write(f"[Worker {worker_id}] {instance.id}: ERROR - {exc}")
-            if progress_callback:
-                progress_callback(instance.id, False)
-    return results
-
-
-def run_parallel(args):
+def _run_parallel_unlocked(args):
     print(f"Running in parallel mode with {args.workers} workers")
     agent = create_agent(args)
     runner = SpreadsheetBenchRunner(
@@ -544,9 +822,75 @@ def run_parallel(args):
     end_idx = args.end_idx if args.end_idx is not None else len(all_instances)
     instances = all_instances[args.start_idx:end_idx]
     instances = _prepare_instances(instances, args.shuffle_seed, args.sample)
-    instances = filter_instances(instances, args, args.data_path)
+    instances = filter_instances(
+        instances,
+        args,
+        args.data_path,
+        use_output_resume=False,
+    )
+    selected_instances = list(instances)
+    selected_ids = {
+        str(instance.id) for instance in selected_instances
+    }
+    results_file = args.results_file or os.path.join(args.output_dir, "results.json")
+    os.makedirs(os.path.dirname(results_file) or ".", exist_ok=True)
+    results_jsonl = Path(results_file).with_suffix(".jsonl")
+    ledger_identity = _result_ledger_identity(
+        args,
+        selected_instances,
+        results_file=Path(results_file),
+    )
+    existing_rows = _prepare_result_ledger(
+        results_jsonl,
+        identity=ledger_identity,
+        valid_ids=selected_ids,
+        resume=bool(args.missing_only),
+    )
+    if existing_rows:
+        before = len(instances)
+        instances = [
+            instance
+            for instance in instances
+            if str(instance.id) not in existing_rows
+        ]
+        print(
+            f"Skipping {before - len(instances)} instances already recorded "
+            "in results JSONL"
+        )
     if not instances:
         print("No instances to run after filtering.")
+        if existing_rows:
+            payload = _serialize_results(
+                args,
+                agent.name,
+                selected_instances,
+                [],
+                extra={
+                    "parallel_workers": min(
+                        int(args.workers),
+                        len(selected_instances),
+                    ),
+                    "elapsed_seconds": 0.0,
+                    "resume_only": True,
+                    "result_ledger_manifest": str(
+                        _result_ledger_manifest_path(results_jsonl)
+                    ),
+                    "response_cache_enabled": not bool(
+                        getattr(
+                            args,
+                            "disable_response_cache",
+                            False,
+                        )
+                    ),
+                },
+            )
+            _merge_serialized_results(
+                payload,
+                selected_instances,
+                existing_rows,
+            )
+            _write_json_atomic(Path(results_file), payload)
+            print(f"Results restored from JSONL: {results_file}")
         return
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -554,54 +898,117 @@ def run_parallel(args):
     os.makedirs(working_dir, exist_ok=True)
 
     num_workers = min(args.workers, len(instances))
-    chunks = [[] for _ in range(num_workers)]
-    for i, instance in enumerate(instances):
-        chunks[i % num_workers].append(instance)
-
     all_results = {}
     success_count_live = [0]
-    progress_lock = threading.Lock()
     pbar = tqdm(total=len(instances), desc="Processing", unit="instance")
+    thread_state = threading.local()
 
-    def progress_callback(instance_id, success):
-        del instance_id
-        with progress_lock:
-            if success:
+    def process_instance(instance):
+        try:
+            if not hasattr(thread_state, "runner"):
+                thread_agent = create_agent(args)
+                thread_state.runner = SpreadsheetBenchRunner(
+                    agent=thread_agent,
+                    data_path=args.data_path,
+                    output_dir=args.output_dir,
+                    working_dir=working_dir,
+                )
+            result = thread_state.runner.run_instance(instance)
+        except Exception as exc:
+            from spreadsheet_agent.runner import InstanceResult
+
+            result = InstanceResult(
+                id=instance.id,
+                instruction=instance.instruction,
+                success=False,
+                error=str(exc),
+            )
+            tqdm.write(
+                f"[Task {instance.id}] ERROR ({type(exc).__name__}) - {exc}"
+            )
+        return instance.id, result
+
+    start_time = datetime.now()
+    with results_jsonl.open("a", encoding="utf-8") as result_log, \
+            ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {
+            executor.submit(process_instance, instance): instance
+            for instance in instances
+        }
+        for future in as_completed(futures):
+            try:
+                instance_id, result = future.result()
+            except Exception as exc:
+                from spreadsheet_agent.runner import InstanceResult
+
+                instance = futures[future]
+                instance_id = instance.id
+                result = InstanceResult(
+                    id=instance.id,
+                    instruction=instance.instruction,
+                    success=False,
+                    error=f"worker_internal_error: {type(exc).__name__}: {exc}",
+                )
+                tqdm.write(
+                    f"[Task {instance_id}] Worker failed: {exc}"
+                )
+            all_results[instance_id] = result
+            _append_result_row(
+                result_log,
+                _serialize_result(result),
+            )
+            if result.success:
                 success_count_live[0] += 1
             pbar.set_postfix(success=success_count_live[0], refresh=False)
             pbar.update(1)
-
-    start_time = datetime.now()
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        futures = {
-            executor.submit(run_worker, i, chunk, args, working_dir, progress_callback): i
-            for i, chunk in enumerate(chunks)
-        }
-        for future in as_completed(futures):
-            worker_id = futures[future]
-            try:
-                for instance_id, result in future.result():
-                    all_results[instance_id] = result
-            except Exception as exc:
-                tqdm.write(f"[Worker {worker_id}] Failed with error: {exc}")
     pbar.close()
 
     elapsed = (datetime.now() - start_time).total_seconds()
     ordered_results = [all_results[instance.id] for instance in instances if instance.id in all_results]
-    results_file = args.results_file or os.path.join(args.output_dir, "results.json")
+    combined_rows = dict(existing_rows)
+    combined_rows.update(
+        {
+            str(result.id): _serialize_result(result)
+            for result in ordered_results
+        }
+    )
     payload = _serialize_results(
         args,
         agent.name,
-        instances,
+        selected_instances,
         ordered_results,
         extra={
             "parallel_workers": num_workers,
             "elapsed_seconds": elapsed,
+            "result_ledger_manifest": str(
+                _result_ledger_manifest_path(results_jsonl)
+            ),
+            "response_cache_enabled": not bool(
+                getattr(args, "disable_response_cache", False)
+            ),
         },
     )
-    with open(results_file, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2)
+    _merge_serialized_results(
+        payload,
+        selected_instances,
+        combined_rows,
+    )
+    _write_json_atomic(Path(results_file), payload)
     print(f"\nResults saved to: {results_file}")
+
+
+def run_parallel(args):
+    results_file = args.results_file or os.path.join(
+        args.output_dir,
+        "results.json",
+    )
+    results_jsonl = Path(results_file).with_suffix(".jsonl")
+    lock_handle = _acquire_result_ledger_lock(results_jsonl)
+    try:
+        return _run_parallel_unlocked(args)
+    finally:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
 
 
 def main():

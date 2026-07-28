@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import random
+import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -15,7 +16,14 @@ from dynamix_core.skill_export import SkillExportConfig, SkillExportResult, expo
 from dynamix_core.tree_builder import ProjectedGmmTreeBuilder
 from dynamix_core.update import ExperienceHierarchyDynamicUpdater
 
-from .clients import EmbeddingClient, EmbeddingConfig, GenerationClient, GenerationConfig
+from .clients import (
+    EmbeddingClient,
+    EmbeddingConfig,
+    GenerationClient,
+    GenerationConfig,
+    embedding_protocol_payload,
+    generation_protocol_payload,
+)
 from .long_embeddings import ChunkedEmbeddingConfig, embed_records_chunked_mean, save_chunked_embedding_report
 from .log_parser import load_records
 from .schemas import RawTrajectoryRecord
@@ -129,6 +137,18 @@ def default_hierarchy_config(payload: dict[str, Any] | None = None) -> Projected
 
 
 async def build_tree_from_records(config: DynaMixRunConfig) -> dict[str, Any]:
+    """Dispatch CDOST before entering the legacy projected-GMM static path."""
+
+    if str(config.hierarchy.get("tree_policy", "")).strip() == "certified_dual_view_otd":
+        from .certified_otd_pipeline import build_certified_otd_tree_from_records
+
+        return await build_certified_otd_tree_from_records(config)
+    if config.embedding.cache_write_policy != "replace":
+        raise ValueError(
+            "legacy tree policies require "
+            "embedding.cache_write_policy='replace'"
+        )
+
     out = Path(config.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     if not config.generation.debug_dir:
@@ -194,16 +214,24 @@ async def build_tree_from_records(config: DynaMixRunConfig) -> dict[str, Any]:
 
 
 async def build_dynamic_tree_from_records(config: DynaMixRunConfig) -> dict[str, Any]:
-    """Formal dynamic-update scenario using the online growing-K updater.
+    """Dispatch CDOST before entering the legacy online-GMM dynamic path.
 
-    Initial records build a normal static hierarchy. Later records are shuffled
-    reproducibly when configured, admitted sequentially inside each update
-    batch, and summarized concurrently by layer after the batch admission.
-    L0 admission first tries routed candidate communities under the analyst
-    token budget; if none fit, the trajectory forms a new dynamic L0 community
-    and routing component. L0 raw trajectory communities may add independent
-    cards, while L1+ ExperienceCard communities are updated in place.
+    The growing-K, shuffle, and batch behavior below applies only to the legacy
+    projected-GMM policy. CDOST returns through its dedicated branch before any
+    of that code executes.
     """
+    if str(config.hierarchy.get("tree_policy", "")).strip() == "certified_dual_view_otd":
+        from .certified_otd_pipeline import (
+            build_certified_otd_dynamic_tree_from_records,
+        )
+
+        return await build_certified_otd_dynamic_tree_from_records(config)
+    if config.embedding.cache_write_policy != "replace":
+        raise ValueError(
+            "legacy tree policies require "
+            "embedding.cache_write_policy='replace'"
+        )
+
     out = Path(config.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     if not config.generation.debug_dir:
@@ -476,12 +504,29 @@ def _refresh_skillbank_index(skillbank_root: str | Path, config: DynaMixRunConfi
         model=config.embedding.model,
         api_key=config.embedding.resolved_api_key,
         cache_path=index_path,
+        vector_cache_path=(
+            config.embedding.cache_path
+            if config.hierarchy.get("tree_policy")
+            == "certified_dual_view_otd"
+            else None
+        ),
+        require_vector_cache_match=(
+            config.hierarchy.get("tree_policy")
+            == "certified_dual_view_otd"
+            and config.scenario == "dynamic_update"
+        ),
         max_model_len=config.embedding.max_model_len,
         max_input_tokens=config.embedding.effective_max_input_tokens,
         batch_size=config.embedding.batch_size,
         tokenizer_model=config.embedding.tokenizer_model,
         chunk_tokens=int(chunked_payload["chunk_tokens"]) if chunked_enabled and chunked_payload.get("chunk_tokens") is not None else None,
         chunk_overlap_tokens=int(chunked_payload["overlap_tokens"]) if chunked_enabled and chunked_payload.get("overlap_tokens") is not None else None,
+        expected_tree_policy=(
+            str(config.hierarchy.get("tree_policy") or "")
+            if config.hierarchy.get("tree_policy")
+            == "certified_dual_view_otd"
+            else None
+        ),
     )
     selector._load_or_build_index()
     return str(index_path)
@@ -689,11 +734,35 @@ def _write_runtime_artifacts(config: DynaMixRunConfig, out: Path) -> None:
                 section_payload["api_key"] = f"sha256:{hashlib.sha256(key.encode('utf-8')).hexdigest()}"
                 section_payload["api_key_redacted"] = True
     (analysis / "runtime_config.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    repo_root = Path(__file__).resolve().parents[2]
+    records_path = Path(config.records_path).resolve()
+    atom_cache_value = (
+        dict(config.hierarchy or {}).get("otd", {}).get("atom_cache_path")
+    )
+    atom_cache_path = (
+        Path(str(atom_cache_value)).expanduser().resolve()
+        if atom_cache_value
+        else None
+    )
     manifest = {
-        "records_path": str(Path(config.records_path).resolve()),
+        "records_path": str(records_path),
+        "records_file": _file_identity(records_path),
+        "atom_cache_file": (
+            _file_identity(atom_cache_path)
+            if atom_cache_path is not None
+            else {"exists": False}
+        ),
         "output_dir": str(out.resolve()),
         "scenario": config.scenario,
+        "service_identity": {
+            "generation": generation_protocol_payload(config.generation),
+            "embedding": embedding_protocol_payload(config.embedding),
+        },
         "core_checksums": _core_checksums(Path(__file__).resolve().parents[1] / "dynamix_core"),
+        "trace2skill_checksums": _core_checksums(
+            Path(__file__).resolve().parents[1] / "dynamix_trace2skill"
+        ),
+        "git": _git_identity(repo_root),
     }
     (analysis / "run_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -703,6 +772,47 @@ def _core_checksums(core_dir: Path) -> dict[str, str]:
     for path in sorted(core_dir.glob("*.py")):
         checksums[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
     return checksums
+
+
+def _file_identity(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {"exists": False, "path": str(path)}
+    return {
+        "exists": True,
+        "path": str(path),
+        "size": path.stat().st_size,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
+def _git_identity(repo_root: Path) -> dict[str, Any]:
+    def run(*args: str) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    try:
+        status_lines = [
+            line
+            for line in run("status", "--porcelain=v1").splitlines()
+            if line
+        ]
+        return {
+            "head": run("rev-parse", "HEAD"),
+            "branch": run("branch", "--show-current"),
+            "dirty": bool(status_lines),
+            "dirty_path_count": len(status_lines),
+            "dirty_paths": status_lines[:100],
+        }
+    except (OSError, subprocess.CalledProcessError) as exc:
+        return {
+            "available": False,
+            "error_type": type(exc).__name__,
+        }
 
 
 def _item_payload_to_constructor_payload(payload: dict[str, Any]) -> dict[str, Any]:

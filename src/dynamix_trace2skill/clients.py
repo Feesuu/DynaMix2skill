@@ -55,6 +55,7 @@ class EmbeddingConfig:
     batch_size: int = 8
     max_concurrency: int = 8
     cache_path: str | None = None
+    cache_write_policy: str = "replace"
     deterministic_dim: int = 384
 
     @property
@@ -66,6 +67,128 @@ class EmbeddingConfig:
         if self.api_key_env_var:
             return os.environ.get(self.api_key_env_var, self.api_key or "EMPTY")
         return self.api_key or "EMPTY"
+
+
+def api_key_fingerprint(value: str) -> str:
+    if value == "EMPTY":
+        return "EMPTY"
+    if not value:
+        return ""
+    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def generation_protocol_payload(config: GenerationConfig) -> dict[str, Any]:
+    return {
+        "base_url": config.base_url,
+        "model": config.model,
+        "api_key": api_key_fingerprint(config.resolved_api_key),
+        "timeout_seconds": float(config.timeout_seconds),
+        "max_concurrency": int(config.max_concurrency),
+        "retry_wait_seconds": [float(value) for value in config.retry_wait_seconds],
+        "thinking_mode": config.thinking_mode,
+        "extra_body": config.extra_body,
+        "client": _openai_client_identity(),
+    }
+
+
+def _openai_client_identity() -> dict[str, str]:
+    try:
+        import openai
+    except ImportError:
+        from . import openai_compat
+
+        source = Path(openai_compat.__file__).read_bytes()
+        return {
+            "implementation": "dynamix_trace2skill.openai_compat",
+            "version": "source-sha256:"
+            + hashlib.sha256(source).hexdigest(),
+        }
+    return {
+        "implementation": "openai",
+        "version": str(getattr(openai, "__version__", "unknown")),
+    }
+
+
+def embedding_protocol_payload(
+    config: EmbeddingConfig,
+    *,
+    model_name: str | None = None,
+    include_execution_controls: bool = True,
+) -> dict[str, Any]:
+    payload = {
+        "base_url": config.base_url,
+        "model": model_name or config.model,
+        "api_key": api_key_fingerprint(config.resolved_api_key),
+        "max_model_len": int(config.max_model_len),
+        "max_input_tokens": int(config.effective_max_input_tokens),
+        "truncate_long_texts": bool(config.truncate_long_texts),
+        "tokenizer_model": config.tokenizer_model or "",
+        "tokenizer_required": bool(config.tokenizer_required),
+        "truncation_strategy": config.truncation_strategy,
+        "deterministic_dim": int(config.deterministic_dim),
+    }
+    if include_execution_controls:
+        payload.update(
+            {
+                "batch_size": int(config.batch_size),
+                "max_concurrency": int(config.max_concurrency),
+                "cache_write_policy": config.cache_write_policy,
+            }
+        )
+    return payload
+
+
+def embedding_cache_namespace(
+    config: EmbeddingConfig,
+    logical_namespace: str,
+    *,
+    model_name: str | None = None,
+) -> str:
+    payload = embedding_protocol_payload(
+        config,
+        model_name=model_name or config.model,
+        include_execution_controls=False,
+    )
+    digest = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"{logical_namespace}::protocol::{digest}"
+
+
+def ordered_embedding_vectors(
+    response_data: Any,
+    *,
+    expected_count: int,
+) -> list[list[float]]:
+    rows = list(response_data)
+    if len(rows) != expected_count:
+        raise RuntimeError(
+            "embedding response count does not match request count: "
+            f"expected={expected_count}, actual={len(rows)}"
+        )
+    vectors_by_index: dict[int, list[float]] = {}
+    for row in rows:
+        index = getattr(row, "index", None)
+        if (
+            not isinstance(index, int)
+            or isinstance(index, bool)
+            or not 0 <= index < expected_count
+            or index in vectors_by_index
+        ):
+            raise RuntimeError(
+                "embedding response indices must be the unique range "
+                f"0..{expected_count - 1}"
+            )
+        vectors_by_index[index] = list(row.embedding)
+    if set(vectors_by_index) != set(range(expected_count)):
+        raise RuntimeError(
+            "embedding response indices do not cover every requested input"
+        )
+    return [vectors_by_index[index] for index in range(expected_count)]
 
 
 class GenerationClient:
@@ -112,6 +235,7 @@ class GenerationClient:
                 content = _mock_text(messages)
                 self._finish_debug(debug_path, "succeeded", response=content)
                 return content
+            request_timeout = float(self.config.timeout_seconds)
             try:
                 request_timeout = float(timeout or self.config.timeout_seconds)
                 content = await self._chat_text_with_app_timeout(messages, temperature, max_tokens, timeout, body, response_format, request_timeout)
@@ -158,7 +282,17 @@ class GenerationClient:
                 return _extract_json_object(text)
             except Exception as exc:
                 last_error = exc
-                messages = list(messages) + [{"role": "user", "content": f"Return valid JSON only for schema {schema_name}. Previous parse error: {exc}"}]
+                messages = list(messages) + [
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Return a fresh, compact JSON object only for schema "
+                            f"{schema_name}. Keep every string concise; do not include "
+                            "code fences, literal formula examples, or repeated "
+                            f"whitespace. Previous parse error: {exc}"
+                        ),
+                    }
+                ]
         raise ValueError(f"failed to parse JSON for {schema_name}: {last_error}")
 
     async def _chat_text_with_app_timeout(
@@ -217,7 +351,12 @@ class GenerationClient:
             kwargs["extra_body"] = body
         if response_format:
             kwargs["response_format"] = response_format
-        client = OpenAI(api_key=self.config.resolved_api_key, base_url=self.config.base_url, timeout=timeout or self.config.timeout_seconds)
+        client = OpenAI(
+            api_key=self.config.resolved_api_key,
+            base_url=self.config.base_url,
+            timeout=timeout or self.config.timeout_seconds,
+            max_retries=0,
+        )
         response = None
         wait_schedule = (0.0, *tuple(float(x) for x in self.config.retry_wait_seconds))
         for attempt, wait_seconds in enumerate(wait_schedule):
@@ -291,7 +430,7 @@ class GenerationClient:
             "request": {
                 "model": self.config.model,
                 "base_url": self.config.base_url,
-                "api_key": _api_key_fingerprint(self.config.resolved_api_key),
+                "api_key": api_key_fingerprint(self.config.resolved_api_key),
                 "temperature": self.config.temperature if temperature is None else temperature,
                 "max_tokens": max_tokens,
                 "timeout_seconds": timeout or self.config.timeout_seconds,
@@ -365,7 +504,10 @@ class EmbeddingClient:
         self._cache: _SqliteEmbeddingCache | None = None
         self.truncation_events: list[dict[str, Any]] = []
         if config.cache_path:
-            self._cache = _SqliteEmbeddingCache(config.cache_path)
+            self._cache = _SqliteEmbeddingCache(
+                config.cache_path,
+                write_policy=config.cache_write_policy,
+            )
 
     async def embed_texts(self, texts: list[str], *, model: str | None = None, batch_size: int | None = None, cache_namespace: str | None = None) -> list[list[float]]:
         if not texts:
@@ -391,27 +533,26 @@ class EmbeddingClient:
             return batch, vectors
 
         for batch, vectors in await asyncio.gather(*(run_batch(batch) for batch in batches)):
+            if len(batch) != len(vectors):
+                raise RuntimeError(
+                    "embedding response count does not match request count"
+                )
             for (idx, prepared_text), vector in zip(batch, vectors):
                 results[idx] = vector
                 if self._cache:
-                    self._cache.set(namespace, prepared_text, vector)
+                    results[idx] = self._cache.set(
+                        namespace,
+                        prepared_text,
+                        vector,
+                    )
         return [list(v or []) for v in results]
 
     def _cache_namespace(self, logical_namespace: str, *, model_name: str) -> str:
-        payload = {
-            "base_url": self.config.base_url,
-            "model": model_name,
-            "api_key": _api_key_fingerprint(self.config.resolved_api_key),
-            "max_model_len": int(self.config.max_model_len),
-            "max_input_tokens": int(self.config.effective_max_input_tokens),
-            "truncate_long_texts": bool(self.config.truncate_long_texts),
-            "tokenizer_model": self.config.tokenizer_model or "",
-            "tokenizer_required": bool(self.config.tokenizer_required),
-            "truncation_strategy": self.config.truncation_strategy,
-            "deterministic_dim": int(self.config.deterministic_dim),
-        }
-        digest = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
-        return f"{logical_namespace}::protocol::{digest}"
+        return embedding_cache_namespace(
+            self.config,
+            logical_namespace,
+            model_name=model_name,
+        )
 
     def _prepare_text(self, text: str, *, index: int | None = None) -> tuple[str, dict[str, Any]]:
         max_tokens = max(1, int(self.config.effective_max_input_tokens))
@@ -494,7 +635,10 @@ class EmbeddingClient:
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             },
         )
-        return [list(item.embedding) for item in response.data]
+        return ordered_embedding_vectors(
+            response.data,
+            expected_count=len(texts),
+        )
 
     def close(self) -> None:
         if self._cache:
@@ -563,14 +707,6 @@ def _debug_io_warning(path: Path, operation: str, exc: Exception) -> None:
     )
 
 
-def _api_key_fingerprint(value: str) -> str:
-    if value == "EMPTY":
-        return "EMPTY"
-    if not value:
-        return ""
-    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
 def _response_usage_payload(value: Any) -> dict[str, Any]:
     usage = getattr(value, "usage", None)
     if usage is None and isinstance(value, dict):
@@ -613,10 +749,23 @@ def _append_usage_record(env_var: str, payload: dict[str, Any]) -> None:
 
 
 class _SqliteEmbeddingCache:
-    def __init__(self, path: str | Path):
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        write_policy: str = "replace",
+    ):
         self.path = Path(path)
+        self.write_policy = str(write_policy)
+        if self.write_policy not in {"replace", "first_write_wins"}:
+            raise ValueError(
+                "embedding cache write_policy must be 'replace' or "
+                "'first_write_wins'"
+            )
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path)
+        self.conn = sqlite3.connect(self.path, timeout=60.0)
+        self.conn.execute("PRAGMA busy_timeout=60000")
+        self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("CREATE TABLE IF NOT EXISTS embeddings (namespace TEXT, key TEXT, vector TEXT, PRIMARY KEY(namespace, key))")
         self.conn.commit()
 
@@ -628,12 +777,353 @@ class _SqliteEmbeddingCache:
         row = cur.fetchone()
         return json.loads(row[0]) if row else None
 
-    def set(self, namespace: str, text: str, vector: list[float]) -> None:
-        self.conn.execute("INSERT OR REPLACE INTO embeddings(namespace,key,vector) VALUES(?,?,?)", (namespace, self._key(text), json.dumps(vector)))
+    def set(
+        self,
+        namespace: str,
+        text: str,
+        vector: list[float],
+    ) -> list[float]:
+        key = self._key(text)
+        insert_mode = (
+            "REPLACE"
+            if self.write_policy == "replace"
+            else "IGNORE"
+        )
+        self.conn.execute(
+            f"INSERT OR {insert_mode} INTO embeddings(namespace,key,vector) "
+            "VALUES(?,?,?)",
+            (namespace, key, json.dumps(vector)),
+        )
         self.conn.commit()
+        row = self.conn.execute(
+            "SELECT vector FROM embeddings WHERE namespace=? AND key=?",
+            (namespace, key),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("embedding cache write did not persist a vector")
+        return list(json.loads(row[0]))
 
     def close(self) -> None:
         self.conn.close()
+
+
+def embedding_vector_sha256(vector: Any) -> str:
+    normalized = [float(value) for value in vector]
+    return hashlib.sha256(
+        json.dumps(
+            normalized,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def normalized_embedding_vector_sha256(vector: Any) -> str:
+    normalized = np.asarray(list(vector), dtype=float)
+    if normalized.ndim != 1 or normalized.size == 0:
+        raise ValueError("embedding vector must be non-empty and one-dimensional")
+    if not np.all(np.isfinite(normalized)):
+        raise ValueError("embedding vector contains a non-finite value")
+    norm = float(np.linalg.norm(normalized))
+    if norm <= 0.0:
+        raise ValueError("embedding vector must have non-zero norm")
+    normalized = normalized / norm
+    return embedding_vector_sha256(normalized.tolist())
+
+
+def write_embedding_cache_manifest(
+    *,
+    cache_path: str | Path,
+    output_path: str | Path,
+    requirements: list[dict[str, Any]],
+) -> dict[str, Any]:
+    resolved_cache = Path(cache_path).resolve()
+    if not resolved_cache.is_file():
+        raise FileNotFoundError(
+            f"embedding vector cache is missing: {resolved_cache}"
+        )
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    for requirement in requirements:
+        namespace = str(requirement.get("namespace") or "").strip()
+        text = str(requirement.get("text") or "")
+        if not namespace or not text:
+            raise ValueError(
+                "embedding cache requirements need namespace and text"
+            )
+        text_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        key = (namespace, text_sha256)
+        expected_vector = requirement.get("vector")
+        expected_sha256 = (
+            embedding_vector_sha256(expected_vector)
+            if expected_vector is not None
+            else None
+        )
+        expected_normalized_vector = requirement.get("normalized_vector")
+        expected_normalized_values = (
+            [float(value) for value in expected_normalized_vector]
+            if expected_normalized_vector is not None
+            else None
+        )
+        expected_normalized_sha256 = (
+            embedding_vector_sha256(expected_normalized_values)
+            if expected_normalized_values is not None
+            else None
+        )
+        entry = merged.setdefault(
+            key,
+            {
+                "namespace": namespace,
+                "text_sha256": text_sha256,
+                "expected_vector_sha256": expected_sha256,
+                "expected_normalized_vector_sha256": (
+                    expected_normalized_sha256
+                ),
+                "expected_normalized_vector": expected_normalized_values,
+                "purposes": set(),
+                "item_ids": set(),
+            },
+        )
+        if (
+            expected_sha256 is not None
+            and entry["expected_vector_sha256"] not in (None, expected_sha256)
+        ):
+            raise ValueError(
+                "conflicting expected vectors for one embedding cache row"
+            )
+        if expected_sha256 is not None:
+            entry["expected_vector_sha256"] = expected_sha256
+        if (
+            expected_normalized_sha256 is not None
+            and entry["expected_normalized_vector_sha256"]
+            not in (None, expected_normalized_sha256)
+        ):
+            raise ValueError(
+                "conflicting expected normalized vectors for one embedding "
+                "cache row"
+            )
+        if expected_normalized_sha256 is not None:
+            entry["expected_normalized_vector_sha256"] = (
+                expected_normalized_sha256
+            )
+            entry["expected_normalized_vector"] = expected_normalized_values
+        purpose = str(requirement.get("purpose") or "").strip()
+        item_id = str(requirement.get("item_id") or "").strip()
+        if purpose:
+            entry["purposes"].add(purpose)
+        if item_id:
+            entry["item_ids"].add(item_id)
+
+    connection = sqlite3.connect(
+        f"file:{resolved_cache}?mode=ro",
+        uri=True,
+    )
+    try:
+        entries: list[dict[str, Any]] = []
+        for namespace, text_sha256 in sorted(merged):
+            source = merged[(namespace, text_sha256)]
+            row = connection.execute(
+                "SELECT vector FROM embeddings WHERE namespace=? AND key=?",
+                (namespace, text_sha256),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(
+                    "embedding cache is missing a required logical row: "
+                    f"namespace={namespace}, text_sha256={text_sha256}"
+                )
+            actual_vector = json.loads(row[0])
+            actual_sha256 = embedding_vector_sha256(actual_vector)
+            expected_sha256 = source["expected_vector_sha256"]
+            if (
+                expected_sha256 is not None
+                and actual_sha256 != expected_sha256
+            ):
+                raise RuntimeError(
+                    "embedding cache vector differs from the build artifact: "
+                    f"namespace={namespace}, text_sha256={text_sha256}"
+                )
+            actual_normalized_sha256 = (
+                normalized_embedding_vector_sha256(actual_vector)
+            )
+            actual_normalized_vector = np.asarray(
+                actual_vector,
+                dtype=float,
+            )
+            actual_normalized_vector = (
+                actual_normalized_vector
+                / float(np.linalg.norm(actual_normalized_vector))
+            )
+            expected_normalized_sha256 = source[
+                "expected_normalized_vector_sha256"
+            ]
+            artifact_cache_max_abs_error = None
+            if expected_normalized_sha256 is not None:
+                expected_normalized_vector = np.asarray(
+                    source["expected_normalized_vector"],
+                    dtype=float,
+                )
+                if (
+                    expected_normalized_vector.ndim != 1
+                    or expected_normalized_vector.size == 0
+                    or not np.all(np.isfinite(expected_normalized_vector))
+                    or expected_normalized_vector.shape
+                    != actual_normalized_vector.shape
+                ):
+                    raise RuntimeError(
+                        "normalized embedding cache vector differs from the "
+                        "build artifact: "
+                        f"namespace={namespace}, text_sha256={text_sha256}"
+                    )
+                artifact_cache_max_abs_error = float(
+                    np.max(
+                        np.abs(
+                            expected_normalized_vector
+                            - actual_normalized_vector
+                        )
+                    )
+                )
+                tolerance = 64.0 * np.finfo(float).eps
+                if artifact_cache_max_abs_error > tolerance:
+                    raise RuntimeError(
+                        "normalized embedding cache vector differs from the "
+                        "build artifact: "
+                        f"namespace={namespace}, text_sha256={text_sha256}"
+                    )
+            entries.append(
+                {
+                    "namespace": namespace,
+                    "text_sha256": text_sha256,
+                    "vector_sha256": actual_sha256,
+                    "normalized_vector_sha256": (
+                        actual_normalized_sha256
+                    ),
+                    "artifact_normalized_vector_sha256": (
+                        expected_normalized_sha256
+                    ),
+                    "artifact_cache_max_abs_error": (
+                        artifact_cache_max_abs_error
+                    ),
+                    "purposes": sorted(source["purposes"]),
+                    "item_ids": sorted(source["item_ids"]),
+                }
+            )
+    finally:
+        connection.close()
+
+    logical_sha256 = hashlib.sha256(
+        json.dumps(
+            entries,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    payload = {
+        "format": "dynamix_embedding_cache_manifest_v1",
+        "cache_path": str(resolved_cache),
+        "entry_count": len(entries),
+        "logical_sha256": logical_sha256,
+        "entries": entries,
+    }
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.tmp"
+    )
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(destination)
+    return payload
+
+
+def validate_embedding_cache_manifest(
+    *,
+    cache_path: str | Path,
+    manifest_path: str | Path,
+) -> dict[str, Any]:
+    resolved_cache = Path(cache_path).resolve()
+    source = Path(manifest_path)
+    if not resolved_cache.is_file():
+        raise FileNotFoundError(
+            f"embedding vector cache is missing: {resolved_cache}"
+        )
+    if not source.is_file():
+        raise FileNotFoundError(
+            f"embedding cache manifest is missing: {source}"
+        )
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    entries = payload.get("entries")
+    if (
+        payload.get("format") != "dynamix_embedding_cache_manifest_v1"
+        or not isinstance(entries, list)
+        or int(payload.get("entry_count", -1)) != len(entries)
+    ):
+        raise ValueError(f"invalid embedding cache manifest: {source}")
+    expected_logical_sha256 = hashlib.sha256(
+        json.dumps(
+            entries,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if payload.get("logical_sha256") != expected_logical_sha256:
+        raise ValueError(
+            f"embedding cache manifest logical digest mismatch: {source}"
+        )
+
+    seen: set[tuple[str, str]] = set()
+    connection = sqlite3.connect(
+        f"file:{resolved_cache}?mode=ro",
+        uri=True,
+    )
+    try:
+        for entry in entries:
+            namespace = str(entry.get("namespace") or "")
+            text_sha256 = str(entry.get("text_sha256") or "")
+            vector_sha256 = str(entry.get("vector_sha256") or "")
+            normalized_vector_sha256 = str(
+                entry.get("normalized_vector_sha256") or ""
+            )
+            key = (namespace, text_sha256)
+            if (
+                not namespace
+                or len(text_sha256) != 64
+                or len(vector_sha256) != 64
+                or len(normalized_vector_sha256) != 64
+                or key in seen
+            ):
+                raise ValueError(
+                    f"invalid embedding cache manifest entry: {entry!r}"
+                )
+            seen.add(key)
+            row = connection.execute(
+                "SELECT vector FROM embeddings WHERE namespace=? AND key=?",
+                key,
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(
+                    "embedding vector cache no longer contains a required "
+                    f"row: namespace={namespace}, text_sha256={text_sha256}"
+                )
+            actual_vector = json.loads(row[0])
+            if embedding_vector_sha256(actual_vector) != vector_sha256:
+                raise RuntimeError(
+                    "embedding vector cache row changed after certification: "
+                    f"namespace={namespace}, text_sha256={text_sha256}"
+                )
+            if (
+                normalized_embedding_vector_sha256(actual_vector)
+                != normalized_vector_sha256
+            ):
+                raise RuntimeError(
+                    "normalized embedding vector cache row changed after "
+                    "certification: "
+                    f"namespace={namespace}, text_sha256={text_sha256}"
+                )
+    finally:
+        connection.close()
+    return payload
 
 
 def _deterministic_embedding(text: str, *, dim: int) -> list[float]:

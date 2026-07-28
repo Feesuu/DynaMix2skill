@@ -202,6 +202,13 @@ class CLISkillPreloadedAgent(BaseSpreadsheetAgent):
             "top_k": self._skillbank_top_k,
             "selected_node_ids": [item["node_id"] for item in selected],
             "selected_node_scores": [item["score"] for item in selected],
+            "query_embedding_audit": dict(
+                getattr(
+                    self._skillbank_selector,
+                    "last_embedding_audit",
+                    {},
+                )
+            ),
             "selected": selected,
         }
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)

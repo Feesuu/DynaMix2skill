@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import os
 import shutil
@@ -11,14 +12,26 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 
-def run(cmd: list[str], *, cwd: Path, env: dict[str, str], log_path: Path | None = None) -> None:
+def run(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    log_path: Path | None = None,
+    append_log: bool = False,
+) -> None:
     print("+", " ".join(cmd), flush=True)
     if log_path:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("w", encoding="utf-8") as log:
+        with log_path.open(
+            "a" if append_log else "w",
+            encoding="utf-8",
+        ) as log:
+            if append_log:
+                log.write("\n[resume] continuing interrupted stage\n")
             proc = subprocess.run(cmd, cwd=str(cwd), env=env, stdout=log, stderr=subprocess.STDOUT)
     else:
         proc = subprocess.run(cmd, cwd=str(cwd), env=env)
@@ -30,18 +43,42 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
 def stage_done(marker: Path, outputs: Iterable[Path], *, fingerprint: dict | None = None) -> bool:
     if not marker.exists():
         return False
-    if not all(path.exists() for path in outputs):
+    output_paths = list(outputs)
+    stage_name = marker.name.removesuffix(".done")
+    if (
+        marker.with_name(f"{stage_name}.running").exists()
+        or marker.with_name(f"{stage_name}.failed.json").exists()
+    ):
         return False
-    if fingerprint is None:
-        return True
+    if not all(path.exists() for path in output_paths):
+        return False
     try:
         payload = json.loads(marker.read_text(encoding="utf-8"))
     except Exception:
         return False
-    return payload.get("fingerprint") == fingerprint
+    if fingerprint is not None and payload.get("fingerprint") != fingerprint:
+        return False
+    expected_outputs = payload.get("output_identities")
+    if not isinstance(expected_outputs, dict):
+        return False
+    actual_outputs = {
+        str(path): path_fingerprint(path)
+        for path in output_paths
+    }
+    return expected_outputs == actual_outputs
 
 
 def run_stage(
@@ -56,24 +93,54 @@ def run_stage(
     resume: bool,
     fingerprint: dict | None = None,
     clear_outputs_before_run: list[Path] | None = None,
+    preserve_partial_outputs_on_resume: bool = False,
 ) -> None:
     marker_dir.mkdir(parents=True, exist_ok=True)
     marker = marker_dir / f"{name}.done"
     if resume and stage_done(marker, outputs, fingerprint=fingerprint):
         print(f"[resume] skip stage {name}", flush=True)
         return
-    for path in clear_outputs_before_run or []:
-        if path.exists() and path.is_file():
-            path.unlink()
+    running = marker_dir / f"{name}.running"
+    failed = marker_dir / f"{name}.failed.json"
+    resume_partial = False
+    if resume and preserve_partial_outputs_on_resume and running.is_file():
+        try:
+            running_payload = json.loads(
+                running.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            running_payload = {}
+        resume_partial = (
+            running_payload.get("fingerprint") == fingerprint
+        )
+        if resume_partial:
+            print(
+                f"[resume] continue partial stage {name}",
+                flush=True,
+            )
+    marker.unlink(missing_ok=True)
+    running.unlink(missing_ok=True)
+    failed.unlink(missing_ok=True)
+    if not resume_partial:
+        for path in clear_outputs_before_run or []:
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                shutil.rmtree(path)
     started_at = utc_now_iso()
     started_monotonic = time.monotonic()
     running_payload = {"stage": name, "cmd": cmd, "fingerprint": fingerprint, "started_at": started_at, "log": str(log_path)}
-    (marker_dir / f"{name}.running").write_text(json.dumps(running_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_atomic(running, running_payload)
     try:
-        run(cmd, cwd=cwd, env=env, log_path=log_path)
+        run(
+            cmd,
+            cwd=cwd,
+            env=env,
+            log_path=log_path,
+            append_log=resume_partial,
+        )
     except Exception as exc:
-        fail = marker_dir / f"{name}.failed.json"
-        fail.write_text(json.dumps({
+        write_json_atomic(failed, {
             "stage": name,
             "cmd": cmd,
             "error": repr(exc),
@@ -81,13 +148,12 @@ def run_stage(
             "started_at": started_at,
             "ended_at": utc_now_iso(),
             "elapsed_seconds": time.monotonic() - started_monotonic,
-        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        })
         raise
     missing = [str(path) for path in outputs if not path.exists()]
     if missing:
-        fail = marker_dir / f"{name}.failed.json"
         error = f"stage completed but required outputs are missing: {missing}"
-        fail.write_text(json.dumps({
+        write_json_atomic(failed, {
             "stage": name,
             "cmd": cmd,
             "error": error,
@@ -95,22 +161,24 @@ def run_stage(
             "started_at": started_at,
             "ended_at": utc_now_iso(),
             "elapsed_seconds": time.monotonic() - started_monotonic,
-        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        })
         raise RuntimeError(error)
     ended_at = utc_now_iso()
     elapsed_seconds = time.monotonic() - started_monotonic
-    marker.write_text(json.dumps({
+    write_json_atomic(marker, {
         "stage": name,
         "outputs": [str(p) for p in outputs],
+        "output_identities": {
+            str(path): path_fingerprint(path)
+            for path in outputs
+        },
         "fingerprint": fingerprint,
         "started_at": started_at,
         "ended_at": ended_at,
         "elapsed_seconds": elapsed_seconds,
         "log": str(log_path),
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
-    running = marker_dir / f"{name}.running"
-    if running.exists():
-        running.unlink()
+    })
+    running.unlink(missing_ok=True)
 
 
 def write_generation_config(path: Path, *, thinking: bool | None, temperature: float = 0.0) -> None:
@@ -229,6 +297,105 @@ def resolved_optional_path(value: str | None) -> Path | None:
     return Path(text).expanduser().resolve()
 
 
+def validate_cdost_vector_cache(
+    *,
+    cache_path: Path,
+    manifest_path: Path,
+) -> dict[str, object]:
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    source_root_text = str(source_root)
+    if source_root_text not in sys.path:
+        sys.path.insert(0, source_root_text)
+    from dynamix_trace2skill.clients import (
+        validate_embedding_cache_manifest,
+    )
+
+    return validate_embedding_cache_manifest(
+        cache_path=cache_path,
+        manifest_path=manifest_path,
+    )
+
+
+def resolve_embedding_cache_path(
+    *,
+    explicit_path: str | None,
+    scenario_dir: Path,
+    tree_policy: str,
+    tree_scenario: str,
+    atom_cache_path: str | None,
+) -> Path:
+    explicit = resolved_optional_path(explicit_path)
+    if (
+        tree_policy != "certified_dual_view_otd"
+        or tree_scenario != "dynamic_update"
+    ):
+        return explicit or (scenario_dir / "cache" / "embedding_cache.sqlite")
+
+    atom_cache = resolved_optional_path(atom_cache_path)
+    if atom_cache is None:
+        raise ValueError(
+            "controlled certified_dual_view_otd dynamic runs require a "
+            "frozen atom cache"
+        )
+    if not atom_cache.is_file():
+        raise FileNotFoundError(f"frozen atom cache is missing: {atom_cache}")
+    source_scenario_dir = atom_cache.parent.parent
+    validate_source_build_output(
+        marker_path=(
+            source_scenario_dir
+            / "stage_markers"
+            / "04_build_tree.done"
+        ),
+        output_path=atom_cache,
+    )
+    source_config_path = source_scenario_dir / "dynamix_config.json"
+    if not source_config_path.is_file():
+        raise FileNotFoundError(
+            "matching static dynamix_config.json is required beside the "
+            f"frozen atom cache: {source_config_path}"
+        )
+    source_config = json.loads(source_config_path.read_text(encoding="utf-8"))
+    source_output = Path(str(source_config.get("output_dir") or "")).resolve()
+    if (
+        source_config.get("scenario") != "static_build"
+        or source_config.get("hierarchy", {}).get("tree_policy")
+        != "certified_dual_view_otd"
+        or atom_cache != (source_output / "experience_atoms.json").resolve()
+    ):
+        raise ValueError(
+            "frozen atom cache is not bound to a matching static CDOST run"
+        )
+    source_cache = resolved_optional_path(
+        source_config.get("embedding", {}).get("cache_path")
+    )
+    if source_cache is None or not source_cache.is_file():
+        raise FileNotFoundError(
+            "matching static embedding vector cache is missing: "
+            f"{source_cache}"
+        )
+    if explicit is not None and explicit != source_cache:
+        raise ValueError(
+            "controlled static/dynamic CDOST runs must share the same "
+            "content-addressed embedding vector cache"
+        )
+    source_vector_manifest = (
+        source_output / "embedding_vector_cache_manifest.json"
+    )
+    validate_source_build_output(
+        marker_path=(
+            source_scenario_dir
+            / "stage_markers"
+            / "04_build_tree.done"
+        ),
+        output_path=source_vector_manifest,
+    )
+    validate_cdost_vector_cache(
+        cache_path=source_cache,
+        manifest_path=source_vector_manifest,
+    )
+    return source_cache
+
+
 def stage_source_fingerprints(repo: Path) -> dict[str, dict[str, str | bool | int]]:
     return {
         "runner": path_fingerprint(Path(__file__).resolve()),
@@ -236,6 +403,9 @@ def stage_source_fingerprints(repo: Path) -> dict[str, dict[str, str | bool | in
         "evaluate_with_official": path_fingerprint(repo / "evaluate_with_official.py"),
         "extract_trace2skill_logs": path_fingerprint(repo / "scripts" / "extract_trace2skill_logs.py"),
         "build_dynamix_tree": path_fingerprint(repo / "scripts" / "build_dynamix_tree.py"),
+        "audit_cdost_query_vector_cache": path_fingerprint(
+            repo / "scripts" / "audit_cdost_query_vector_cache.py"
+        ),
         "spreadsheetbench_support": path_fingerprint(repo / "spreadsheetbench_support.py"),
         "spreadsheet_agent": path_fingerprint(repo / "spreadsheet_agent", source_only=True),
         "react_agent": path_fingerprint(repo / "src" / "react_agent", source_only=True),
@@ -254,6 +424,10 @@ def rollout_protocol(args: argparse.Namespace, *, generation_config: Path) -> di
         "workers": int(args.workers),
         "timeout_seconds": float(args.rollout_client_timeout_seconds),
         "retry_wait_seconds": list(args.rollout_client_retry_wait_seconds),
+        "sdk_max_retries": 0,
+        "response_cache_enabled": not bool(
+            getattr(args, "rollout_disable_response_cache", False)
+        ),
         "llm_client": args.rollout_llm_client,
         "num_random_seeds": int(args.rollout_num_random_seeds),
         "seeds": str(args.rollout_seeds),
@@ -266,16 +440,296 @@ def rollout_protocol(args: argparse.Namespace, *, generation_config: Path) -> di
     }
 
 
-def skillbank_retrieval_protocol(args: argparse.Namespace, *, cache_path: Path, selection_log: Path) -> dict[str, object]:
+def build_evaluation_command(
+    *,
+    python_executable: str,
+    data_path: str,
+    output_dir: Path,
+    recalc_dir: Path,
+    start_idx: int,
+    end_idx: int,
+    results_file: Path,
+    evaluator_backend: str,
+) -> list[str]:
+    return [
+        python_executable,
+        "evaluate_with_official.py",
+        "--data_path",
+        data_path,
+        "--output_dir",
+        str(output_dir),
+        "--recalc_dir",
+        str(recalc_dir),
+        "--start_idx",
+        str(start_idx),
+        "--end_idx",
+        str(end_idx),
+        "--results_file",
+        str(results_file),
+        "--evaluator-backend",
+        evaluator_backend,
+    ]
+
+
+def evaluation_runtime_identity(
+    repo: Path,
+    *,
+    evaluator_backend: str,
+) -> dict[str, object]:
+    repo_text = str(repo.resolve())
+    if repo_text not in sys.path:
+        sys.path.insert(0, repo_text)
+    evaluator = importlib.import_module("evaluate_with_official")
+    return evaluator.evaluation_runtime_identity(evaluator_backend)
+
+
+def _canonical_sha256(payload: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def cdost_control_contract(
+    *,
+    args: argparse.Namespace,
+    config: Mapping[str, Any],
+    records_path: Path,
+    dataset_fingerprint: Mapping[str, Any],
+    generation_config_path: Path,
+    evaluator_identity: Mapping[str, Any],
+    source_fingerprints: Mapping[str, Mapping[str, Any]],
+) -> dict[str, object]:
+    hierarchy = dict(config.get("hierarchy") or {})
+    otd = dict(hierarchy.get("otd") or {})
+    otd.pop("atom_cache_path", None)
+    generation = dict(config.get("generation") or {})
+    generation.pop("debug_dir", None)
+    generation["api_key_fingerprint"] = api_key_fingerprint(
+        str(generation.pop("api_key", ""))
+    )
+    embedding = dict(config.get("embedding") or {})
+    embedding.pop("cache_path", None)
+    embedding["api_key_fingerprint"] = api_key_fingerprint(
+        str(embedding.pop("api_key", ""))
+    )
+    analyst = dict(config.get("analyst") or {})
+    analyst.pop("prompt_token_report_path", None)
+    retrieval = skillbank_retrieval_protocol(
+        args,
+        cache_path=Path("<run-local-index>"),
+        vector_cache_path=Path("<shared-vector-cache>"),
+        selection_log=Path("<run-local-selection-log>"),
+    )
+    for key in (
+        "cache_path",
+        "vector_cache_path",
+        "selection_log",
+        "require_vector_cache_match",
+    ):
+        retrieval.pop(key, None)
+    retrieval["embedding_api_key_fingerprint"] = api_key_fingerprint(
+        str(retrieval.pop("embedding_api_key", ""))
+    )
+    rollout = rollout_protocol(
+        args,
+        generation_config=generation_config_path,
+    )
+    rollout["generation_config"] = json.loads(
+        generation_config_path.read_text(encoding="utf-8")
+    )
+    rollout["openai_api_key_fingerprint"] = str(
+        rollout.pop("openai_api_key", "")
+    )
+    dynamic_counts = expected_dynamic_counts(
+        record_count=load_record_count(records_path),
+        initial_count=int(args.dynamic_initial_count),
+        arrival_count=int(args.dynamic_arrival_count),
+    )
+    paired_dynamic_schedule = {
+        **dynamic_counts,
+        "arrival_order": "dataset",
+        "shuffle_seed": (
+            None
+            if int(args.dynamic_shuffle_seed) < 0
+            else int(args.dynamic_shuffle_seed)
+        ),
+        "snapshot_interval": max(
+            1,
+            int(args.dynamic_update_batch_size),
+        ),
+        "snapshot_include_embeddings": bool(
+            args.dynamic_snapshot_include_embeddings
+        ),
+        "resume_from_snapshots": bool(
+            args.dynamic_resume_from_snapshots
+        ),
+    }
     return {
+        "format": "cdost_control_contract_v2",
+        "dataset": dataset_fingerprint,
+        "records_sha256": file_sha256(records_path),
+        "train_split": [int(args.train_start), int(args.train_end)],
+        "heldout_split": [int(args.heldout_start), int(args.heldout_end)],
+        "tree": {
+            "tree_policy": "certified_dual_view_otd",
+            "otd": otd,
+            "generation": generation,
+            "embedding": embedding,
+            "analyst": analyst,
+        },
+        "paired_dynamic_schedule": paired_dynamic_schedule,
+        "retrieval": retrieval,
+        "rollout": rollout,
+        "evaluator": evaluator_identity,
+        "source": {
+            key: source_fingerprints[key]
+            for key in (
+                "runner",
+                "run_spreadsheetbench",
+                "evaluate_with_official",
+                "spreadsheetbench_support",
+                "spreadsheet_agent",
+                "react_agent",
+                "dynamix_core",
+                "dynamix_trace2skill",
+            )
+        },
+    }
+
+
+def write_cdost_control_manifest(
+    path: Path,
+    contract: dict[str, object],
+) -> dict[str, object]:
+    payload = {
+        "format": "cdost_control_manifest_v1",
+        "contract_sha256": _canonical_sha256(contract),
+        "contract": contract,
+    }
+    write_json_atomic(path, payload)
+    return payload
+
+
+def validate_matching_cdost_control_manifest(
+    *,
+    current_manifest: Path,
+    source_manifest: Path,
+) -> None:
+    current = json.loads(current_manifest.read_text(encoding="utf-8"))
+    source = json.loads(source_manifest.read_text(encoding="utf-8"))
+    for path, payload in (
+        (current_manifest, current),
+        (source_manifest, source),
+    ):
+        if (
+            payload.get("format") != "cdost_control_manifest_v1"
+            or payload.get("contract_sha256")
+            != _canonical_sha256(payload.get("contract"))
+        ):
+            raise ValueError(f"invalid CDOST control manifest: {path}")
+    if current["contract"] != source["contract"]:
+        raise ValueError(
+            "dynamic CDOST control contract differs from the source static run"
+        )
+
+
+def validate_source_build_output(
+    *,
+    marker_path: Path,
+    output_path: Path,
+) -> None:
+    if not marker_path.is_file():
+        raise FileNotFoundError(
+            f"source build marker is missing: {marker_path}"
+        )
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    identities = marker.get("output_identities")
+    expected = (
+        identities.get(str(output_path))
+        if isinstance(identities, dict)
+        else None
+    )
+    if not isinstance(expected, dict) or expected != path_fingerprint(
+        output_path
+    ):
+        raise ValueError(
+            "source output no longer matches its completed stage marker: "
+            f"{output_path}"
+        )
+
+
+def skillbank_retrieval_protocol(
+    args: argparse.Namespace,
+    *,
+    cache_path: Path,
+    vector_cache_path: Path,
+    selection_log: Path,
+) -> dict[str, object]:
+    is_cdost = args.tree_policy == "certified_dual_view_otd"
+    protocol: dict[str, object] = {
         "query_policy": "instruction + Task type; answer_position excluded",
         "top_k": int(args.skillbank_top_k),
         "embedding_base_url": args.embedding_base_url,
         "embedding_model": args.embedding_model,
         "embedding_api_key": api_key_fingerprint("EMPTY"),
+        "embedding_max_model_len": int(args.embedding_max_model_len),
+        "embedding_max_input_tokens": int(args.embedding_max_input_tokens),
+        "embedding_batch_size": int(args.embedding_batch_size),
+        "embedding_tokenizer": args.embedding_tokenizer,
+        "vector_cache_path": str(vector_cache_path),
+        "require_vector_cache_match": (
+            is_cdost
+            and args.tree_scenario == "dynamic_update"
+        ),
+        "require_cache_match": is_cdost,
         "cache_path": str(cache_path),
         "selection_log": str(selection_log),
     }
+    if is_cdost:
+        protocol.update(
+            {
+                "embedding_input_policy": (
+                    "single_vector_fail_if_over_limit"
+                ),
+                "chunked_embedding_active": False,
+                "vector_cache_policy": (
+                    "content_addressed_first_success_frozen"
+                ),
+            }
+        )
+    else:
+        protocol.update(
+            {
+                "embedding_input_policy": "legacy_single_vector",
+                "chunked_embedding_active": False,
+                "chunked_embedding_configured": bool(
+                    args.chunked_embedding_enabled
+                ),
+                "chunk_tokens": int(
+                    args.chunked_embedding_chunk_tokens
+                ),
+                "chunk_overlap_tokens": int(
+                    args.chunked_embedding_overlap_tokens
+                ),
+                "chunk_pooling": args.chunked_embedding_pooling,
+                "chunk_add_special_tokens": bool(
+                    args.chunked_embedding_add_special_tokens
+                ),
+                "chunk_normalize_after_pooling": bool(
+                    args.chunked_embedding_normalize_after_pooling
+                ),
+                "chunk_fail_if_exceeds_model_limit": bool(
+                    args.chunked_embedding_fail_if_chunk_exceeds_model_limit
+                ),
+                "vector_cache_policy": "disabled",
+            }
+        )
+    return protocol
 
 
 def expected_dynamic_counts(*, record_count: int, initial_count: int, arrival_count: int) -> dict[str, int]:
@@ -390,6 +844,30 @@ def validate_tree_summary_for_heldout(summary: dict, args: argparse.Namespace) -
     scenario = str(summary.get("scenario", ""))
     if scenario != args.tree_scenario:
         raise RuntimeError(f"DynaMix tree summary scenario mismatch: expected {args.tree_scenario!r}, got {scenario!r}")
+    if getattr(args, "tree_policy", "") == "certified_dual_view_otd":
+        if summary.get("tree_policy") != "certified_dual_view_otd":
+            raise RuntimeError("heldout requires a certified_dual_view_otd tree")
+        if int(summary.get("parent_generation_error_count", -1)) != 0:
+            raise RuntimeError(
+                "heldout is blocked because parent skill generation was incomplete"
+            )
+        if int(summary.get("excluded_count", -1)) != 0:
+            raise RuntimeError(
+                "heldout is blocked because the certified tree excluded input records"
+            )
+        if int(summary.get("atom_count", -1)) != int(
+            summary.get("record_count", -2)
+        ):
+            raise RuntimeError(
+                "heldout is blocked because atom_count does not match record_count"
+            )
+        if (
+            scenario == "dynamic_update"
+            and summary.get("atom_source") != "frozen_cache"
+        ):
+            raise RuntimeError(
+                "controlled CDOST dynamic heldout requires frozen_cache atoms"
+            )
     if args.tree_scenario != "dynamic_update":
         return
     if hasattr(args, "train_start") and hasattr(args, "train_end"):
@@ -537,7 +1015,7 @@ def collect_prompt_token_stats(path: Path) -> dict[str, Any]:
             for event in events
             if isinstance(event, dict)
         ],
-        key=lambda item: item["prompt_tokens"],
+        key=lambda item: int(item["prompt_tokens"] or 0),
         reverse=True,
     )[:10]
     return {
@@ -573,6 +1051,10 @@ def collect_chunked_embedding_stats(path: Path) -> dict[str, Any]:
 
 def runtime_dead_corner_findings(args: argparse.Namespace) -> list[dict[str, str]]:
     findings: list[dict[str, str]] = []
+    is_cdost = (
+        str(getattr(args, "tree_policy", "")).strip()
+        == "certified_dual_view_otd"
+    )
     analyst_budget = int(float(args.summary_max_model_tokens) * float(args.summary_budget_ratio))
     evidence_budget = analyst_budget - int(args.summary_prompt_overhead_reserve_tokens)
     if analyst_budget >= int(args.summary_max_model_tokens) * 0.9:
@@ -582,35 +1064,39 @@ def runtime_dead_corner_findings(args: argparse.Namespace) -> list[dict[str, str
             "finding": "analyst prompt budget leaves little context-window headroom for chat-template/thinking overhead.",
             "evidence": f"analyst_budget={analyst_budget}, max_model_tokens={args.summary_max_model_tokens}",
         })
-    if evidence_budget <= 0:
+    if not is_cdost and evidence_budget <= 0:
         findings.append({
             "severity": "blocker",
             "area": "summary_budget",
             "finding": "member evidence budget is non-positive, so build cannot select feasible communities.",
             "evidence": f"analyst_budget={analyst_budget}, overhead={args.summary_prompt_overhead_reserve_tokens}",
         })
-    if int(args.analyst_max_prompt_tokens) > 0 and int(args.analyst_max_prompt_tokens) < evidence_budget:
+    if (
+        not is_cdost
+        and int(args.analyst_max_prompt_tokens) > 0
+        and int(args.analyst_max_prompt_tokens) < evidence_budget
+    ):
         findings.append({
             "severity": "high",
             "area": "analyst_budget_override",
             "finding": "analyst max prompt override is smaller than the tree-builder evidence budget; build may pass but analyst preflight can fail.",
             "evidence": f"analyst_max_prompt_tokens={args.analyst_max_prompt_tokens}, evidence_budget={evidence_budget}",
         })
-    if int(args.budget_refinement_apply_to_level) == 0:
+    if not is_cdost and int(args.budget_refinement_apply_to_level) == 0:
         findings.append({
             "severity": "watch",
             "area": "budget_refinement",
             "finding": "budget refinement only protects L0 raw-trajectory communities; unusually verbose L1+ cards can still trigger analyst over-budget failures.",
             "evidence": "budget_refinement_apply_to_level=0",
         })
-    if args.soft_recursive_assignment == "cumulative_mass":
+    if not is_cdost and args.soft_recursive_assignment == "cumulative_mass":
         findings.append({
             "severity": "info",
             "area": "soft_membership",
             "finding": "top_r_memberships is inactive under cumulative_mass assignment; max_membership_gap and cumulative_mass_coverage control fan-out.",
             "evidence": f"recursive_assignment={args.soft_recursive_assignment}, top_r={args.soft_top_r_memberships}",
         })
-    if args.soft_recursive_assignment == "cumulative_mass":
+    if not is_cdost and args.soft_recursive_assignment == "cumulative_mass":
         findings.append({
             "severity": "info",
             "area": "soft_membership",
@@ -645,6 +1131,90 @@ def runtime_dead_corner_findings(args: argparse.Namespace) -> list[dict[str, str
             "evidence": f"train_count={train_count}, expected_dynamic={expected_dynamic}",
         })
     return findings
+
+
+def validate_nodebank_manifest_for_heldout(
+    manifest: dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    if args.tree_policy != "certified_dual_view_otd":
+        return
+    if manifest.get("tree_policy") != "certified_dual_view_otd":
+        raise RuntimeError("CDOST nodebank tree_policy identity is missing")
+    export_policy = dict(manifest.get("export_policy", {}))
+    if export_policy.get("heldout_retrieval") != "tree_antichain_knapsack":
+        raise RuntimeError("CDOST nodebank antichain retrieval policy is missing")
+
+
+def active_hierarchy_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    tree_policy = str(payload.get("tree_policy") or "").strip()
+    if tree_policy == "certified_dual_view_otd":
+        return {
+            key: payload[key]
+            for key in ("tree_policy", "otd", "summary_budget")
+        }
+    return {
+        key: value
+        for key, value in payload.items()
+        if key != "otd"
+    }
+
+
+def active_dynamic_payload(
+    payload: dict[str, Any],
+    *,
+    tree_policy: str,
+) -> dict[str, Any]:
+    if tree_policy != "certified_dual_view_otd":
+        return dict(payload)
+    return {
+        key: payload[key]
+        for key in (
+            "initial_count",
+            "arrival_count",
+            "update_batch_size",
+            "shuffle_seed",
+            "snapshot_include_embeddings",
+            "resume_from_snapshots",
+        )
+    }
+
+
+def method_runtime_identity(args: argparse.Namespace) -> dict[str, Any]:
+    if args.tree_policy != "certified_dual_view_otd":
+        return {
+            "tree_policy": args.tree_policy,
+            "structural_graph_kind": args.graph_kind,
+            "allow_overlap": bool(args.allow_overlap),
+            "allow_multi_parent": bool(args.allow_multi_parent),
+        }
+    dynamic = args.tree_scenario == "dynamic_update"
+    return {
+        "tree_policy": "certified_dual_view_otd",
+        "structural_graph_kind": "single_parent_binary_tree",
+        "allow_overlap": False,
+        "allow_multi_parent": False,
+        "arrival_update_semantics": (
+            "sequential_per_atom" if dynamic else "static_dataset_order"
+        ),
+        "parent_refresh_semantics": (
+            "changed_path_bottom_up_per_atom"
+            if dynamic
+            else "all_internal_nodes_bottom_up_after_build"
+        ),
+        "snapshot_interval": (
+            max(1, int(args.dynamic_update_batch_size))
+            if dynamic
+            else None
+        ),
+        "nodebank_scope": "complete_tree",
+        "retrieval_policy": "tree_antichain_knapsack",
+        "embedding_vector_control": (
+            "shared_content_addressed_cache_required"
+            if dynamic
+            else "content_addressed_cache_populates_control"
+        ),
+    }
 
 
 def write_experiment_stage_report(
@@ -742,17 +1312,23 @@ def render_experiment_stage_report_md(report: dict[str, Any]) -> str:
     lines.extend(["", "## Build Token Pressure", ""])
     prompt_stats = report.get("prompt_token_stats", {})
     lines.append(f"- Prompt token report: `{prompt_stats.get('path')}`")
-    lines.append(f"- Max observed prompt tokens: `{prompt_stats.get('max_prompt_tokens_observed', 0)}` / configured `{prompt_stats.get('configured_max_prompt_tokens', 0)}`")
-    lines.append(f"- Near configured limit count: `{prompt_stats.get('near_configured_limit_count', 0)}`; over budget count: `{prompt_stats.get('over_budget_count', 0)}`")
-    for event in prompt_stats.get("top_events", [])[:5]:
-        lines.append(
-            f"- Top prompt `{event.get('community_id')}` level={event.get('level')} members={event.get('member_count')} tokens={event.get('prompt_tokens')}/{event.get('max_prompt_tokens')}"
-        )
+    if not prompt_stats.get("exists"):
+        lines.append("- Artifact status: unavailable; this report was not produced for the run.")
+    else:
+        lines.append(f"- Max observed prompt tokens: `{prompt_stats.get('max_prompt_tokens_observed', 0)}` / configured `{prompt_stats.get('configured_max_prompt_tokens', 0)}`")
+        lines.append(f"- Near configured limit count: `{prompt_stats.get('near_configured_limit_count', 0)}`; over budget count: `{prompt_stats.get('over_budget_count', 0)}`")
+        for event in prompt_stats.get("top_events", [])[:5]:
+            lines.append(
+                f"- Top prompt `{event.get('community_id')}` level={event.get('level')} members={event.get('member_count')} tokens={event.get('prompt_tokens')}/{event.get('max_prompt_tokens')}"
+            )
     chunk_stats = report.get("chunked_embedding_stats", {})
     lines.extend(["", "## Chunked Embedding", ""])
     lines.append(f"- Chunk report: `{chunk_stats.get('path')}`")
-    lines.append(f"- chunk_tokens=`{chunk_stats.get('chunk_tokens')}`, overlap_tokens=`{chunk_stats.get('overlap_tokens')}`, pooling=`{chunk_stats.get('pooling')}`")
-    lines.append(f"- max_token_count=`{chunk_stats.get('max_token_count')}`, over_limit_chunk_count=`{chunk_stats.get('over_limit_chunk_count')}`")
+    if not chunk_stats.get("exists"):
+        lines.append("- Artifact status: unavailable; this report was not produced for the run.")
+    else:
+        lines.append(f"- chunk_tokens=`{chunk_stats.get('chunk_tokens')}`, overlap_tokens=`{chunk_stats.get('overlap_tokens')}`, pooling=`{chunk_stats.get('pooling')}`")
+        lines.append(f"- max_token_count=`{chunk_stats.get('max_token_count')}`, over_limit_chunk_count=`{chunk_stats.get('over_limit_chunk_count')}`")
     lines.extend(["", "## Runtime Dead-Corner Findings", ""])
     findings = report.get("runtime_dead_corner_findings", [])
     if not findings:
@@ -768,22 +1344,95 @@ def write_split_manifest(data_path: Path, run_dir: Path, *, train_start: int, tr
     rows = json.loads(dataset_path.read_text(encoding="utf-8"))
     if not isinstance(rows, list):
         rows = rows.get("results") or rows.get("data") or rows.get("instances") or []
+    dataset_size = len(rows)
+    if not 0 <= train_start < train_end <= heldout_start < heldout_end:
+        raise ValueError(
+            "train and heldout ranges must be ordered, non-empty, and "
+            "non-overlapping"
+        )
+    if heldout_end > dataset_size:
+        raise ValueError(
+            f"heldout_end={heldout_end} exceeds dataset size {dataset_size}"
+        )
+
     def subset(start: int, end: int) -> list[dict]:
         out = []
         for index, row in enumerate(rows[start:end], start=start):
             out.append({"index": index, "id": str(row.get("id", row.get("task_id", index))), "instruction_type": row.get("instruction_type", ""), "answer_position": row.get("answer_position", "")})
         return out
+
+    train = subset(train_start, train_end)
+    heldout = subset(heldout_start, heldout_end)
+    if len(train) != train_end - train_start:
+        raise ValueError("train slice count does not match the requested range")
+    if len(heldout) != heldout_end - heldout_start:
+        raise ValueError("heldout slice count does not match the requested range")
+    overlap = {row["id"] for row in train} & {row["id"] for row in heldout}
+    if overlap:
+        raise ValueError(
+            "train and heldout task IDs must be disjoint; overlap="
+            f"{sorted(overlap)[:10]}"
+        )
     manifest = {
         "source_dataset_json": str(dataset_path.resolve()),
         "policy": "Trace2Skill dataset order / natural task id order; runner still uses start/end indices",
+        "dataset_size": dataset_size,
         "train_range": [train_start, train_end],
         "heldout_range": [heldout_start, heldout_end],
-        "train": subset(train_start, train_end),
-        "heldout": subset(heldout_start, heldout_end),
+        "train_expected_count": train_end - train_start,
+        "heldout_expected_count": heldout_end - heldout_start,
+        "train": train,
+        "heldout": heldout,
     }
     path = run_dir / "split_manifest.json"
     path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return manifest
+
+
+def validate_heldout_eval_coverage(
+    eval_path: Path,
+    split_manifest: dict[str, Any],
+) -> None:
+    payload = json.loads(eval_path.read_text(encoding="utf-8"))
+    expected_ids = [
+        str(row["id"])
+        for row in split_manifest["heldout"]
+    ]
+    expected_count = int(
+        split_manifest.get("heldout_expected_count", len(expected_ids))
+    )
+    actual_count = int(payload.get("summary", {}).get("total_instances", -1))
+    if actual_count != expected_count:
+        raise RuntimeError(
+            "heldout evaluator denominator mismatch: "
+            f"expected={expected_count}, actual={actual_count}"
+        )
+    actual_ids = [
+        str(row.get("id", ""))
+        for row in payload.get("results", [])
+    ]
+    if actual_ids != expected_ids:
+        raise RuntimeError(
+            "heldout evaluator identity/order mismatch: "
+            f"expected={expected_ids[:10]}, actual={actual_ids[:10]}"
+        )
+
+
+def validate_evaluation_runtime_identity(
+    eval_path: Path,
+    expected_identity: Mapping[str, Any],
+) -> None:
+    payload = json.loads(eval_path.read_text(encoding="utf-8"))
+    summary = dict(payload.get("summary", {}))
+    actual_identity = {
+        "workbook_comparator": summary.get("workbook_comparator"),
+        "libreoffice": summary.get("libreoffice"),
+    }
+    if actual_identity != dict(expected_identity):
+        raise RuntimeError(
+            "evaluator runtime identity changed after preflight: "
+            f"expected={dict(expected_identity)}, actual={actual_identity}"
+        )
 
 
 def main() -> None:
@@ -813,23 +1462,90 @@ def main() -> None:
     parser.add_argument("--tree-scenario", choices=["dynamic_update", "static_build"], default="dynamic_update", help="DynaMix build mode before heldout; default is the train200 60/40 dynamic protocol")
     parser.add_argument("--random-seed", type=int, default=42)
     parser.add_argument("--tree-policy", default="projected_gmm_bic")
+    parser.add_argument("--otd-dual-view-lambda", type=float, default=0.5)
+    parser.add_argument("--otd-tie-epsilon", type=float, default=0.0)
+    parser.add_argument("--otd-atom-temperature", type=float, default=0.0)
+    parser.add_argument("--otd-parent-temperature", type=float, default=0.0)
+    parser.add_argument("--otd-atom-cache-path", default=None, help="Frozen experience_atoms.json used to compare static and dynamic OTD builds")
+    parser.add_argument("--otd-retrieval-token-budget", type=int, default=24000)
+    parser.add_argument("--otd-retrieval-token-unit", type=int, default=128)
+    parser.add_argument(
+        "--otd-retrieval-exact-search-max-states",
+        type=int,
+        default=250_000,
+        help=(
+            "Fail-closed work bound used only when exact non-additive "
+            "antichain retrieval cannot use its unique-optimum fast path."
+        ),
+    )
     parser.add_argument("--graph-kind", default="overlapping_experience_hierarchy")
     parser.add_argument("--allow-overlap", type=parse_bool, default=True)
     parser.add_argument("--allow-multi-parent", type=parse_bool, default=True)
     parser.add_argument("--use-support-mass", type=parse_bool, default=True)
     parser.add_argument("--dynamic-initial-count", type=int, default=120, help="Dynamic mode: number of initial train records used for the static seed tree")
     parser.add_argument("--dynamic-arrival-count", type=int, default=80, help="Dynamic mode: number of later train records inserted sequentially; <=0 consumes all remaining train records")
-    parser.add_argument("--dynamic-update-batch-size", type=int, default=8, help="Dynamic mode: admit this many arrival trajectories sequentially, then run layer-local LLM summaries concurrently")
-    parser.add_argument("--dynamic-shuffle-seed", type=int, default=42, help="Dynamic mode: reproducibly shuffle arrival trajectories before batched admission; use -1 to disable shuffle")
-    parser.add_argument("--dynamic-snapshot-include-embeddings", type=parse_bool, default=True, help="Dynamic mode: include item embeddings in per-batch snapshots so resume can continue routing")
-    parser.add_argument("--dynamic-resume-from-snapshots", type=parse_bool, default=False, help="Dynamic mode: resume from latest dynamic_snapshots/batch_* snapshot when present; default false until fingerprint validation is enabled")
+    parser.add_argument(
+        "--dynamic-update-batch-size",
+        type=int,
+        default=8,
+        help=(
+            "Legacy dynamic policies: sequential admissions per layer-local "
+            "summary batch. certified_dual_view_otd: snapshot interval only; "
+            "every atom is inserted and its changed parent path refreshed "
+            "before the next arrival."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-shuffle-seed",
+        type=int,
+        default=42,
+        help=(
+            "Legacy dynamic policies: reproducible arrival shuffle; -1 "
+            "disables it. certified_dual_view_otd rejects shuffle and "
+            "therefore requires -1."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-snapshot-include-embeddings",
+        type=parse_bool,
+        default=True,
+        help=(
+            "Legacy dynamic snapshot embedding control. "
+            "certified_dual_view_otd snapshots its complete immutable atom "
+            "state and requires this to remain true."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-resume-from-snapshots",
+        type=parse_bool,
+        default=False,
+        help=(
+            "Legacy dynamic snapshot resume control. "
+            "certified_dual_view_otd rejects snapshot resume until a "
+            "validated resume protocol is implemented."
+        ),
+    )
     parser.add_argument("--max-levels", type=int, default=8)
     parser.add_argument("--skill-output-dir-name", default="skills")
     parser.add_argument("--skill-export-min-level", type=int, default=-1, help="-1 exports all lower levels; 1 exports L1+")
     parser.add_argument("--skill-export-max-level", type=int, default=-1, help="-1 exports all upper levels; 1 exports L1 only")
     parser.add_argument("--rollout-temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--evaluator-backend",
+        choices=["official", "local"],
+        default="local",
+        help=(
+            "Explicit SpreadsheetBench workbook comparator. The experiment "
+            "runner never uses environment-dependent auto discovery."
+        ),
+    )
     parser.add_argument("--rollout-client-timeout-seconds", type=float, default=600.0)
     parser.add_argument("--rollout-client-retry-wait-seconds", type=parse_float_csv, default=[5.0, 10.0, 30.0])
+    parser.add_argument(
+        "--rollout-disable-response-cache",
+        type=parse_bool,
+        default=False,
+    )
     parser.add_argument("--rollout-llm-client", default="openai")
     parser.add_argument("--rollout-num-random-seeds", type=int, default=1)
     parser.add_argument("--rollout-seeds", default="")
@@ -848,6 +1564,14 @@ def main() -> None:
     parser.add_argument("--embedding-truncation-strategy", default="head")
     parser.add_argument("--embedding-batch-size", type=int, default=8)
     parser.add_argument("--embedding-max-concurrency", type=int, default=8, help="Embedding API concurrency")
+    parser.add_argument(
+        "--embedding-cache-path",
+        default="",
+        help=(
+            "Content-addressed embedding vector cache. Controlled CDOST "
+            "dynamic runs must reuse the matching static run cache."
+        ),
+    )
     parser.add_argument("--embedding-tokenizer-required", type=parse_bool, default=True)
     parser.add_argument("--chunked-embedding-enabled", type=parse_bool, default=True)
     parser.add_argument("--chunked-embedding-chunk-tokens", type=int, default=8000)
@@ -924,12 +1648,60 @@ def main() -> None:
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
-    if args.dynamic_update_mode != "budget_constrained_online_gmm":
-        parser.error("--dynamic-update-mode is currently fixed to budget_constrained_online_gmm; this is not a tunable protocol knob")
-    if not bool(args.dynamic_update_routing_model):
-        parser.error("--dynamic-update-routing-model is fixed to true for budget_constrained_online_gmm")
-    if not bool(args.budget_refinement_skip_oversize_singleton):
-        parser.error("--budget-refinement-skip-oversize-singleton is currently fixed to true; false is not implemented")
+    if (
+        args.tree_policy == "certified_dual_view_otd"
+        and int(args.dynamic_shuffle_seed) >= 0
+    ):
+        parser.error(
+            "certified_dual_view_otd paired runs require dataset order; "
+            "pass --dynamic-shuffle-seed -1"
+        )
+    if (
+        args.tree_policy == "certified_dual_view_otd"
+        and args.tree_scenario == "dynamic_update"
+        and not str(args.otd_atom_cache_path or "").strip()
+    ):
+        parser.error(
+            "controlled certified_dual_view_otd dynamic runs require "
+            "--otd-atom-cache-path from the matching static extraction"
+        )
+    if (
+        args.tree_policy == "certified_dual_view_otd"
+        and bool(args.dynamic_resume_from_snapshots)
+    ):
+        parser.error(
+            "certified_dual_view_otd snapshot resume is not implemented with "
+            "fingerprint validation; pass --dynamic-resume-from-snapshots false"
+        )
+    if (
+        args.tree_policy == "certified_dual_view_otd"
+        and not bool(args.dynamic_snapshot_include_embeddings)
+    ):
+        parser.error(
+            "certified_dual_view_otd requires "
+            "--dynamic-snapshot-include-embeddings true"
+        )
+    if args.tree_policy == "certified_dual_view_otd":
+        if int(args.max_levels) != 8:
+            parser.error(
+                "certified_dual_view_otd builds the complete binary tree; "
+                "--max-levels is inactive and must remain 8"
+            )
+        if (
+            int(args.skill_export_min_level) >= 0
+            or int(args.skill_export_max_level) >= 0
+        ):
+            parser.error(
+                "certified_dual_view_otd antichain retrieval requires the "
+                "complete tree; skill-export level filters are not allowed"
+            )
+    if args.tree_policy != "certified_dual_view_otd":
+        if args.dynamic_update_mode != "budget_constrained_online_gmm":
+            parser.error("--dynamic-update-mode is currently fixed to budget_constrained_online_gmm; this is not a tunable protocol knob")
+        if not bool(args.dynamic_update_routing_model):
+            parser.error("--dynamic-update-routing-model is fixed to true for budget_constrained_online_gmm")
+        if not bool(args.budget_refinement_skip_oversize_singleton):
+            parser.error("--budget-refinement-skip-oversize-singleton is currently fixed to true; false is not implemented")
     if args.rollout_llm_client != "openai":
         parser.error("--rollout-llm-client is fixed to openai for this handoff protocol")
     if int(args.rollout_num_random_seeds) != 1:
@@ -938,8 +1710,6 @@ def main() -> None:
         parser.error("--rollout-seeds must be empty for this handoff protocol")
     if str(args.rollout_instance_ids).strip():
         parser.error("--rollout-instance-ids must be empty for this handoff protocol")
-    if bool(args.rollout_missing_only):
-        parser.error("--rollout-missing-only is fixed to false for this handoff protocol")
     if int(args.rollout_repeat) != 1:
         parser.error("--rollout-repeat is fixed to 1 for this handoff protocol")
     if str(args.rollout_shuffle_seed).strip():
@@ -978,6 +1748,13 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     train_artifact_dir.mkdir(parents=True, exist_ok=True)
     scenario_dir.mkdir(parents=True, exist_ok=True)
+    embedding_cache_path = resolve_embedding_cache_path(
+        explicit_path=args.embedding_cache_path,
+        scenario_dir=scenario_dir,
+        tree_policy=args.tree_policy,
+        tree_scenario=args.tree_scenario,
+        atom_cache_path=args.otd_atom_cache_path,
+    )
     train_stage_logs = train_artifact_dir / "logs"
     train_markers = train_artifact_dir / "stage_markers"
     logs = scenario_dir / "logs"
@@ -1001,6 +1778,10 @@ def main() -> None:
     split_manifest = write_split_manifest(Path(args.data_path), scenario_dir, train_start=args.train_start, train_end=args.train_end, heldout_start=args.heldout_start, heldout_end=args.heldout_end)
     dataset_fp = path_fingerprint(dataset_json_path(args.data_path))
     source_fp = stage_source_fingerprints(repo)
+    evaluator_identity = evaluation_runtime_identity(
+        repo,
+        evaluator_backend=args.evaluator_backend,
+    )
 
     runtime = {
         "data_path": str(Path(args.data_path).resolve()),
@@ -1012,6 +1793,9 @@ def main() -> None:
         "embedding_base_url": args.embedding_base_url,
         "embedding_model": args.embedding_model,
         "embedding_tokenizer": args.embedding_tokenizer,
+        "embedding_vector_cache_path": str(embedding_cache_path),
+        "evaluator_backend": args.evaluator_backend,
+        "evaluator_identity": evaluator_identity,
         "train_range": [args.train_start, args.train_end],
         "heldout_range": [args.heldout_start, args.heldout_end],
         "split_manifest": str(scenario_dir / "split_manifest.json"),
@@ -1022,12 +1806,43 @@ def main() -> None:
         "trace2skill_generation_config": str(scenario_gen_config_path),
         "skillbank_top_k": int(args.skillbank_top_k),
         "tree_scenario": args.tree_scenario,
-        "dynamic_initial_count": int(args.dynamic_initial_count),
-        "dynamic_arrival_count": int(args.dynamic_arrival_count),
-        "dynamic_update_batch_size": int(args.dynamic_update_batch_size),
+        "method_identity": method_runtime_identity(args),
+        "dynamic_initial_count": (
+            int(args.dynamic_initial_count)
+            if args.tree_policy != "certified_dual_view_otd"
+            or args.tree_scenario == "dynamic_update"
+            else None
+        ),
+        "dynamic_arrival_count": (
+            int(args.dynamic_arrival_count)
+            if args.tree_policy != "certified_dual_view_otd"
+            or args.tree_scenario == "dynamic_update"
+            else None
+        ),
+        "dynamic_snapshot_interval": (
+            max(1, int(args.dynamic_update_batch_size))
+            if args.tree_policy == "certified_dual_view_otd"
+            and args.tree_scenario == "dynamic_update"
+            else None
+        ),
+        "dynamic_update_batch_size": (
+            int(args.dynamic_update_batch_size)
+            if args.tree_policy != "certified_dual_view_otd"
+            else None
+        ),
         "dynamic_shuffle_seed": None if int(args.dynamic_shuffle_seed) < 0 else int(args.dynamic_shuffle_seed),
-        "dynamic_snapshot_include_embeddings": bool(args.dynamic_snapshot_include_embeddings),
-        "dynamic_resume_from_snapshots": bool(args.dynamic_resume_from_snapshots),
+        "dynamic_snapshot_include_embeddings": (
+            bool(args.dynamic_snapshot_include_embeddings)
+            if args.tree_policy != "certified_dual_view_otd"
+            or args.tree_scenario == "dynamic_update"
+            else None
+        ),
+        "dynamic_resume_from_snapshots": (
+            bool(args.dynamic_resume_from_snapshots)
+            if args.tree_policy != "certified_dual_view_otd"
+            or args.tree_scenario == "dynamic_update"
+            else None
+        ),
         "max_levels": int(args.max_levels),
         "skill_output_dir_name": args.skill_output_dir_name,
         "skill_export_min_level": None if int(args.skill_export_min_level) < 0 else int(args.skill_export_min_level),
@@ -1036,6 +1851,9 @@ def main() -> None:
         "rollout_temperature": float(args.rollout_temperature),
         "rollout_client_timeout_seconds": float(args.rollout_client_timeout_seconds),
         "rollout_client_retry_wait_seconds": list(args.rollout_client_retry_wait_seconds),
+        "rollout_disable_response_cache": bool(
+            args.rollout_disable_response_cache
+        ),
         "rollout_llm_client": args.rollout_llm_client,
         "rollout_num_random_seeds": int(args.rollout_num_random_seeds),
         "rollout_seeds": str(args.rollout_seeds),
@@ -1065,6 +1883,7 @@ def main() -> None:
             usage_dir / "06_heldout_collect.react_usage.jsonl",
             usage_dir / "06_heldout_collect.skillbank_usage.jsonl",
         ],
+        "06b_query_vector_audit": [],
         "07_heldout_eval": [],
     }
 
@@ -1086,6 +1905,10 @@ def main() -> None:
     train_out = train_artifact_dir / "trace2skill_train_outputs"
     train_logs = train_artifact_dir / "trace2skill_train_logs"
     train_results = train_artifact_dir / "trace2skill_train_results.json"
+    train_results_jsonl = train_results.with_suffix(".jsonl")
+    train_results_ledger_manifest = train_results_jsonl.with_suffix(
+        train_results_jsonl.suffix + ".manifest.json"
+    )
     train_collect_cmd = [
         python_executable, "run_spreadsheetbench.py",
         "--data_path", args.data_path,
@@ -1107,6 +1930,10 @@ def main() -> None:
         "--log_dir", str(train_logs),
         "--log_format", "markdown",
     ]
+    if args.rollout_disable_response_cache:
+        train_collect_cmd.append("--disable_response_cache")
+    if args.rollout_missing_only:
+        train_collect_cmd.append("--missing_only")
     if not skip_train_stages:
         run_stage(
             "01_train_collect",
@@ -1115,11 +1942,27 @@ def main() -> None:
             env={**env, "REACT_AGENT_USAGE_LOG": str(usage_logs_by_stage["01_train_collect"][0])},
             log_path=train_stage_logs / "01_train_collect.log",
             marker_dir=train_markers,
-            outputs=[train_results],
+            outputs=[
+                train_results,
+                train_results_jsonl,
+                train_results_ledger_manifest,
+                train_out,
+                train_logs,
+            ],
             resume=args.resume,
-            clear_outputs_before_run=list(usage_logs_by_stage["01_train_collect"]),
+            clear_outputs_before_run=[
+                train_results,
+                train_results_jsonl,
+                train_results_ledger_manifest,
+                train_out,
+                train_logs,
+                *usage_logs_by_stage["01_train_collect"],
+            ],
+            preserve_partial_outputs_on_resume=bool(
+                args.rollout_missing_only
+            ),
             fingerprint=stage_fingerprint(
-                "01_train_collect:v2",
+                "01_train_collect:v3",
                 train_collect_cmd,
                 dataset=dataset_fp,
                 rollout_protocol=rollout_protocol(args, generation_config=train_gen_config_path),
@@ -1132,16 +1975,18 @@ def main() -> None:
                 split=[args.train_start, args.train_end],
             ),
         )
-
     train_eval = train_artifact_dir / "trace2skill_train_eval.json"
-    train_eval_cmd = [
-        python_executable, "evaluate_with_official.py",
-        "--data_path", args.data_path,
-        "--output_dir", str(train_out),
-        "--start_idx", str(args.train_start),
-        "--end_idx", str(args.train_end),
-        "--results_file", str(train_eval),
-    ]
+    train_recalc_dir = train_artifact_dir / "trace2skill_train_recalculated_outputs"
+    train_eval_cmd = build_evaluation_command(
+        python_executable=python_executable,
+        data_path=args.data_path,
+        output_dir=train_out,
+        recalc_dir=train_recalc_dir,
+        start_idx=args.train_start,
+        end_idx=args.train_end,
+        results_file=train_eval,
+        evaluator_backend=args.evaluator_backend,
+    )
     if not skip_train_stages:
         run_stage(
             "02_train_eval",
@@ -1152,11 +1997,13 @@ def main() -> None:
             marker_dir=train_markers,
             outputs=[train_eval],
             resume=args.resume,
+            clear_outputs_before_run=[train_eval, train_recalc_dir],
             fingerprint=stage_fingerprint(
                 "02_train_eval:v2",
                 train_eval_cmd,
                 dataset=dataset_fp,
                 train_outputs=path_fingerprint(train_out),
+                evaluator_identity=evaluator_identity,
                 source={
                     "runner": source_fp["runner"],
                     "evaluate_with_official": source_fp["evaluate_with_official"],
@@ -1164,6 +2011,10 @@ def main() -> None:
                 },
                 split=[args.train_start, args.train_end],
             ),
+        )
+        validate_evaluation_runtime_identity(
+            train_eval,
+            evaluator_identity,
         )
 
     extract_records_cmd = [
@@ -1249,7 +2100,12 @@ def main() -> None:
             "truncation_strategy": args.embedding_truncation_strategy,
             "batch_size": int(args.embedding_batch_size),
             "max_concurrency": int(args.embedding_max_concurrency or args.workers),
-            "cache_path": str(scenario_dir / "cache" / "embedding_cache.sqlite"),
+            "cache_path": str(embedding_cache_path),
+            "cache_write_policy": (
+                "first_write_wins"
+                if args.tree_policy == "certified_dual_view_otd"
+                else "replace"
+            ),
         },
         "chunked_embedding": {
             "enabled": bool(args.chunked_embedding_enabled),
@@ -1260,8 +2116,21 @@ def main() -> None:
             "normalize_after_pooling": bool(args.chunked_embedding_normalize_after_pooling),
             "fail_if_chunk_exceeds_model_limit": bool(args.chunked_embedding_fail_if_chunk_exceeds_model_limit),
         },
-        "hierarchy": {
+        "hierarchy": active_hierarchy_payload({
             "tree_policy": args.tree_policy,
+            "otd": {
+                "dual_view_lambda": float(args.otd_dual_view_lambda),
+                "tie_epsilon": float(args.otd_tie_epsilon),
+                "atom_temperature": float(args.otd_atom_temperature),
+                "parent_temperature": float(args.otd_parent_temperature),
+                "atom_cache_path": args.otd_atom_cache_path,
+                "retrieval_token_budget": int(args.otd_retrieval_token_budget),
+                "retrieval_token_unit": int(args.otd_retrieval_token_unit),
+                "retrieval_exact_search_max_states": int(
+                    args.otd_retrieval_exact_search_max_states
+                ),
+                "validation_mode": "structural_only",
+            },
             "graph_kind": args.graph_kind,
             "allow_overlap": bool(args.allow_overlap),
             "allow_multi_parent": bool(args.allow_multi_parent),
@@ -1328,8 +2197,8 @@ def main() -> None:
                 "clear_stale_after_propagation": bool(args.dynamic_clear_stale_after_propagation),
                 "confidence_metadata_key": args.dynamic_confidence_metadata_key,
             },
-        },
-        "dynamic": {
+        }),
+        "dynamic": active_dynamic_payload({
             "initial_count": int(args.dynamic_initial_count),
             "arrival_count": int(args.dynamic_arrival_count),
             "update_batch_size": int(args.dynamic_update_batch_size),
@@ -1337,7 +2206,7 @@ def main() -> None:
             "snapshot_include_embeddings": bool(args.dynamic_snapshot_include_embeddings),
             "resume_from_snapshots": bool(args.dynamic_resume_from_snapshots),
             "max_propagation_rounds": int(args.dynamic_max_propagation_rounds),
-        },
+        }, tree_policy=args.tree_policy),
         "analyst": {
             "prompt_style": args.analyst_prompt_style,
             "confidence_floor": float(args.analyst_confidence_floor),
@@ -1366,6 +2235,49 @@ def main() -> None:
     }
     config_path = scenario_dir / "dynamix_config.json"
     config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    cdost_control_manifest_path = (
+        scenario_dir / "analysis" / "cdost_control_manifest.json"
+    )
+    source_cdost_control_manifest: Path | None = None
+    if args.tree_policy == "certified_dual_view_otd":
+        contract = cdost_control_contract(
+            args=args,
+            config=config,
+            records_path=records,
+            dataset_fingerprint=dataset_fp,
+            generation_config_path=scenario_gen_config_path,
+            evaluator_identity=evaluator_identity,
+            source_fingerprints=source_fp,
+        )
+        write_cdost_control_manifest(
+            cdost_control_manifest_path,
+            contract,
+        )
+        if args.tree_scenario == "dynamic_update":
+            atom_cache_for_control = resolved_optional_path(
+                args.otd_atom_cache_path
+            )
+            if atom_cache_for_control is None:
+                raise ValueError(
+                    "dynamic CDOST requires a source atom cache"
+                )
+            source_cdost_control_manifest = (
+                atom_cache_for_control.parent.parent
+                / "analysis"
+                / "cdost_control_manifest.json"
+            )
+            validate_source_build_output(
+                marker_path=(
+                    atom_cache_for_control.parent.parent
+                    / "stage_markers"
+                    / "04_build_tree.done"
+                ),
+                output_path=source_cdost_control_manifest,
+            )
+            validate_matching_cdost_control_manifest(
+                current_manifest=cdost_control_manifest_path,
+                source_manifest=source_cdost_control_manifest,
+            )
     if reuse_tree_dir is not None:
         if tree_dir.resolve() == reuse_tree_dir.resolve():
             raise RuntimeError("--reuse-tree-dir cannot be the same as this run's output dynamix_tree dir")
@@ -1405,11 +2317,37 @@ def main() -> None:
             "dynamix_trace2skill": source_fp["dynamix_trace2skill"],
         }
         reuse_tree_fingerprint = {"exists": False}
+    atom_cache_path = resolved_optional_path(args.otd_atom_cache_path)
+    source_vector_cache_manifest = (
+        atom_cache_path.parent / "embedding_vector_cache_manifest.json"
+        if atom_cache_path is not None
+        else None
+    )
     build_tree_fingerprint = {
         "stage_contract": build_tree_contract,
         "cmd": build_tree_cmd,
         "config_sha256": file_sha256(config_path),
         "records_sha256": file_sha256(records),
+        "atom_cache": (
+            path_fingerprint(atom_cache_path)
+            if atom_cache_path is not None
+            else {"exists": False}
+        ),
+        "source_embedding_vector_cache_manifest": (
+            path_fingerprint(source_vector_cache_manifest)
+            if source_vector_cache_manifest is not None
+            else {"exists": False}
+        ),
+        "cdost_control_manifest": (
+            path_fingerprint(cdost_control_manifest_path)
+            if args.tree_policy == "certified_dual_view_otd"
+            else {"exists": False}
+        ),
+        "source_cdost_control_manifest": (
+            path_fingerprint(source_cdost_control_manifest)
+            if source_cdost_control_manifest is not None
+            else {"exists": False}
+        ),
         "openai_api_key": api_key_fingerprint(args.openai_api_key),
         "tree_scenario": args.tree_scenario,
         "reuse_tree_dir": str(reuse_tree_dir) if reuse_tree_dir is not None else "",
@@ -1422,6 +2360,27 @@ def main() -> None:
         "DYNAMIX_EMBEDDING_USAGE_LOG": str(usage_logs_by_stage["04_build_tree"][1]),
         "DYNAMIX_SKILLBANK_USAGE_LOG": str(usage_logs_by_stage["04_build_tree"][2]),
     }
+    build_outputs = [
+        tree_dir / "summary.json",
+        tree_dir / args.skill_output_dir_name / "node_bank_manifest.json",
+        tree_dir / args.skill_output_dir_name / ".dynamix_skillbank_index.json",
+    ]
+    if args.tree_policy == "certified_dual_view_otd":
+        build_outputs.extend(
+            [
+                tree_dir / "experience_atoms.json",
+                tree_dir / "otd_tree_state.json",
+                tree_dir / "otd_tree_structure.json",
+                tree_dir / "otd_insertions.jsonl",
+                tree_dir / "otd_parent_updates.jsonl",
+                tree_dir / "otd_structural_diagnostics.json",
+                tree_dir / "otd_observed_beta_separation.json",
+                tree_dir / "analysis" / "runtime_config.json",
+                tree_dir / "analysis" / "run_manifest.json",
+                tree_dir / "embedding_vector_cache_manifest.json",
+                cdost_control_manifest_path,
+            ]
+        )
     run_stage(
         "04_build_tree",
         build_tree_cmd,
@@ -1429,15 +2388,26 @@ def main() -> None:
         env=build_tree_usage_env,
         log_path=logs / "04_build_tree.log",
         marker_dir=markers,
-        outputs=[tree_dir / "summary.json"],
+        outputs=build_outputs,
         resume=args.resume,
-        clear_outputs_before_run=list(usage_logs_by_stage["04_build_tree"]),
+        clear_outputs_before_run=[
+            tree_dir,
+            *usage_logs_by_stage["04_build_tree"],
+        ],
         fingerprint=build_tree_fingerprint,
     )
+    if args.tree_policy == "certified_dual_view_otd":
+        validate_cdost_vector_cache(
+            cache_path=embedding_cache_path,
+            manifest_path=(
+                tree_dir / "embedding_vector_cache_manifest.json"
+            ),
+        )
 
     summary = json.loads((tree_dir / "summary.json").read_text(encoding="utf-8"))
     validate_tree_summary_for_heldout(summary, args)
     manifest = json.loads(Path(summary["node_bank_manifest"]).read_text(encoding="utf-8"))
+    validate_nodebank_manifest_for_heldout(manifest, args)
     if int(manifest.get("node_count", 0)) <= 0:
         raise RuntimeError("DynaMix produced no retrievable nodebank nodes")
     skillbank_root = Path(manifest.get("output_dir") or Path(summary["node_bank_manifest"]).parent)
@@ -1449,17 +2419,93 @@ def main() -> None:
     env["DYNAMIX_SKILLBANK_EMBED_BASE_URL"] = args.embedding_base_url
     env["DYNAMIX_SKILLBANK_EMBED_MODEL"] = args.embedding_model
     env["DYNAMIX_SKILLBANK_EMBED_API_KEY"] = "EMPTY"
+    env["DYNAMIX_SKILLBANK_EMBED_MAX_MODEL_LEN"] = str(
+        int(args.embedding_max_model_len)
+    )
+    env["DYNAMIX_SKILLBANK_EMBED_MAX_INPUT_TOKENS"] = str(
+        int(args.embedding_max_input_tokens)
+    )
+    env["DYNAMIX_SKILLBANK_EMBED_BATCH_SIZE"] = str(
+        int(args.embedding_batch_size)
+    )
+    env["DYNAMIX_SKILLBANK_EMBED_TOKENIZER"] = str(
+        args.embedding_tokenizer or ""
+    )
+    env["DYNAMIX_SKILLBANK_CHUNK_TOKENS"] = (
+        ""
+        if args.tree_policy == "certified_dual_view_otd"
+        or not args.chunked_embedding_enabled
+        else str(args.chunked_embedding_chunk_tokens)
+    )
+    env["DYNAMIX_SKILLBANK_CHUNK_OVERLAP_TOKENS"] = (
+        ""
+        if args.tree_policy == "certified_dual_view_otd"
+        or not args.chunked_embedding_enabled
+        else str(args.chunked_embedding_overlap_tokens)
+    )
+    env["DYNAMIX_SKILLBANK_REQUIRE_CACHE_MATCH"] = (
+        "true"
+        if args.tree_policy == "certified_dual_view_otd"
+        else "false"
+    )
+    if args.tree_policy == "certified_dual_view_otd":
+        env["DYNAMIX_SKILLBANK_EXPECT_TREE_POLICY"] = args.tree_policy
     skillbank_cache_path = Path(summary.get("skillbank_index") or (skillbank_root / ".dynamix_skillbank_index.json"))
     if not skillbank_cache_path.is_file():
         raise RuntimeError(f"DynaMix skillbank index missing before heldout: {skillbank_cache_path}")
     env["DYNAMIX_SKILLBANK_CACHE_PATH"] = str(skillbank_cache_path)
+    if args.tree_policy == "certified_dual_view_otd":
+        env["DYNAMIX_SKILLBANK_VECTOR_CACHE_PATH"] = str(
+            embedding_cache_path
+        )
+    else:
+        env.pop("DYNAMIX_SKILLBANK_VECTOR_CACHE_PATH", None)
+    env["DYNAMIX_SKILLBANK_REQUIRE_VECTOR_CACHE_MATCH"] = (
+        "true"
+        if args.tree_policy == "certified_dual_view_otd"
+        and args.tree_scenario == "dynamic_update"
+        else "false"
+    )
     selection_log = scenario_dir / "raw" / "skill_selection_records.jsonl"
     selection_log.parent.mkdir(parents=True, exist_ok=True)
     env["DYNAMIX_SKILL_SELECTION_LOG"] = str(selection_log)
+    query_vector_manifest = (
+        scenario_dir
+        / "raw"
+        / "heldout_query_embedding_cache_manifest.json"
+    )
+    source_query_vector_manifest: Path | None = None
+    if (
+        args.tree_policy == "certified_dual_view_otd"
+        and args.tree_scenario == "dynamic_update"
+    ):
+        if atom_cache_path is None:
+            raise ValueError("dynamic CDOST requires a source atom cache")
+        source_query_vector_manifest = (
+            atom_cache_path.parent.parent
+            / "raw"
+            / "heldout_query_embedding_cache_manifest.json"
+        )
+        validate_source_build_output(
+            marker_path=(
+                atom_cache_path.parent.parent
+                / "stage_markers"
+                / "06b_query_vector_audit.done"
+            ),
+            output_path=source_query_vector_manifest,
+        )
+        validate_cdost_vector_cache(
+            cache_path=embedding_cache_path,
+            manifest_path=source_query_vector_manifest,
+        )
 
     heldout_out = scenario_dir / "trace2skill_heldout_outputs"
     heldout_logs = scenario_dir / "trace2skill_heldout_logs"
     heldout_results = scenario_dir / "trace2skill_heldout_results.json"
+    heldout_results_jsonl = heldout_results.with_suffix(".jsonl")
+    heldout_results_ledger_manifest = heldout_results_jsonl.with_suffix(
+        heldout_results_jsonl.suffix + ".manifest.json"
+    )
     heldout_collect_cmd = [
         python_executable, "run_spreadsheetbench.py",
         "--data_path", args.data_path,
@@ -1482,6 +2528,10 @@ def main() -> None:
         "--log_dir", str(heldout_logs),
         "--log_format", "markdown",
     ]
+    if args.rollout_disable_response_cache:
+        heldout_collect_cmd.append("--disable_response_cache")
+    if args.rollout_missing_only:
+        heldout_collect_cmd.append("--missing_only")
     run_stage(
         "06_heldout_collect",
         heldout_collect_cmd,
@@ -1493,19 +2543,50 @@ def main() -> None:
         },
         log_path=logs / "06_heldout_collect.log",
         marker_dir=markers,
-        outputs=[heldout_results, selection_log],
+        outputs=[
+            heldout_results,
+            heldout_results_jsonl,
+            heldout_results_ledger_manifest,
+            selection_log,
+            heldout_out,
+            heldout_logs,
+        ],
         resume=args.resume,
-        clear_outputs_before_run=[selection_log, *usage_logs_by_stage["06_heldout_collect"]],
+        clear_outputs_before_run=[
+            heldout_results,
+            heldout_results_jsonl,
+            heldout_results_ledger_manifest,
+            selection_log,
+            heldout_out,
+            heldout_logs,
+            *usage_logs_by_stage["06_heldout_collect"],
+        ],
+        preserve_partial_outputs_on_resume=bool(
+            args.rollout_missing_only
+        ),
         fingerprint=stage_fingerprint(
-            "06_heldout_collect:v2",
+            "06_heldout_collect:v3",
             heldout_collect_cmd,
             dataset=dataset_fp,
             generation_config=path_fingerprint(scenario_gen_config_path),
             tree_summary=path_fingerprint(tree_dir / "summary.json"),
             node_bank_manifest=path_fingerprint(Path(summary["node_bank_manifest"])),
+            embedding_vector_cache_manifest=path_fingerprint(
+                tree_dir / "embedding_vector_cache_manifest.json"
+            ),
+            source_query_vector_manifest=(
+                path_fingerprint(source_query_vector_manifest)
+                if source_query_vector_manifest is not None
+                else {"exists": False}
+            ),
             skillbank_root=path_fingerprint(skillbank_root),
             rollout_protocol=rollout_protocol(args, generation_config=scenario_gen_config_path),
-            skillbank_retrieval_protocol=skillbank_retrieval_protocol(args, cache_path=skillbank_cache_path, selection_log=selection_log),
+            skillbank_retrieval_protocol=skillbank_retrieval_protocol(
+                args,
+                cache_path=skillbank_cache_path,
+                vector_cache_path=embedding_cache_path,
+                selection_log=selection_log,
+            ),
             source={
                 "runner": source_fp["runner"],
                 "run_spreadsheetbench": source_fp["run_spreadsheetbench"],
@@ -1517,15 +2598,74 @@ def main() -> None:
         ),
     )
 
+    if args.tree_policy == "certified_dual_view_otd":
+        query_audit_cmd = [
+            python_executable,
+            "scripts/audit_cdost_query_vector_cache.py",
+            "--selection-log",
+            str(selection_log),
+            "--cache-path",
+            str(embedding_cache_path),
+            "--output-path",
+            str(query_vector_manifest),
+        ]
+        if source_query_vector_manifest is not None:
+            query_audit_cmd.extend(
+                [
+                    "--reference-manifest",
+                    str(source_query_vector_manifest),
+                ]
+            )
+        run_stage(
+            "06b_query_vector_audit",
+            query_audit_cmd,
+            cwd=repo,
+            env=env,
+            log_path=logs / "06b_query_vector_audit.log",
+            marker_dir=markers,
+            outputs=[query_vector_manifest],
+            resume=args.resume,
+            clear_outputs_before_run=[query_vector_manifest],
+            fingerprint=stage_fingerprint(
+                "06b_query_vector_audit:v1",
+                query_audit_cmd,
+                selection_log=path_fingerprint(selection_log),
+                build_vector_manifest=path_fingerprint(
+                    tree_dir / "embedding_vector_cache_manifest.json"
+                ),
+                source_query_vector_manifest=(
+                    path_fingerprint(source_query_vector_manifest)
+                    if source_query_vector_manifest is not None
+                    else {"exists": False}
+                ),
+                source={
+                    "runner": source_fp["runner"],
+                    "audit_cdost_query_vector_cache": source_fp[
+                        "audit_cdost_query_vector_cache"
+                    ],
+                    "dynamix_trace2skill": source_fp[
+                        "dynamix_trace2skill"
+                    ],
+                },
+            ),
+        )
+        validate_cdost_vector_cache(
+            cache_path=embedding_cache_path,
+            manifest_path=query_vector_manifest,
+        )
+
     heldout_eval = scenario_dir / "trace2skill_heldout_eval.json"
-    heldout_eval_cmd = [
-        python_executable, "evaluate_with_official.py",
-        "--data_path", args.data_path,
-        "--output_dir", str(heldout_out),
-        "--start_idx", str(args.heldout_start),
-        "--end_idx", str(args.heldout_end),
-        "--results_file", str(heldout_eval),
-    ]
+    heldout_recalc_dir = scenario_dir / "trace2skill_heldout_recalculated_outputs"
+    heldout_eval_cmd = build_evaluation_command(
+        python_executable=python_executable,
+        data_path=args.data_path,
+        output_dir=heldout_out,
+        recalc_dir=heldout_recalc_dir,
+        start_idx=args.heldout_start,
+        end_idx=args.heldout_end,
+        results_file=heldout_eval,
+        evaluator_backend=args.evaluator_backend,
+    )
     run_stage(
         "07_heldout_eval",
         heldout_eval_cmd,
@@ -1535,12 +2675,19 @@ def main() -> None:
         marker_dir=markers,
         outputs=[heldout_eval],
         resume=args.resume,
+        clear_outputs_before_run=[heldout_eval, heldout_recalc_dir],
         fingerprint=stage_fingerprint(
             "07_heldout_eval:v2",
             heldout_eval_cmd,
             dataset=dataset_fp,
             heldout_outputs=path_fingerprint(heldout_out),
             heldout_results=path_fingerprint(heldout_results),
+            query_vector_manifest=(
+                path_fingerprint(query_vector_manifest)
+                if args.tree_policy == "certified_dual_view_otd"
+                else {"exists": False}
+            ),
+            evaluator_identity=evaluator_identity,
             source={
                 "runner": source_fp["runner"],
                 "evaluate_with_official": source_fp["evaluate_with_official"],
@@ -1548,6 +2695,11 @@ def main() -> None:
             },
             split=[args.heldout_start, args.heldout_end],
         ),
+    )
+    validate_heldout_eval_coverage(heldout_eval, split_manifest)
+    validate_evaluation_runtime_identity(
+        heldout_eval,
+        evaluator_identity,
     )
 
     final = {
@@ -1560,15 +2712,29 @@ def main() -> None:
         "skillbank_top_k": int(args.skillbank_top_k),
         "skillbank_index": str(skillbank_cache_path),
         "skill_selection_records": str(selection_log),
+        "heldout_query_embedding_cache_manifest": (
+            str(query_vector_manifest)
+            if args.tree_policy == "certified_dual_view_otd"
+            else None
+        ),
         "heldout_eval": str(heldout_eval),
     }
+    scenario_stages = ["04_build_tree", "06_heldout_collect"]
+    if args.tree_policy == "certified_dual_view_otd":
+        scenario_stages.append("06b_query_vector_audit")
+    scenario_stages.append("07_heldout_eval")
     stage_report = write_experiment_stage_report(
         run_dir=scenario_dir,
         marker_dir=markers,
         stages=(
-            ["04_build_tree", "06_heldout_collect", "07_heldout_eval"]
+            scenario_stages
             if skip_train_stages
-            else ["01_train_collect", "02_train_eval", "03_extract_records", "04_build_tree", "06_heldout_collect", "07_heldout_eval"]
+            else [
+                "01_train_collect",
+                "02_train_eval",
+                "03_extract_records",
+                *scenario_stages,
+            ]
         ),
         usage_logs_by_stage=usage_logs_by_stage,
         runtime=runtime,
@@ -1579,6 +2745,7 @@ def main() -> None:
             "03_extract_records": train_markers,
             "04_build_tree": markers,
             "06_heldout_collect": markers,
+            "06b_query_vector_audit": markers,
             "07_heldout_eval": markers,
         },
     )

@@ -298,6 +298,8 @@ class SpreadsheetBenchRunner:
         output_subdir = os.path.join(self.output_dir, instance.spreadsheet_path)
         os.makedirs(output_subdir, exist_ok=True)
         final_output_path = os.path.join(output_subdir, output_file)
+        if os.path.exists(final_output_path):
+            os.remove(final_output_path)
 
         # Create task-specific subdirectory within working_dir
         # Use instance id and input file base name to create unique subdirectory
@@ -334,6 +336,18 @@ class SpreadsheetBenchRunner:
         try:
             agent_result = self.agent.run(context)
 
+            if not bool(agent_result.get("success")):
+                return TestCaseResult(
+                    input_file=input_file,
+                    output_file=output_file,
+                    success=False,
+                    agent_answer=agent_result.get("answer", ""),
+                    turns=agent_result.get("turns", 0),
+                    error=(
+                        agent_result.get("error")
+                        or "Agent did not complete the task successfully"
+                    ),
+                )
             if os.path.exists(work_output):
                 shutil.copy(work_output, final_output_path)
                 return TestCaseResult(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
@@ -77,8 +78,15 @@ class HuggingFaceTokenizer(BaseTokenizer):
         return self.tokenizer.decode(ids, skip_special_tokens=True)
 
 
+_TOKENIZER_INIT_LOCK = threading.Lock()
+
+
 @lru_cache(maxsize=8)
-def get_tokenizer(model_or_path: str | None, *, allow_regex_fallback: bool) -> BaseTokenizer:
+def _get_tokenizer_cached(
+    model_or_path: str | None,
+    *,
+    allow_regex_fallback: bool,
+) -> BaseTokenizer:
     if model_or_path:
         try:
             return HuggingFaceTokenizer(model_or_path)
@@ -91,6 +99,18 @@ def get_tokenizer(model_or_path: str | None, *, allow_regex_fallback: bool) -> B
     if allow_regex_fallback:
         return RegexTokenizer()
     raise TokenizerUnavailable("No tokenizer configured and regex fallback is disabled")
+
+
+def get_tokenizer(
+    model_or_path: str | None,
+    *,
+    allow_regex_fallback: bool,
+) -> BaseTokenizer:
+    with _TOKENIZER_INIT_LOCK:
+        return _get_tokenizer_cached(
+            model_or_path,
+            allow_regex_fallback=allow_regex_fallback,
+        )
 
 
 def truncate_with_tokenizer(

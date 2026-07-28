@@ -776,7 +776,9 @@ def test_officeqa_vanilla_runner_enforces_expected_count(tmp_path: Path, monkeyp
         raise AssertionError("expected count mismatch to fail")
 
 
-def test_skillbank_index_refresh_uses_chunked_embedding_protocol(tmp_path: Path) -> None:
+def test_legacy_skillbank_index_refresh_records_single_vector_protocol(
+    tmp_path: Path,
+) -> None:
     bank = tmp_path / "skills"
     bank.mkdir()
     (bank / "node_bank_manifest.json").write_text(json.dumps({
@@ -795,6 +797,8 @@ def test_skillbank_index_refresh_uses_chunked_embedding_protocol(tmp_path: Path)
     cfg.embedding.max_model_len = 32000
     cfg.embedding.max_input_tokens = 32000
     cfg.embedding.batch_size = 8
+    legacy_vector_cache = tmp_path / "legacy-vectors.sqlite"
+    cfg.embedding.cache_path = str(legacy_vector_cache)
     cfg.chunked_embedding = {
         "enabled": True,
         "chunk_tokens": 28000,
@@ -805,6 +809,9 @@ def test_skillbank_index_refresh_uses_chunked_embedding_protocol(tmp_path: Path)
     assert payload["embedding_protocol"]["max_model_len"] == 32000
     assert payload["embedding_protocol"]["chunk_tokens"] == 28000
     assert payload["embedding_protocol"]["chunk_overlap_tokens"] == 1000
+    assert payload["embedding_protocol"]["input_policy"] == "legacy_single_vector"
+    assert payload["embedding_protocol"]["chunking_active"] is False
+    assert not legacy_vector_cache.exists()
 
 
 def test_mock_pipeline_records_to_items_uses_regex_tokenizer_without_hf(tmp_path: Path) -> None:

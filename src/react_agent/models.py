@@ -19,9 +19,15 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+OPENAI_SDK_MAX_RETRIES = 0
+
 
 class RequestContextLengthExceeded(RuntimeError):
     """Raised when a request exceeds the model context window."""
+
+
+class RequestRuntimeTimeout(TimeoutError):
+    """Raised when request execution times out and must not be replayed."""
 
 
 def _extract_openai_error_message(exc: Exception) -> str:
@@ -53,6 +59,32 @@ def _is_context_length_bad_request(exc: Exception) -> bool:
     )
 
 
+def _is_runtime_timeout(exc: Exception) -> bool:
+    """Recognize SDK and transport timeout errors through their exception chain."""
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, TimeoutError):
+            return True
+        if "timeout" in type(current).__name__.lower():
+            return True
+        current = current.__cause__ or current.__context__
+    return "timed out" in _extract_openai_error_message(exc).lower()
+
+
+def _raise_terminal_request_error(exc: Exception) -> None:
+    if _is_context_length_bad_request(exc):
+        raise RequestContextLengthExceeded(
+            _extract_openai_error_message(exc)
+        ) from exc
+    if _is_runtime_timeout(exc):
+        raise RequestRuntimeTimeout(
+            "runtime_invalid_timeout: "
+            + _extract_openai_error_message(exc)
+        ) from exc
+
+
 @dataclass
 class Message:
     """A single message in a conversation."""
@@ -63,14 +95,16 @@ class Message:
 @dataclass
 class ModelSettings:
     """Settings for LLM generation."""
-    temperature: float = 0.7
+    temperature: float | None = None
     max_tokens: int | None = None
     stop: list[str] = field(default_factory=list)
     extra_body: dict = field(default_factory=dict)
     
     def to_dict(self) -> dict:
-        result = {"temperature": self.temperature}
-        if self.max_tokens:
+        result = {}
+        if self.temperature is not None:
+            result["temperature"] = self.temperature
+        if self.max_tokens is not None:
             result["max_tokens"] = self.max_tokens
         if self.stop:
             result["stop"] = self.stop
@@ -283,7 +317,12 @@ class OpenAIClient(LLMClient):
         except ImportError:
             from dynamix_trace2skill.openai_compat import OpenAI, AsyncOpenAI
         
-        client_kwargs = {"api_key": self.api_key, "timeout": timeout}
+        # Keep retries in our runner-level logs instead of hidden SDK retries.
+        client_kwargs = {
+            "api_key": self.api_key,
+            "timeout": timeout,
+            "max_retries": OPENAI_SDK_MAX_RETRIES,
+        }
         if self.base_url:
             client_kwargs["base_url"] = self.base_url
         
@@ -344,20 +383,23 @@ class OpenAIClient(LLMClient):
                     **config,
                 )
             except Exception as e:
-                if _is_context_length_bad_request(e):
-                    raise RequestContextLengthExceeded(_extract_openai_error_message(e)) from e
+                _raise_terminal_request_error(e)
                 log.warning(
-                    f"Request failed: {e}. Retry #{i+1}/{len(self.retry_times)} "
+                    f"Request failed ({type(e).__name__}): {e}. "
+                    f"Retry #{i+1}/{len(self.retry_times)} "
                     f"after {wait_time} seconds."
                 )
                 time.sleep(wait_time)
         
-        # Final attempt without catch
-        return self._client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            **config,
-        )
+        try:
+            return self._client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                **config,
+            )
+        except Exception as e:
+            _raise_terminal_request_error(e)
+            raise
     
     def _get_async_client(self):
         if self._async_client is None:
@@ -380,20 +422,23 @@ class OpenAIClient(LLMClient):
                     **config,
                 )
             except Exception as e:
-                if _is_context_length_bad_request(e):
-                    raise RequestContextLengthExceeded(_extract_openai_error_message(e)) from e
+                _raise_terminal_request_error(e)
                 log.warning(
-                    f"Request failed: {e}. Retry #{i+1}/{len(self.retry_times)} "
+                    f"Request failed ({type(e).__name__}): {e}. "
+                    f"Retry #{i+1}/{len(self.retry_times)} "
                     f"after {wait_time} seconds."
                 )
                 await asyncio.sleep(wait_time)
         
-        # Final attempt without catch
-        return await self._get_async_client().chat.completions.create(
-            model=self.model,
-            messages=messages,
-            **config,
-        )
+        try:
+            return await self._get_async_client().chat.completions.create(
+                model=self.model,
+                messages=messages,
+                **config,
+            )
+        except Exception as e:
+            _raise_terminal_request_error(e)
+            raise
 
     async def aclose(self) -> None:
         """Close async client resources if initialized.
@@ -443,6 +488,7 @@ class OpenAIClient(LLMClient):
                 "generation_config": config,
                 "retry_times": self.retry_times,
                 "timeout": self.timeout,
+                "sdk_max_retries": OPENAI_SDK_MAX_RETRIES,
             },
         )
         cached = self._get_from_cache(cache_key)

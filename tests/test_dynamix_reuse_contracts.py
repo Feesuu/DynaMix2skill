@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import asyncio
+import hashlib
 import importlib.util
 import multiprocessing as mp
 import os
 import sys
+import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -15,14 +17,807 @@ from typing import Any
 import numpy as np
 import pytest
 
-from dynamix_trace2skill.clients import EmbeddingClient, EmbeddingConfig, GenerationClient, GenerationConfig
+from dynamix_trace2skill.clients import (
+    EmbeddingClient,
+    EmbeddingConfig,
+    GenerationClient,
+    GenerationConfig,
+    _SqliteEmbeddingCache,
+    api_key_fingerprint,
+    embedding_cache_namespace,
+    embedding_protocol_payload,
+    embedding_vector_sha256,
+    normalized_embedding_vector_sha256,
+    ordered_embedding_vectors,
+    validate_embedding_cache_manifest,
+    write_embedding_cache_manifest,
+)
 from dynamix_trace2skill.summary import ClusterAnalyst, ClusterAnalystConfig
 from dynamix_trace2skill.log_parser import parse_trace2skill_logs, _result_fields
-from dynamix_trace2skill.pipeline import DynaMixRunConfig, default_hierarchy_config
+from dynamix_trace2skill.pipeline import (
+    DynaMixRunConfig,
+    _write_runtime_artifacts,
+    default_hierarchy_config,
+)
 from dynamix_trace2skill.schemas import RawTrajectoryRecord, TrajectoryStep
 from dynamix_trace2skill.trace_views import render_embedding_trace
 from dynamix_core.data_structures import ExperienceCardPatch, ExperienceCommunity, ExperienceHierarchyState, ExperienceItem, ITEM_KIND_EXPERIENCE_CARD, ITEM_KIND_TRAJECTORY
 from dynamix_core.update import ExperienceHierarchyDynamicUpdater
+
+
+def test_react_model_settings_do_not_override_client_generation_defaults():
+    from react_agent.models import ModelSettings
+
+    assert "temperature" not in ModelSettings().to_dict()
+    assert ModelSettings(temperature=0.0).to_dict()["temperature"] == 0.0
+
+
+def test_react_openai_client_disables_hidden_sdk_retries(monkeypatch):
+    from react_agent.models import OPENAI_SDK_MAX_RETRIES, OpenAIClient
+
+    constructor_kwargs = {}
+    async_constructor_kwargs = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            constructor_kwargs.update(kwargs)
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs):
+            async_constructor_kwargs.update(kwargs)
+
+    fake_openai = SimpleNamespace(
+        OpenAI=FakeOpenAI,
+        AsyncOpenAI=FakeAsyncOpenAI,
+    )
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+
+    client = OpenAIClient(
+        api_key="EMPTY",
+        base_url="http://example.invalid/v1",
+        use_cache=False,
+        timeout=600.0,
+    )
+
+    assert constructor_kwargs["max_retries"] == OPENAI_SDK_MAX_RETRIES
+    assert (
+        client._async_client_kwargs["max_retries"]
+        == OPENAI_SDK_MAX_RETRIES
+    )
+    client._get_async_client()
+    assert (
+        async_constructor_kwargs["max_retries"]
+        == OPENAI_SDK_MAX_RETRIES
+    )
+
+
+def test_react_openai_client_does_not_retry_runtime_timeout(monkeypatch):
+    import react_agent.models as models
+
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            raise FakeAPITimeoutError("Request timed out.")
+
+    class FakeAPITimeoutError(Exception):
+        pass
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setitem(
+        sys.modules,
+        "openai",
+        SimpleNamespace(OpenAI=FakeOpenAI, AsyncOpenAI=FakeOpenAI),
+    )
+    monkeypatch.setattr(
+        models.time,
+        "sleep",
+        lambda _: pytest.fail("runtime timeout must not be retried"),
+    )
+    client = models.OpenAIClient(
+        api_key="EMPTY",
+        base_url="http://example.invalid/v1",
+        use_cache=False,
+    )
+
+    with pytest.raises(
+        models.RequestRuntimeTimeout,
+        match="runtime_invalid_timeout",
+    ):
+        client._send_request_with_retry(
+            [{"role": "user", "content": "test"}],
+            {},
+        )
+    assert len(calls) == 1
+
+
+def test_react_openai_client_keeps_retrying_non_timeout_errors(monkeypatch):
+    import react_agent.models as models
+
+    calls = []
+    expected = object()
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise RuntimeError("temporary connection failure")
+            return expected
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setitem(
+        sys.modules,
+        "openai",
+        SimpleNamespace(OpenAI=FakeOpenAI, AsyncOpenAI=FakeOpenAI),
+    )
+    monkeypatch.setattr(models.time, "sleep", lambda _: None)
+    client = models.OpenAIClient(
+        api_key="EMPTY",
+        base_url="http://example.invalid/v1",
+        use_cache=False,
+        retry_times=(0,),
+    )
+
+    assert client._send_request_with_retry([], {}) is expected
+    assert len(calls) == 2
+
+
+def test_react_async_openai_client_does_not_retry_runtime_timeout(
+    monkeypatch,
+):
+    import react_agent.models as models
+
+    calls = []
+
+    class FakeAPITimeoutError(Exception):
+        pass
+
+    class FakeSyncOpenAI:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakeAsyncCompletions:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            raise FakeAPITimeoutError("Request timed out.")
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=FakeAsyncCompletions())
+
+    monkeypatch.setitem(
+        sys.modules,
+        "openai",
+        SimpleNamespace(
+            OpenAI=FakeSyncOpenAI,
+            AsyncOpenAI=FakeAsyncOpenAI,
+        ),
+    )
+    client = models.OpenAIClient(
+        api_key="EMPTY",
+        base_url="http://example.invalid/v1",
+        use_cache=False,
+    )
+
+    with pytest.raises(
+        models.RequestRuntimeTimeout,
+        match="runtime_invalid_timeout",
+    ):
+        asyncio.run(client._send_request_with_retry_async([], {}))
+    assert len(calls) == 1
+
+
+def test_react_response_cache_key_tracks_sdk_retry_policy(monkeypatch):
+    import react_agent.models as models
+
+    base_protocol = {
+        "client": "openai",
+        "base_url": "http://example.invalid/v1",
+        "api_key": "EMPTY",
+        "generation_config": {"temperature": 0.0},
+        "retry_times": (5, 10, 30),
+        "timeout": 600.0,
+    }
+    old_key = models._make_cache_key(
+        "model",
+        [{"role": "user", "content": "test"}],
+        protocol=base_protocol,
+    )
+    new_key = models._make_cache_key(
+        "model",
+        [{"role": "user", "content": "test"}],
+        protocol={
+            **base_protocol,
+            "sdk_max_retries": models.OPENAI_SDK_MAX_RETRIES,
+        },
+    )
+    assert old_key != new_key
+
+    captured_protocol = {}
+
+    def capture_cache_key(model, messages, *, protocol=None):
+        captured_protocol.update(protocol or {})
+        return ("captured",)
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakeCache(dict):
+        def close(self):
+            pass
+
+    monkeypatch.setattr(models, "_make_cache_key", capture_cache_key)
+    monkeypatch.setitem(
+        sys.modules,
+        "openai",
+        SimpleNamespace(OpenAI=FakeOpenAI, AsyncOpenAI=FakeOpenAI),
+    )
+    client = models.OpenAIClient(
+        api_key="EMPTY",
+        base_url="http://example.invalid/v1",
+        use_cache=False,
+    )
+    client._cache = FakeCache(
+        {("captured",): ("cached response", "")}
+    )
+
+    assert client.chat([models.Message(role="user", content="test")]) == (
+        "cached response"
+    )
+    assert (
+        captured_protocol["sdk_max_retries"]
+        == models.OPENAI_SDK_MAX_RETRIES
+    )
+
+
+def test_spreadsheet_runner_temperature_is_written_to_client_config():
+    import run_spreadsheetbench
+
+    args = SimpleNamespace(
+        generation_config=json.dumps({"temperature": 0.7}),
+        temperature=0.2,
+        run_seed=None,
+    )
+    assert run_spreadsheetbench._build_generation_config(args)[
+        "temperature"
+    ] == pytest.approx(0.2)
+
+
+def test_spreadsheet_runner_can_disable_response_cache(monkeypatch):
+    import run_spreadsheetbench
+
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        run_spreadsheetbench,
+        "OpenAIClient",
+        FakeClient,
+    )
+    args = SimpleNamespace(
+        generation_config=None,
+        temperature=0.0,
+        run_seed=None,
+        disable_response_cache=True,
+        llm_client="openai",
+        model="model",
+        llm_retry_wait_seconds=(5.0,),
+        llm_timeout_seconds=600.0,
+    )
+
+    run_spreadsheetbench._build_client(args)
+
+    assert captured["use_cache"] is False
+
+
+def test_spreadsheet_parallel_runner_uses_shared_task_queue_and_jsonl(
+    monkeypatch,
+    tmp_path,
+):
+    import run_spreadsheetbench
+    from spreadsheet_agent.runner import InstanceResult
+
+    task_two_started = threading.Event()
+    task_zero_saw_task_two = []
+    processed = []
+    instances = [
+        SimpleNamespace(id=str(index), instruction=f"task-{index}")
+        for index in range(4)
+    ]
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            pass
+
+        def load_data(self):
+            return instances
+
+        def run_instance(self, instance):
+            processed.append(instance.id)
+            if instance.id == "0":
+                task_zero_saw_task_two.append(task_two_started.wait(1.0))
+            elif instance.id == "2":
+                task_two_started.set()
+            return InstanceResult(
+                id=instance.id,
+                instruction=instance.instruction,
+                success=True,
+            )
+
+    monkeypatch.setattr(
+        run_spreadsheetbench,
+        "SpreadsheetBenchRunner",
+        FakeRunner,
+    )
+    monkeypatch.setattr(
+        run_spreadsheetbench,
+        "create_agent",
+        lambda args: SimpleNamespace(name="fake-agent"),
+    )
+    monkeypatch.setattr(
+        run_spreadsheetbench,
+        "instance_has_outputs",
+        lambda instance, output_dir, data_path: False,
+    )
+    args = SimpleNamespace(
+        workers=2,
+        data_path=str(tmp_path),
+        output_dir=str(tmp_path / "outputs"),
+        working_dir=str(tmp_path / "work"),
+        start_idx=0,
+        end_idx=4,
+        shuffle_seed=None,
+        sample=None,
+        instance_ids=None,
+        missing_only=False,
+        results_file=str(tmp_path / "results.json"),
+        agent="cli_only",
+        skills_dir=str(tmp_path / "skills"),
+        model="fake-model",
+        llm_client="openai",
+        generation_config=None,
+        temperature=0.0,
+        max_turns=30,
+        llm_timeout_seconds=600.0,
+        llm_retry_wait_seconds=(5.0, 10.0, 30.0),
+        disable_response_cache=True,
+        repeat=1,
+        run_seed=None,
+    )
+
+    run_spreadsheetbench.run_parallel(args)
+
+    assert task_zero_saw_task_two == [True]
+    payload = json.loads(Path(args.results_file).read_text(encoding="utf-8"))
+    assert [row["id"] for row in payload["results"]] == ["0", "1", "2", "3"]
+    jsonl_path = Path(args.results_file).with_suffix(".jsonl")
+    rows = [
+        json.loads(line)
+        for line in jsonl_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert {row["id"] for row in rows} == {"0", "1", "2", "3"}
+
+    Path(args.results_file).unlink()
+    args.missing_only = True
+    run_spreadsheetbench.run_parallel(args)
+    assert len(processed) == 4
+    restored = json.loads(Path(args.results_file).read_text(encoding="utf-8"))
+    assert [row["id"] for row in restored["results"]] == ["0", "1", "2", "3"]
+    assert restored["response_cache_enabled"] is False
+    assert restored["parallel_workers"] == 2
+    assert restored["resume_only"] is True
+
+
+def test_spreadsheet_result_ledger_repairs_only_partial_tail(tmp_path):
+    import run_spreadsheetbench
+
+    results_jsonl = tmp_path / "results.jsonl"
+    valid_row = {
+        "id": "task-1",
+        "instruction": "first",
+        "success": False,
+        "error": "runtime_invalid_timeout",
+        "test_cases": [],
+    }
+    results_jsonl.write_bytes(
+        (
+            json.dumps(valid_row, sort_keys=True)
+            + "\n"
+            + '{"id":"partial'
+        ).encode("utf-8")
+    )
+    identity = {
+        "format": "spreadsheetbench_result_ledger_v1",
+        "fingerprint": "fingerprint",
+        "protocol": {"task_ids": ["task-1", "task-2"]},
+    }
+    run_spreadsheetbench._write_json_atomic(
+        run_spreadsheetbench._result_ledger_manifest_path(
+            results_jsonl
+        ),
+        identity,
+    )
+
+    rows = run_spreadsheetbench._prepare_result_ledger(
+        results_jsonl,
+        identity=identity,
+        valid_ids={"task-1", "task-2"},
+        resume=True,
+    )
+
+    assert rows == {"task-1": valid_row}
+    assert results_jsonl.read_bytes().endswith(b"\n")
+
+
+def test_spreadsheet_result_ledger_rejects_identity_and_scope_drift(
+    tmp_path,
+):
+    import run_spreadsheetbench
+
+    results_jsonl = tmp_path / "results.jsonl"
+    identity = {
+        "format": "spreadsheetbench_result_ledger_v1",
+        "fingerprint": "expected",
+        "protocol": {"task_ids": ["task-1"]},
+    }
+    run_spreadsheetbench._prepare_result_ledger(
+        results_jsonl,
+        identity=identity,
+        valid_ids={"task-1"},
+        resume=False,
+    )
+    with pytest.raises(RuntimeError, match="identity"):
+        run_spreadsheetbench._prepare_result_ledger(
+            results_jsonl,
+            identity={**identity, "fingerprint": "different"},
+            valid_ids={"task-1"},
+            resume=True,
+        )
+
+    out_of_scope_row = {
+        "id": "task-2",
+        "instruction": "stale",
+        "success": True,
+        "error": "",
+        "test_cases": [],
+    }
+    results_jsonl.write_text(
+        json.dumps(out_of_scope_row) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="out-of-scope"):
+        run_spreadsheetbench._prepare_result_ledger(
+            results_jsonl,
+            identity=identity,
+            valid_ids={"task-1"},
+            resume=True,
+        )
+
+
+def test_spreadsheet_result_ledger_publishes_manifest_after_empty_ledger(
+    tmp_path,
+    monkeypatch,
+):
+    import run_spreadsheetbench
+
+    results_jsonl = tmp_path / "results.jsonl"
+    results_jsonl.write_text('{"id":"old"}\n', encoding="utf-8")
+    identity = {
+        "format": "spreadsheetbench_result_ledger_v1",
+        "fingerprint": "new",
+        "protocol": {"task_ids": ["task-1"]},
+    }
+    original_write = run_spreadsheetbench._write_json_atomic
+
+    def assert_empty_then_publish(path, payload):
+        assert results_jsonl.read_bytes() == b""
+        original_write(path, payload)
+
+    monkeypatch.setattr(
+        run_spreadsheetbench,
+        "_write_json_atomic",
+        assert_empty_then_publish,
+    )
+
+    rows = run_spreadsheetbench._prepare_result_ledger(
+        results_jsonl,
+        identity=identity,
+        valid_ids={"task-1"},
+        resume=False,
+    )
+
+    assert rows == {}
+
+
+def test_spreadsheet_result_ledger_rejects_concurrent_process(tmp_path):
+    import run_spreadsheetbench
+
+    results_jsonl = tmp_path / "results.jsonl"
+    first_lock = run_spreadsheetbench._acquire_result_ledger_lock(
+        results_jsonl
+    )
+    try:
+        with pytest.raises(RuntimeError, match="already running"):
+            run_spreadsheetbench._acquire_result_ledger_lock(results_jsonl)
+    finally:
+        first_lock.close()
+
+
+def test_spreadsheet_runner_preserves_agent_timeout_failure(
+    tmp_path,
+    monkeypatch,
+):
+    import spreadsheet_agent.runner as runner_module
+
+    spreadsheet_dir = tmp_path / "data"
+    spreadsheet_dir.mkdir()
+    (spreadsheet_dir / "1_task_input.xlsx").write_bytes(b"input")
+    monkeypatch.setattr(
+        runner_module,
+        "get_spreadsheet_content",
+        lambda _: "preview",
+    )
+
+    class TimeoutAgent:
+        def run(self, context):
+            Path(context.output_file).write_bytes(b"partial")
+            return {
+                "success": False,
+                "answer": "",
+                "turns": 4,
+                "error": "runtime_invalid_timeout: Request timed out",
+            }
+
+    runner = runner_module.SpreadsheetBenchRunner(
+        agent=TimeoutAgent(),
+        data_path=str(tmp_path),
+        output_dir=str(tmp_path / "outputs"),
+        working_dir=str(tmp_path / "work"),
+    )
+    instance = SimpleNamespace(
+        id="task",
+        spreadsheet_path="sheet",
+        instruction="edit workbook",
+        instruction_type="Cell-Level Manipulation",
+        answer_position="A1",
+    )
+    stale_output = (
+        tmp_path
+        / "outputs"
+        / "sheet"
+        / "1_task_output.xlsx"
+    )
+    stale_output.parent.mkdir(parents=True)
+    stale_output.write_bytes(b"stale-unrecorded-output")
+
+    result = runner._run_test_case(
+        instance,
+        str(spreadsheet_dir),
+        "1_task_input.xlsx",
+    )
+
+    assert result.success is False
+    assert result.turns == 4
+    assert result.error == "runtime_invalid_timeout: Request timed out"
+    assert not stale_output.exists()
+
+
+def test_tokenizer_initialization_is_serialized(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    import dynamix_trace2skill.tokenization as tokenization
+
+    tokenization._get_tokenizer_cached.cache_clear()
+    constructor_calls = []
+
+    class FakeTokenizer:
+        def __init__(self, model_or_path):
+            constructor_calls.append(model_or_path)
+            time.sleep(0.05)
+
+    monkeypatch.setattr(tokenization, "HuggingFaceTokenizer", FakeTokenizer)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        tokenizers = list(
+            executor.map(
+                lambda _: tokenization.get_tokenizer(
+                    "test-tokenizer",
+                    allow_regex_fallback=False,
+                ),
+                range(2),
+            )
+        )
+
+    assert constructor_calls == ["test-tokenizer"]
+    assert tokenizers[0] is tokenizers[1]
+    tokenization._get_tokenizer_cached.cache_clear()
+
+
+def test_embedding_response_is_strictly_reordered_by_index():
+    rows = [
+        SimpleNamespace(index=1, embedding=[2.0]),
+        SimpleNamespace(index=0, embedding=[1.0]),
+    ]
+    assert ordered_embedding_vectors(rows, expected_count=2) == [
+        [1.0],
+        [2.0],
+    ]
+    with pytest.raises(RuntimeError, match="count"):
+        ordered_embedding_vectors(rows[:1], expected_count=2)
+    with pytest.raises(RuntimeError, match="unique range"):
+        ordered_embedding_vectors(
+            [
+                SimpleNamespace(index=0, embedding=[1.0]),
+                SimpleNamespace(index=0, embedding=[2.0]),
+            ],
+            expected_count=2,
+        )
+
+
+def test_embedding_cache_manifest_detects_required_row_mutation(
+    tmp_path,
+):
+    import sqlite3
+
+    cache_path = tmp_path / "vectors.sqlite"
+    config = EmbeddingConfig(
+        base_url="mock://deterministic",
+        cache_path=str(cache_path),
+        tokenizer_required=False,
+    )
+    client = EmbeddingClient(config)
+    vector = asyncio.run(
+        client.embed_texts(
+            ["required text"],
+            cache_namespace="manifest_test",
+        )
+    )[0]
+    client.close()
+    namespace = embedding_cache_namespace(
+        config,
+        "manifest_test",
+        model_name=config.model,
+    )
+    manifest_path = tmp_path / "manifest.json"
+    payload = write_embedding_cache_manifest(
+        cache_path=cache_path,
+        output_path=manifest_path,
+        requirements=[
+            {
+                "namespace": namespace,
+                "text": "required text",
+                "vector": vector,
+                "purpose": "test",
+                "item_id": "item-1",
+            }
+        ],
+    )
+    assert payload["entry_count"] == 1
+    validate_embedding_cache_manifest(
+        cache_path=cache_path,
+        manifest_path=manifest_path,
+    )
+
+    connection = sqlite3.connect(cache_path)
+    connection.execute(
+        "INSERT OR REPLACE INTO embeddings(namespace,key,vector) "
+        "VALUES(?,?,?)",
+        (
+            namespace,
+            hashlib.sha256(b"unrelated text").hexdigest(),
+            json.dumps([9.0]),
+        ),
+    )
+    connection.commit()
+    connection.close()
+    validate_embedding_cache_manifest(
+        cache_path=cache_path,
+        manifest_path=manifest_path,
+    )
+
+    connection = sqlite3.connect(cache_path)
+    connection.execute(
+        "UPDATE embeddings SET vector=? WHERE namespace=? AND key=?",
+        (
+            json.dumps([7.0]),
+            namespace,
+            hashlib.sha256(b"required text").hexdigest(),
+        ),
+    )
+    connection.commit()
+    connection.close()
+    with pytest.raises(RuntimeError, match="changed after certification"):
+        validate_embedding_cache_manifest(
+            cache_path=cache_path,
+            manifest_path=manifest_path,
+        )
+
+
+def test_embedding_cache_manifest_binds_actual_normalized_artifact_vector(
+    tmp_path: Path,
+) -> None:
+    cache_path = tmp_path / "vectors.sqlite"
+    raw = np.linspace(0.001, 1.0, 4096, dtype=float)
+    artifact = (
+        raw.reshape(1, -1)
+        / np.linalg.norm(raw.reshape(1, -1), axis=1, keepdims=True)
+    )[0]
+    cache = _SqliteEmbeddingCache(cache_path)
+    cache.set("node-index", "node text", raw.tolist())
+    cache.close()
+
+    payload = write_embedding_cache_manifest(
+        cache_path=cache_path,
+        output_path=tmp_path / "manifest.json",
+        requirements=[
+            {
+                "namespace": "node-index",
+                "text": "node text",
+                "normalized_vector": artifact.tolist(),
+            }
+        ],
+    )
+
+    entry = payload["entries"][0]
+    assert entry["artifact_normalized_vector_sha256"] == (
+        embedding_vector_sha256(artifact.tolist())
+    )
+    assert entry["artifact_cache_max_abs_error"] is not None
+    assert entry["artifact_cache_max_abs_error"] <= (
+        64.0 * np.finfo(float).eps
+    )
+    validate_embedding_cache_manifest(
+        cache_path=cache_path,
+        manifest_path=tmp_path / "manifest.json",
+    )
+
+
+def test_embedding_cache_manifest_uses_exact_documented_absolute_tolerance(
+    tmp_path: Path,
+) -> None:
+    cache_path = tmp_path / "vectors.sqlite"
+    cache = _SqliteEmbeddingCache(cache_path)
+    cache.set("node-index", "node text", [1.0, 0.0])
+    cache.close()
+    epsilon = np.finfo(float).eps
+
+    write_embedding_cache_manifest(
+        cache_path=cache_path,
+        output_path=tmp_path / "accepted.json",
+        requirements=[
+            {
+                "namespace": "node-index",
+                "text": "node text",
+                "normalized_vector": [1.0 + 32.0 * epsilon, 0.0],
+            }
+        ],
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="normalized embedding cache vector differs",
+    ):
+        write_embedding_cache_manifest(
+            cache_path=cache_path,
+            output_path=tmp_path / "rejected.json",
+            requirements=[
+                {
+                    "namespace": "node-index",
+                    "text": "node text",
+                    "normalized_vector": [1.0 + 100.0 * epsilon, 0.0],
+                }
+            ],
+        )
 
 
 def _load_experiment_runner_module():
@@ -32,6 +827,412 @@ def _load_experiment_runner_module():
     assert spec and spec.loader
     spec.loader.exec_module(module)
     return module
+
+
+def _load_query_cache_audit_module():
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "audit_cdost_query_vector_cache.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "audit_cdost_query_vector_cache_under_test",
+        path,
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_spreadsheet_evaluator_module():
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "evaluate_with_official.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "evaluate_with_official_under_test",
+        path,
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_official_evaluator_backend_fails_closed_when_unavailable(
+    monkeypatch,
+):
+    evaluator = _load_spreadsheet_evaluator_module()
+    monkeypatch.setattr(
+        evaluator,
+        "official_compare_workbooks",
+        None,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="evaluation_official is unavailable",
+    ):
+        evaluator._resolve_comparator("official")
+
+
+def test_evaluator_runtime_identity_binds_comparator_and_libreoffice(
+    monkeypatch,
+):
+    evaluator = _load_spreadsheet_evaluator_module()
+    monkeypatch.setattr(
+        evaluator,
+        "_preflight_libreoffice",
+        lambda timeout_seconds=30: (
+            "/usr/bin/soffice",
+            "LibreOffice test-version",
+        ),
+    )
+    identity = evaluator.evaluation_runtime_identity("local")
+    assert identity["workbook_comparator"]["resolved_backend"] == "local"
+    assert identity["workbook_comparator"]["source_sha256"]
+    assert identity["libreoffice"] == {
+        "executable": str(Path("/usr/bin/soffice").resolve()),
+        "version": "LibreOffice test-version",
+    }
+
+
+def test_cdost_control_manifest_rejects_protocol_drift(tmp_path):
+    runner = _load_experiment_runner_module()
+    source = tmp_path / "source.json"
+    current = tmp_path / "current.json"
+    runner.write_cdost_control_manifest(
+        source,
+        {"format": "cdost_control_contract_v2", "top_k": 10},
+    )
+    runner.write_cdost_control_manifest(
+        current,
+        {"format": "cdost_control_contract_v2", "top_k": 9},
+    )
+    with pytest.raises(ValueError, match="control contract differs"):
+        runner.validate_matching_cdost_control_manifest(
+            current_manifest=current,
+            source_manifest=source,
+        )
+
+
+def test_cdost_control_contract_covers_method_and_redacts_secrets(tmp_path):
+    runner = _load_experiment_runner_module()
+    records_path = tmp_path / "records.json"
+    records_path.write_text(
+        json.dumps([{"trajectory_id": str(index)} for index in range(200)]),
+        encoding="utf-8",
+    )
+    generation_config_path = tmp_path / "generation.json"
+    generation_config_path.write_text(
+        json.dumps({"temperature": 0.0}),
+        encoding="utf-8",
+    )
+    args = SimpleNamespace(
+        train_start=0,
+        train_end=200,
+        heldout_start=200,
+        heldout_end=400,
+        model="model-under-test",
+        openai_base_url="https://generation.example/v1",
+        openai_api_key="rollout-secret",
+        thinking="true",
+        max_turns=30,
+        workers=16,
+        rollout_client_timeout_seconds=1200.0,
+        rollout_client_retry_wait_seconds=[5.0, 10.0],
+        rollout_llm_client="openai",
+        rollout_num_random_seeds=1,
+        rollout_seeds="",
+        rollout_instance_ids="",
+        rollout_missing_only=False,
+        rollout_repeat=1,
+        rollout_shuffle_seed="",
+        rollout_sample=0,
+        skillbank_top_k=10,
+        embedding_base_url="https://embedding.example/v1",
+        embedding_model="embedding-model",
+        embedding_max_model_len=32000,
+        embedding_max_input_tokens=32000,
+        embedding_batch_size=8,
+        embedding_tokenizer="/models/embedding",
+        tree_policy="certified_dual_view_otd",
+        tree_scenario="static_build",
+        dynamic_initial_count=120,
+        dynamic_arrival_count=80,
+        dynamic_update_batch_size=8,
+        dynamic_shuffle_seed=-1,
+        dynamic_snapshot_include_embeddings=True,
+        dynamic_resume_from_snapshots=False,
+    )
+    config = {
+        "hierarchy": {
+            "otd": {
+                "dual_view_lambda": 0.5,
+                "tie_epsilon": 0.0,
+                "atom_cache_path": "/run/local/atoms.json",
+            }
+        },
+        "generation": {
+            "base_url": args.openai_base_url,
+            "model": args.model,
+            "api_key": "analyst-secret",
+            "temperature": 0.0,
+            "debug_dir": "/run/local/debug",
+        },
+        "embedding": {
+            "base_url": args.embedding_base_url,
+            "model": args.embedding_model,
+            "api_key": "embedding-secret",
+            "cache_path": "/run/local/cache.sqlite",
+            "max_model_len": 32000,
+        },
+        "analyst": {
+            "max_output_tokens": 4096,
+            "prompt_token_report_path": "/run/local/prompt.json",
+        },
+    }
+    source_keys = (
+        "runner",
+        "run_spreadsheetbench",
+        "evaluate_with_official",
+        "spreadsheetbench_support",
+        "spreadsheet_agent",
+        "react_agent",
+        "dynamix_core",
+        "dynamix_trace2skill",
+    )
+    contract = runner.cdost_control_contract(
+        args=args,
+        config=config,
+        records_path=records_path,
+        dataset_fingerprint={"sha256": "dataset-sha"},
+        generation_config_path=generation_config_path,
+        evaluator_identity={"libreoffice": {"version": "test"}},
+        source_fingerprints={
+            key: {"exists": True, "sha256": f"{key}-sha"}
+            for key in source_keys
+        },
+    )
+
+    encoded = json.dumps(contract, sort_keys=True)
+    for secret in (
+        "rollout-secret",
+        "analyst-secret",
+        "embedding-secret",
+    ):
+        assert secret not in encoded
+    assert contract["train_split"] == [0, 200]
+    assert contract["heldout_split"] == [200, 400]
+    assert contract["paired_dynamic_schedule"] == {
+        "initial_count": 120,
+        "arrival_count": 80,
+        "insertion_count": 80,
+        "arrival_order": "dataset",
+        "shuffle_seed": None,
+        "snapshot_interval": 8,
+        "snapshot_include_embeddings": True,
+        "resume_from_snapshots": False,
+    }
+    assert contract["tree"]["otd"]["dual_view_lambda"] == 0.5
+    assert "atom_cache_path" not in contract["tree"]["otd"]
+    assert contract["retrieval"]["top_k"] == 10
+    assert contract["rollout"]["generation_config"]["temperature"] == 0.0
+    from react_agent.models import OPENAI_SDK_MAX_RETRIES
+
+    assert (
+        contract["rollout"]["sdk_max_retries"]
+        == OPENAI_SDK_MAX_RETRIES
+    )
+    assert contract["evaluator"]["libreoffice"]["version"] == "test"
+    assert set(contract["source"]) == set(source_keys)
+    assert contract["tree"]["generation"]["api_key_fingerprint"].startswith(
+        "sha256:"
+    )
+    assert contract["tree"]["embedding"]["api_key_fingerprint"].startswith(
+        "sha256:"
+    )
+    assert contract["rollout"]["openai_api_key_fingerprint"].startswith(
+        "sha256:"
+    )
+
+
+def test_cdost_control_manifest_rejects_dynamic_schedule_drift(tmp_path):
+    runner = _load_experiment_runner_module()
+    source = tmp_path / "source.json"
+    current = tmp_path / "current.json"
+    base = {
+        "format": "cdost_control_contract_v2",
+        "paired_dynamic_schedule": {
+            "initial_count": 120,
+            "arrival_count": 80,
+            "insertion_count": 80,
+            "arrival_order": "dataset",
+            "shuffle_seed": None,
+            "snapshot_interval": 8,
+            "snapshot_include_embeddings": True,
+            "resume_from_snapshots": False,
+        },
+    }
+    changed = json.loads(json.dumps(base))
+    changed["paired_dynamic_schedule"]["snapshot_interval"] = 10
+    runner.write_cdost_control_manifest(source, base)
+    runner.write_cdost_control_manifest(current, changed)
+
+    with pytest.raises(ValueError, match="control contract differs"):
+        runner.validate_matching_cdost_control_manifest(
+            current_manifest=current,
+            source_manifest=source,
+        )
+
+
+def test_heldout_query_cache_manifest_detects_mutation_and_reference_drift(
+    tmp_path,
+):
+    import sqlite3
+
+    module = _load_query_cache_audit_module()
+    cache_path = tmp_path / "vectors.sqlite"
+    config = EmbeddingConfig(
+        base_url="mock://query-audit",
+        cache_path=str(cache_path),
+        tokenizer_required=False,
+    )
+    client = EmbeddingClient(config)
+    query = "calculate the requested total\n\nTask type: arithmetic"
+    vector = asyncio.run(
+        client.embed_texts(
+            [query],
+            cache_namespace="query_protocol",
+        )
+    )[0]
+    client.close()
+    namespace = embedding_cache_namespace(
+        config,
+        "query_protocol",
+        model_name=config.model,
+    )
+    selection_log = tmp_path / "selection.jsonl"
+    selection_log.write_text(
+        json.dumps(
+            {
+                "instance_id": "task-1",
+                "query": query,
+                "query_embedding_audit": {
+                    "namespace_sha256": namespace,
+                    "text_sha256": [
+                        hashlib.sha256(query.encode()).hexdigest()
+                    ],
+                    "vector_sha256": [
+                        hashlib.sha256(
+                            json.dumps(
+                                vector,
+                                separators=(",", ":"),
+                            ).encode()
+                        ).hexdigest()
+                    ],
+                    "scoring_vector_sha256": [
+                        normalized_embedding_vector_sha256(vector)
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    static_manifest = tmp_path / "static-query-manifest.json"
+    module.audit_query_vector_cache(
+        selection_log=selection_log,
+        cache_path=cache_path,
+        output_path=static_manifest,
+    )
+    dynamic_manifest = tmp_path / "dynamic-query-manifest.json"
+    module.audit_query_vector_cache(
+        selection_log=selection_log,
+        cache_path=cache_path,
+        output_path=dynamic_manifest,
+        reference_manifest=static_manifest,
+    )
+
+    connection = sqlite3.connect(cache_path)
+    connection.execute(
+        "UPDATE embeddings SET vector=? WHERE namespace=? AND key=?",
+        (
+            json.dumps([123.0]),
+            namespace,
+            hashlib.sha256(query.encode()).hexdigest(),
+        ),
+    )
+    connection.commit()
+    connection.close()
+    with pytest.raises(RuntimeError, match="changed after certification"):
+        validate_embedding_cache_manifest(
+            cache_path=cache_path,
+            manifest_path=static_manifest,
+        )
+
+
+def test_query_vector_manifest_is_bound_to_source_audit_marker(tmp_path):
+    runner = _load_experiment_runner_module()
+    manifest = tmp_path / "heldout_query_embedding_cache_manifest.json"
+    manifest.write_text('{"logical_sha256":"stable"}', encoding="utf-8")
+    marker = tmp_path / "06b_query_vector_audit.done"
+    marker.write_text(
+        json.dumps(
+            {
+                "output_identities": {
+                    str(manifest): runner.path_fingerprint(manifest),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    runner.validate_source_build_output(
+        marker_path=marker,
+        output_path=manifest,
+    )
+    manifest.write_text('{"logical_sha256":"changed"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="completed stage marker"):
+        runner.validate_source_build_output(
+            marker_path=marker,
+            output_path=manifest,
+        )
+
+
+def test_local_evaluator_backend_records_source_identity():
+    evaluator = _load_spreadsheet_evaluator_module()
+    comparator, identity = evaluator._resolve_comparator("local")
+
+    assert comparator is evaluator.local_compare_workbooks
+    assert identity["requested_backend"] == "local"
+    assert identity["resolved_backend"] == "local"
+    assert identity["module"] == "spreadsheetbench_support"
+    assert identity["source_path"].endswith(
+        "spreadsheetbench_support.py"
+    )
+    assert len(identity["source_sha256"]) == 64
+
+
+def test_experiment_runner_builds_explicit_evaluator_command(tmp_path):
+    runner = _load_experiment_runner_module()
+    command = runner.build_evaluation_command(
+        python_executable="/env/bin/python",
+        data_path="/data/spreadsheetbench",
+        output_dir=tmp_path / "outputs",
+        recalc_dir=tmp_path / "recalc",
+        start_idx=200,
+        end_idx=400,
+        results_file=tmp_path / "eval.json",
+        evaluator_backend="local",
+    )
+
+    backend_index = command.index("--evaluator-backend")
+    assert command[backend_index + 1] == "local"
+    assert command[0:2] == [
+        "/env/bin/python",
+        "evaluate_with_official.py",
+    ]
 
 
 def test_embedding_truncates_to_configured_32k_budget_with_tokenizer(tmp_path):
@@ -54,6 +1255,200 @@ def test_embedding_truncates_to_configured_32k_budget_with_tokenizer(tmp_path):
     payload = json.loads(report.read_text())
     assert payload["event_count"] == 1
     assert payload["truncation_strategy"] == "head"
+
+
+def test_runtime_manifest_records_resolved_service_identity(
+    tmp_path,
+    monkeypatch,
+):
+    records_path = tmp_path / "records.json"
+    records_path.write_text("[]", encoding="utf-8")
+    monkeypatch.setenv("TEST_GENERATION_KEY", "resolved-generation-secret")
+    monkeypatch.setenv("TEST_EMBEDDING_KEY", "resolved-embedding-secret")
+    generation = GenerationConfig(
+        base_url="http://generation.invalid/v1",
+        model="test-generation",
+        api_key="fallback-generation-secret",
+        api_key_env_var="TEST_GENERATION_KEY",
+    )
+    embedding = EmbeddingConfig(
+        base_url="http://embedding.invalid/v1",
+        model="test-embedding",
+        api_key="fallback-embedding-secret",
+        api_key_env_var="TEST_EMBEDDING_KEY",
+        max_input_tokens=28000,
+        tokenizer_required=False,
+    )
+    config = DynaMixRunConfig(
+        output_dir=str(tmp_path / "run"),
+        records_path=str(records_path),
+        generation=generation,
+        embedding=embedding,
+    )
+    output_dir = Path(config.output_dir)
+    _write_runtime_artifacts(config, output_dir)
+
+    runtime_config = json.loads(
+        (output_dir / "analysis" / "runtime_config.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    serialized = json.dumps(runtime_config, sort_keys=True)
+    assert "fallback-generation-secret" not in serialized
+    assert "fallback-embedding-secret" not in serialized
+    assert "resolved-generation-secret" not in serialized
+    assert "resolved-embedding-secret" not in serialized
+
+    manifest = json.loads(
+        (output_dir / "analysis" / "run_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["service_identity"]["generation"]["api_key"] == (
+        api_key_fingerprint(generation.resolved_api_key)
+    )
+    assert manifest["service_identity"]["embedding"] == (
+        embedding_protocol_payload(embedding)
+    )
+    manifest_serialized = json.dumps(manifest, sort_keys=True)
+    assert "resolved-generation-secret" not in manifest_serialized
+    assert "resolved-embedding-secret" not in manifest_serialized
+
+
+def test_embedding_cache_namespace_preserves_legacy_protocol_identity():
+    config = EmbeddingConfig(
+        base_url="http://embedding.invalid/v1",
+        model="test-embedding",
+        api_key="EMPTY",
+        max_model_len=32000,
+        max_input_tokens=28000,
+        truncate_long_texts=True,
+        tokenizer_model="test-tokenizer",
+        tokenizer_required=True,
+        truncation_strategy="head",
+        batch_size=8,
+        max_concurrency=8,
+        deterministic_dim=384,
+    )
+    legacy_payload = {
+        "base_url": config.base_url,
+        "model": config.model,
+        "api_key": api_key_fingerprint(config.resolved_api_key),
+        "max_model_len": config.max_model_len,
+        "max_input_tokens": config.effective_max_input_tokens,
+        "truncate_long_texts": config.truncate_long_texts,
+        "tokenizer_model": config.tokenizer_model,
+        "tokenizer_required": config.tokenizer_required,
+        "truncation_strategy": config.truncation_strategy,
+        "deterministic_dim": config.deterministic_dim,
+    }
+    expected_digest = hashlib.sha256(
+        json.dumps(
+            legacy_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    client = EmbeddingClient(config)
+    assert client._cache_namespace(
+        config.model,
+        model_name=config.model,
+    ) == f"{config.model}::protocol::{expected_digest}"
+    changed_execution = EmbeddingClient(
+        EmbeddingConfig(
+            **(asdict(config) | {"batch_size": 4, "max_concurrency": 4})
+        )
+    )
+    assert changed_execution._cache_namespace(
+        config.model,
+        model_name=config.model,
+    ) == client._cache_namespace(config.model, model_name=config.model)
+
+
+def test_embedding_cache_default_replaces_legacy_rows(tmp_path):
+    cache = _SqliteEmbeddingCache(tmp_path / "legacy.sqlite")
+    assert cache.set("namespace", "text", [1.0]) == [1.0]
+    assert cache.set("namespace", "text", [2.0]) == [2.0]
+    assert cache.get("namespace", "text") == [2.0]
+    cache.close()
+
+
+def test_embedding_cache_first_write_policy_freezes_cdost_rows(tmp_path):
+    cache = _SqliteEmbeddingCache(
+        tmp_path / "cdost.sqlite",
+        write_policy="first_write_wins",
+    )
+    assert cache.set("namespace", "text", [1.0]) == [1.0]
+    assert cache.set("namespace", "text", [2.0]) == [1.0]
+    assert cache.get("namespace", "text") == [1.0]
+    cache.close()
+
+
+def test_legacy_skillbank_protocol_records_actual_single_vector_behavior():
+    runner = _load_experiment_runner_module()
+    args = SimpleNamespace(
+        tree_policy="projected_gmm_bic",
+        tree_scenario="static_build",
+        skillbank_top_k=10,
+        embedding_base_url="http://embedding.invalid/v1",
+        embedding_model="Qwen3-Embedding-8B",
+        embedding_max_model_len=32000,
+        embedding_max_input_tokens=32000,
+        embedding_batch_size=8,
+        embedding_tokenizer="/models/Qwen3-Embedding-8B",
+        chunked_embedding_enabled=True,
+        chunked_embedding_chunk_tokens=28000,
+        chunked_embedding_overlap_tokens=1000,
+        chunked_embedding_pooling="mean",
+        chunked_embedding_add_special_tokens=False,
+        chunked_embedding_normalize_after_pooling=False,
+        chunked_embedding_fail_if_chunk_exceeds_model_limit=True,
+    )
+    protocol = runner.skillbank_retrieval_protocol(
+        args,
+        cache_path=Path("/tmp/index.json"),
+        vector_cache_path=Path("/tmp/vectors.sqlite"),
+        selection_log=Path("/tmp/selection.jsonl"),
+    )
+
+    assert protocol["embedding_input_policy"] == "legacy_single_vector"
+    assert protocol["chunked_embedding_active"] is False
+    assert protocol["chunked_embedding_configured"] is True
+    assert protocol["chunk_tokens"] == 28000
+    assert protocol["chunk_overlap_tokens"] == 1000
+    assert protocol["chunk_pooling"] == "mean"
+    assert protocol["vector_cache_policy"] == "disabled"
+    assert protocol["require_cache_match"] is False
+    assert protocol["require_vector_cache_match"] is False
+
+
+def test_embedding_client_reads_prefilled_legacy_namespace(
+    tmp_path,
+    monkeypatch,
+):
+    config = EmbeddingConfig(
+        base_url="mock://deterministic",
+        model="test-embedding",
+        api_key="EMPTY",
+        tokenizer_required=False,
+        batch_size=4,
+        max_concurrency=4,
+        cache_path=str(tmp_path / "embedding.sqlite"),
+    )
+    client = EmbeddingClient(config)
+    namespace = client._cache_namespace(
+        config.model,
+        model_name=config.model,
+    )
+    assert client._cache is not None
+    client._cache.set(namespace, "hello", [0.25, 0.75])
+
+    async def fail_uncached(*args, **kwargs):
+        raise AssertionError("legacy cache entry must prevent backend embedding")
+
+    monkeypatch.setattr(client, "_embed_uncached", fail_uncached)
+    assert asyncio.run(client.embed_texts(["hello"])) == [[0.25, 0.75]]
+    client.close()
 
 
 def test_embedding_trace_excludes_answer_position():
@@ -251,6 +1646,101 @@ def test_chat_json_rejects_embedded_json_when_guided_schema_is_requested():
                 retries=0,
             )
         )
+
+
+def test_chat_json_repairs_malformed_json_once():
+    client = GenerationClient(GenerationConfig(base_url="mock://deterministic"))
+    responses = iter(('{"cards": [', '{"cards": []}'))
+    calls = []
+
+    async def fake_chat_text(messages, **kwargs):
+        calls.append(list(messages))
+        return next(responses)
+
+    client.chat_text = fake_chat_text
+    result = asyncio.run(
+        client.chat_json(
+            [{"role": "user", "content": "return cards"}],
+            schema_name="MinimalClusterExperienceCards",
+            guided_json={
+                "type": "object",
+                "properties": {"cards": {"type": "array"}},
+                "required": ["cards"],
+            },
+            retries=1,
+        )
+    )
+
+    assert result == {"cards": []}
+    assert len(calls) == 2
+    assert "Previous parse error" in calls[1][-1]["content"]
+    assert "fresh, compact JSON object" in calls[1][-1]["content"]
+
+
+def test_chat_json_stops_after_one_malformed_json_repair():
+    client = GenerationClient(GenerationConfig(base_url="mock://deterministic"))
+    calls = 0
+
+    async def fake_chat_text(messages, **kwargs):
+        nonlocal calls
+        calls += 1
+        return '{"cards": ['
+
+    client.chat_text = fake_chat_text
+    with pytest.raises(ValueError, match="failed to parse JSON"):
+        asyncio.run(
+            client.chat_json(
+                [{"role": "user", "content": "return cards"}],
+                schema_name="MinimalClusterExperienceCards",
+                guided_json={
+                    "type": "object",
+                    "properties": {"cards": {"type": "array"}},
+                    "required": ["cards"],
+                },
+                retries=1,
+            )
+        )
+    assert calls == 2
+
+
+def test_generation_client_disables_openai_sdk_retries(monkeypatch):
+    constructor_kwargs = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            constructor_kwargs.update(kwargs)
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=lambda **request: SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                message=SimpleNamespace(content="ok")
+                            )
+                        ]
+                    )
+                )
+            )
+
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
+    client = GenerationClient(
+        GenerationConfig(
+            base_url="http://example.invalid/v1",
+            retry_wait_seconds=(),
+        )
+    )
+
+    assert (
+        client._chat_text_sync(
+            [{"role": "user", "content": "hello"}],
+            None,
+            None,
+            None,
+            {},
+            None,
+        )
+        == "ok"
+    )
+    assert constructor_kwargs["max_retries"] == 0
 
 
 def test_generation_debug_reuses_succeeded_response_and_continues_numbering(tmp_path, monkeypatch):
@@ -878,13 +2368,287 @@ def test_experiment_runner_tree_resume_requires_matching_fingerprint(tmp_path):
     runner = _load_experiment_runner_module()
     marker = tmp_path / "04_build_tree.done"
     output = tmp_path / "summary.json"
+    output_dir = tmp_path / "audit"
+    output_dir.mkdir()
+    audit = output_dir / "events.jsonl"
     output.write_text("{}", encoding="utf-8")
-    marker.write_text(json.dumps({"fingerprint": {"scenario": "dynamic_update"}}), encoding="utf-8")
+    audit.write_text('{"event": 1}\n', encoding="utf-8")
+    marker.write_text(
+        json.dumps(
+            {
+                "fingerprint": {"scenario": "dynamic_update"},
+                "output_identities": {
+                    str(output): runner.path_fingerprint(output),
+                    str(output_dir): runner.path_fingerprint(output_dir),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
-    assert runner.stage_done(marker, [output], fingerprint={"scenario": "dynamic_update"})
-    assert not runner.stage_done(marker, [output], fingerprint={"scenario": "static_build"})
+    outputs = [output, output_dir]
+    assert runner.stage_done(marker, outputs, fingerprint={"scenario": "dynamic_update"})
+    assert not runner.stage_done(marker, outputs, fingerprint={"scenario": "static_build"})
+    audit.write_text('{"event": 2}\n', encoding="utf-8")
+    assert not runner.stage_done(
+        marker,
+        outputs,
+        fingerprint={"scenario": "dynamic_update"},
+    )
+    audit.write_text('{"event": 1}\n', encoding="utf-8")
+    output.write_text('{"tampered": true}', encoding="utf-8")
+    assert not runner.stage_done(
+        marker,
+        outputs,
+        fingerprint={"scenario": "dynamic_update"},
+    )
     marker.write_text(json.dumps({"stage": "04_build_tree"}), encoding="utf-8")
-    assert not runner.stage_done(marker, [output], fingerprint={"scenario": "dynamic_update"})
+    assert not runner.stage_done(marker, outputs, fingerprint={"scenario": "dynamic_update"})
+
+
+def test_experiment_runner_forced_rerun_removes_stage_owned_directories(
+    tmp_path,
+    monkeypatch,
+):
+    runner = _load_experiment_runner_module()
+    marker_dir = tmp_path / "markers"
+    marker_dir.mkdir()
+    old_outputs = tmp_path / "outputs"
+    old_logs = tmp_path / "logs"
+    old_outputs.mkdir()
+    old_logs.mkdir()
+    (old_outputs / "stale.xlsx").write_bytes(b"stale")
+    (old_logs / "stale.md").write_text("stale", encoding="utf-8")
+    result = tmp_path / "results.json"
+    result.write_text("stale", encoding="utf-8")
+
+    def fail_after_cleanup(*args, **kwargs):
+        assert not old_outputs.exists()
+        assert not old_logs.exists()
+        assert not result.exists()
+        raise RuntimeError("forced failure")
+
+    monkeypatch.setattr(runner, "run", fail_after_cleanup)
+    with pytest.raises(RuntimeError, match="forced failure"):
+        runner.run_stage(
+            "01_train_collect",
+            ["false"],
+            cwd=tmp_path,
+            env={},
+            log_path=tmp_path / "collect.log",
+            marker_dir=marker_dir,
+            outputs=[result, old_outputs, old_logs],
+            resume=False,
+            clear_outputs_before_run=[result, old_outputs, old_logs],
+        )
+
+    assert not old_outputs.exists()
+    assert not old_logs.exists()
+    assert not result.exists()
+
+
+def test_experiment_runner_failed_forced_rerun_invalidates_old_done(
+    tmp_path,
+    monkeypatch,
+):
+    runner = _load_experiment_runner_module()
+    marker_dir = tmp_path / "markers"
+    marker_dir.mkdir()
+    marker = marker_dir / "04_build_tree.done"
+    output = tmp_path / "summary.json"
+    output.write_text("old", encoding="utf-8")
+    fingerprint = {"scenario": "static_build"}
+    marker.write_text(
+        json.dumps({"fingerprint": fingerprint}),
+        encoding="utf-8",
+    )
+
+    def fail_run(*args, **kwargs):
+        raise RuntimeError("forced failure")
+
+    monkeypatch.setattr(runner, "run", fail_run)
+    with pytest.raises(RuntimeError, match="forced failure"):
+        runner.run_stage(
+            "04_build_tree",
+            ["false"],
+            cwd=tmp_path,
+            env={},
+            log_path=tmp_path / "build.log",
+            marker_dir=marker_dir,
+            outputs=[output],
+            resume=False,
+            fingerprint=fingerprint,
+        )
+
+    assert not marker.exists()
+    assert (marker_dir / "04_build_tree.failed.json").is_file()
+    assert not runner.stage_done(
+        marker,
+        [output],
+        fingerprint=fingerprint,
+    )
+
+
+def test_experiment_runner_resumes_matching_partial_stage_without_cleanup(
+    tmp_path,
+    monkeypatch,
+):
+    runner = _load_experiment_runner_module()
+    marker_dir = tmp_path / "markers"
+    marker_dir.mkdir()
+    fingerprint = {"stage": "heldout", "version": 3}
+    output = tmp_path / "results.jsonl"
+    output.write_text('{"id":"task-1"}\n', encoding="utf-8")
+    (marker_dir / "06_heldout_collect.running").write_text(
+        json.dumps({"fingerprint": fingerprint}),
+        encoding="utf-8",
+    )
+
+    def finish_run(*args, **kwargs):
+        assert output.is_file()
+        assert kwargs["append_log"] is True
+
+    monkeypatch.setattr(runner, "run", finish_run)
+    runner.run_stage(
+        "06_heldout_collect",
+        ["resume"],
+        cwd=tmp_path,
+        env={},
+        log_path=tmp_path / "heldout.log",
+        marker_dir=marker_dir,
+        outputs=[output],
+        resume=True,
+        fingerprint=fingerprint,
+        clear_outputs_before_run=[output],
+        preserve_partial_outputs_on_resume=True,
+    )
+
+    assert output.read_text(encoding="utf-8") == '{"id":"task-1"}\n'
+    assert (marker_dir / "06_heldout_collect.done").is_file()
+
+
+def test_experiment_runner_split_manifest_is_disjoint_and_bounded(tmp_path):
+    runner = _load_experiment_runner_module()
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "dataset.json").write_text(
+        json.dumps(
+            [
+                {"id": f"task-{index}", "instruction_type": "test"}
+                for index in range(4)
+            ]
+        ),
+        encoding="utf-8",
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    with pytest.raises(ValueError, match="non-overlapping"):
+        runner.write_split_manifest(
+            data_dir,
+            run_dir,
+            train_start=0,
+            train_end=3,
+            heldout_start=2,
+            heldout_end=4,
+        )
+    with pytest.raises(ValueError, match="dataset size"):
+        runner.write_split_manifest(
+            data_dir,
+            run_dir,
+            train_start=0,
+            train_end=2,
+            heldout_start=2,
+            heldout_end=5,
+        )
+
+    manifest = runner.write_split_manifest(
+        data_dir,
+        run_dir,
+        train_start=0,
+        train_end=2,
+        heldout_start=2,
+        heldout_end=4,
+    )
+    assert manifest["dataset_size"] == 4
+    assert manifest["train_expected_count"] == 2
+    assert manifest["heldout_expected_count"] == 2
+    assert {row["id"] for row in manifest["train"]}.isdisjoint(
+        row["id"] for row in manifest["heldout"]
+    )
+
+
+def test_experiment_runner_validates_heldout_eval_identity_and_denominator(
+    tmp_path,
+):
+    runner = _load_experiment_runner_module()
+    split_manifest = {
+        "heldout": [{"id": "task-a"}, {"id": "task-b"}],
+        "heldout_expected_count": 2,
+    }
+    eval_path = tmp_path / "eval.json"
+    eval_path.write_text(
+        json.dumps(
+            {
+                "summary": {"total_instances": 1},
+                "results": [{"id": "task-a"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="denominator"):
+        runner.validate_heldout_eval_coverage(eval_path, split_manifest)
+
+    eval_path.write_text(
+        json.dumps(
+            {
+                "summary": {"total_instances": 2},
+                "results": [{"id": "task-b"}, {"id": "task-a"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="identity/order"):
+        runner.validate_heldout_eval_coverage(eval_path, split_manifest)
+
+    eval_path.write_text(
+        json.dumps(
+            {
+                "summary": {"total_instances": 2},
+                "results": [{"id": "task-a"}, {"id": "task-b"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner.validate_heldout_eval_coverage(eval_path, split_manifest)
+
+
+def test_experiment_runner_rejects_post_run_evaluator_identity_drift(
+    tmp_path,
+):
+    runner = _load_experiment_runner_module()
+    expected = {
+        "workbook_comparator": {
+            "resolved_backend": "local",
+            "source_sha256": "comparator-sha",
+        },
+        "libreoffice": {
+            "executable": "/usr/bin/soffice",
+            "version": "LibreOffice test",
+        },
+    }
+    eval_path = tmp_path / "eval.json"
+    eval_path.write_text(
+        json.dumps({"summary": expected}),
+        encoding="utf-8",
+    )
+    runner.validate_evaluation_runtime_identity(eval_path, expected)
+
+    drifted = json.loads(eval_path.read_text(encoding="utf-8"))
+    drifted["summary"]["libreoffice"]["version"] = "LibreOffice changed"
+    eval_path.write_text(json.dumps(drifted), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="changed after preflight"):
+        runner.validate_evaluation_runtime_identity(eval_path, expected)
 
 
 def test_experiment_runner_reuse_tree_requires_reused_train_artifacts(tmp_path, monkeypatch):
@@ -989,6 +2753,29 @@ def test_experiment_runner_stage_report_aggregates_time_tokens_and_budget_pressu
     assert (tmp_path / "experiment_stage_report.md").exists()
 
 
+def test_experiment_stage_report_marks_missing_optional_artifacts_unavailable():
+    runner = _load_experiment_runner_module()
+
+    rendered = runner.render_experiment_stage_report_md({
+        "run_dir": "/tmp/run",
+        "created_at": "2026-07-28T00:00:00Z",
+        "stages": [],
+        "prompt_token_stats": {
+            "path": "/tmp/run/dynamix_tree/analysis/cluster_prompt_token_report.json",
+            "exists": False,
+        },
+        "chunked_embedding_stats": {
+            "path": "/tmp/run/dynamix_tree/analysis/chunked_embedding_report.json",
+            "exists": False,
+        },
+        "runtime_dead_corner_findings": [],
+    })
+
+    assert rendered.count("Artifact status: unavailable; this report was not produced for the run.") == 2
+    assert "Max observed prompt tokens:" not in rendered
+    assert "chunk_tokens=`None`" not in rendered
+
+
 def test_experiment_runner_rejects_wrong_tree_summary_before_heldout():
     runner = _load_experiment_runner_module()
     args = SimpleNamespace(
@@ -1018,6 +2805,339 @@ def test_experiment_runner_rejects_wrong_tree_summary_before_heldout():
         runner.validate_tree_summary_for_heldout(
             {"scenario": "dynamic_update", "record_count": 200, "initial_count": 120, "arrival_count": 80, "updated_count": 78, "excluded_count": 1, "insertion_count": 80},
             args,
+        )
+
+
+def test_cdost_runtime_report_omits_gmm_only_findings():
+    runner = _load_experiment_runner_module()
+    args = SimpleNamespace(
+        tree_policy="certified_dual_view_otd",
+        summary_max_model_tokens=100000,
+        summary_budget_ratio=0.85,
+        summary_prompt_overhead_reserve_tokens=8000,
+        analyst_max_prompt_tokens=-1,
+        budget_refinement_apply_to_level=0,
+        soft_recursive_assignment="cumulative_mass",
+        soft_top_r_memberships=2,
+        soft_cumulative_mass_coverage=0.90,
+        soft_max_membership_gap=0.25,
+        workers=1,
+        thinking="false",
+        generation_timeout_seconds=1200,
+        rollout_client_timeout_seconds=1200,
+        chunked_embedding_enabled=True,
+        embedding_batch_size=1,
+        chunked_embedding_chunk_tokens=28000,
+        embedding_max_model_len=32000,
+        train_start=0,
+        train_end=3,
+        dynamic_initial_count=2,
+        dynamic_arrival_count=1,
+        tree_scenario="dynamic_update",
+    )
+    findings = runner.runtime_dead_corner_findings(args)
+    areas = {finding["area"] for finding in findings}
+    assert "budget_refinement" not in areas
+    assert "soft_membership" not in areas
+    assert "analyst_budget_override" not in areas
+
+
+def test_cdost_hierarchy_fingerprint_uses_only_active_policy_fields():
+    runner = _load_experiment_runner_module()
+    payload = {
+        "tree_policy": "certified_dual_view_otd",
+        "otd": {"dual_view_lambda": 0.5},
+        "summary_budget": {"max_model_tokens": 100000},
+        "gmm_bic": {"min_split_size": 999},
+        "soft_membership": {"recursive_assignment": "cumulative_mass"},
+        "dynamic_update": {"mode": "budget_constrained_online_gmm"},
+    }
+    assert runner.active_hierarchy_payload(payload) == {
+        "tree_policy": "certified_dual_view_otd",
+        "otd": payload["otd"],
+        "summary_budget": payload["summary_budget"],
+    }
+
+    gmm_payload = payload | {"tree_policy": "projected_gmm_bic"}
+    active_gmm = runner.active_hierarchy_payload(gmm_payload)
+    assert "otd" not in active_gmm
+    assert active_gmm["gmm_bic"] == payload["gmm_bic"]
+    assert active_gmm["soft_membership"] == payload["soft_membership"]
+
+
+def test_cdost_dynamic_reuses_matching_static_embedding_vector_cache(
+    tmp_path: Path,
+) -> None:
+    runner = _load_experiment_runner_module()
+    static_dir = tmp_path / "static"
+    tree_dir = static_dir / "dynamix_tree"
+    cache_path = static_dir / "cache" / "embedding_cache.sqlite"
+    tree_dir.mkdir(parents=True)
+    cache_path.parent.mkdir(parents=True)
+    embedding_config = EmbeddingConfig(
+        base_url="mock://deterministic",
+        cache_path=str(cache_path),
+        tokenizer_required=False,
+    )
+    embedding_client = EmbeddingClient(embedding_config)
+    vector = asyncio.run(
+        embedding_client.embed_texts(
+            ["required vector"],
+            cache_namespace="static_dynamic_test",
+        )
+    )[0]
+    embedding_client.close()
+    namespace = embedding_cache_namespace(
+        embedding_config,
+        "static_dynamic_test",
+        model_name=embedding_config.model,
+    )
+    write_embedding_cache_manifest(
+        cache_path=cache_path,
+        output_path=(
+            tree_dir / "embedding_vector_cache_manifest.json"
+        ),
+        requirements=[
+            {
+                "namespace": namespace,
+                "text": "required vector",
+                "vector": vector,
+            }
+        ],
+    )
+    vector_manifest = tree_dir / "embedding_vector_cache_manifest.json"
+    atom_cache = tree_dir / "experience_atoms.json"
+    atom_cache.write_text("{}", encoding="utf-8")
+    marker = static_dir / "stage_markers" / "04_build_tree.done"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(
+        json.dumps(
+            {
+                "output_identities": {
+                    str(atom_cache): runner.path_fingerprint(atom_cache),
+                    str(vector_manifest): runner.path_fingerprint(
+                        vector_manifest
+                    ),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (static_dir / "dynamix_config.json").write_text(
+        json.dumps(
+            {
+                "scenario": "static_build",
+                "output_dir": str(tree_dir),
+                "embedding": {"cache_path": str(cache_path)},
+                "hierarchy": {
+                    "tree_policy": "certified_dual_view_otd",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolved = runner.resolve_embedding_cache_path(
+        explicit_path="",
+        scenario_dir=tmp_path / "dynamic",
+        tree_policy="certified_dual_view_otd",
+        tree_scenario="dynamic_update",
+        atom_cache_path=str(atom_cache),
+    )
+    assert resolved == cache_path.resolve()
+    original_vector_manifest = vector_manifest.read_text(encoding="utf-8")
+    vector_manifest.write_text(
+        original_vector_manifest + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="completed stage marker"):
+        runner.resolve_embedding_cache_path(
+            explicit_path="",
+            scenario_dir=tmp_path / "dynamic",
+            tree_policy="certified_dual_view_otd",
+            tree_scenario="dynamic_update",
+            atom_cache_path=str(atom_cache),
+        )
+    vector_manifest.write_text(
+        original_vector_manifest,
+        encoding="utf-8",
+    )
+    atom_cache.write_text('{"tampered": true}', encoding="utf-8")
+    with pytest.raises(ValueError, match="completed stage marker"):
+        runner.resolve_embedding_cache_path(
+            explicit_path="",
+            scenario_dir=tmp_path / "dynamic",
+            tree_policy="certified_dual_view_otd",
+            tree_scenario="dynamic_update",
+            atom_cache_path=str(atom_cache),
+        )
+    atom_cache.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="must share"):
+        runner.resolve_embedding_cache_path(
+            explicit_path=str(tmp_path / "different.sqlite"),
+            scenario_dir=tmp_path / "dynamic",
+            tree_policy="certified_dual_view_otd",
+            tree_scenario="dynamic_update",
+            atom_cache_path=str(atom_cache),
+        )
+    import sqlite3
+
+    connection = sqlite3.connect(cache_path)
+    connection.execute(
+        "UPDATE embeddings SET vector=? WHERE namespace=? AND key=?",
+        (
+            json.dumps([123.0]),
+            namespace,
+            hashlib.sha256(b"required vector").hexdigest(),
+        ),
+    )
+    connection.commit()
+    connection.close()
+    with pytest.raises(RuntimeError, match="changed after certification"):
+        runner.resolve_embedding_cache_path(
+            explicit_path="",
+            scenario_dir=tmp_path / "dynamic",
+            tree_policy="certified_dual_view_otd",
+            tree_scenario="dynamic_update",
+            atom_cache_path=str(atom_cache),
+        )
+
+
+def test_cdost_dynamic_config_and_runtime_identity_are_method_specific():
+    runner = _load_experiment_runner_module()
+    payload = {
+        "initial_count": 120,
+        "arrival_count": 80,
+        "update_batch_size": 8,
+        "shuffle_seed": None,
+        "snapshot_include_embeddings": True,
+        "resume_from_snapshots": False,
+        "max_propagation_rounds": 999,
+    }
+    assert runner.active_dynamic_payload(
+        payload,
+        tree_policy="certified_dual_view_otd",
+    ) == {
+        "initial_count": 120,
+        "arrival_count": 80,
+        "update_batch_size": 8,
+        "shuffle_seed": None,
+        "snapshot_include_embeddings": True,
+        "resume_from_snapshots": False,
+    }
+    assert runner.active_dynamic_payload(
+        payload,
+        tree_policy="projected_gmm_bic",
+    ) == payload
+
+    args = SimpleNamespace(
+        tree_policy="certified_dual_view_otd",
+        tree_scenario="dynamic_update",
+        dynamic_update_batch_size=8,
+        graph_kind="overlapping_experience_hierarchy",
+        allow_overlap=True,
+        allow_multi_parent=True,
+    )
+    identity = runner.method_runtime_identity(args)
+    assert identity == {
+        "tree_policy": "certified_dual_view_otd",
+        "structural_graph_kind": "single_parent_binary_tree",
+        "allow_overlap": False,
+        "allow_multi_parent": False,
+        "arrival_update_semantics": "sequential_per_atom",
+        "parent_refresh_semantics": "changed_path_bottom_up_per_atom",
+        "snapshot_interval": 8,
+        "nodebank_scope": "complete_tree",
+        "retrieval_policy": "tree_antichain_knapsack",
+        "embedding_vector_control": (
+            "shared_content_addressed_cache_required"
+        ),
+    }
+    args.tree_scenario = "static_build"
+    static_identity = runner.method_runtime_identity(args)
+    assert static_identity["arrival_update_semantics"] == "static_dataset_order"
+    assert (
+        static_identity["parent_refresh_semantics"]
+        == "all_internal_nodes_bottom_up_after_build"
+    )
+    assert static_identity["snapshot_interval"] is None
+    assert (
+        static_identity["embedding_vector_control"]
+        == "content_addressed_cache_populates_control"
+    )
+
+
+def test_cdost_runner_requires_nodebank_method_identity():
+    runner = _load_experiment_runner_module()
+    args = SimpleNamespace(tree_policy="certified_dual_view_otd")
+    valid = {
+        "tree_policy": "certified_dual_view_otd",
+        "export_policy": {
+            "heldout_retrieval": "tree_antichain_knapsack",
+        },
+    }
+    runner.validate_nodebank_manifest_for_heldout(valid, args)
+    with pytest.raises(RuntimeError, match="tree_policy identity"):
+        runner.validate_nodebank_manifest_for_heldout(
+            {"export_policy": valid["export_policy"]},
+            args,
+        )
+    with pytest.raises(RuntimeError, match="antichain retrieval"):
+        runner.validate_nodebank_manifest_for_heldout(
+            {"tree_policy": "certified_dual_view_otd"},
+            args,
+        )
+
+
+def test_experiment_runner_cdost_summary_gate_is_fail_closed():
+    runner = _load_experiment_runner_module()
+    args = SimpleNamespace(
+        tree_scenario="static_build",
+        tree_policy="certified_dual_view_otd",
+    )
+    valid = {
+        "scenario": "static_build",
+        "tree_policy": "certified_dual_view_otd",
+        "record_count": 3,
+        "atom_count": 3,
+        "excluded_count": 0,
+        "parent_generation_error_count": 0,
+        "atom_source": "generated",
+    }
+    runner.validate_tree_summary_for_heldout(valid, args)
+    with pytest.raises(RuntimeError, match="parent skill generation"):
+        runner.validate_tree_summary_for_heldout(
+            valid | {"parent_generation_error_count": 1},
+            args,
+        )
+    with pytest.raises(RuntimeError, match="excluded input"):
+        runner.validate_tree_summary_for_heldout(
+            valid | {"excluded_count": 1},
+            args,
+        )
+    with pytest.raises(RuntimeError, match="atom_count"):
+        runner.validate_tree_summary_for_heldout(
+            valid | {"atom_count": 2},
+            args,
+        )
+
+    dynamic_args = SimpleNamespace(
+        tree_scenario="dynamic_update",
+        tree_policy="certified_dual_view_otd",
+        dynamic_initial_count=2,
+        dynamic_arrival_count=1,
+    )
+    with pytest.raises(RuntimeError, match="frozen_cache"):
+        runner.validate_tree_summary_for_heldout(
+            valid
+            | {
+                "scenario": "dynamic_update",
+                "initial_count": 2,
+                "arrival_count": 1,
+                "updated_count": 1,
+                "insertion_count": 1,
+            },
+            dynamic_args,
         )
 
 
