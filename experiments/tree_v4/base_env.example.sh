@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+
+export REPO_ROOT="/mnt/data/yaodong/codes/DynaMix2skill_tree_v2"
+export DYNAMIX_PYTHON="/home/yaodong/miniconda3/envs/stableskill-skillrl/bin/python"
+export DATA_PATH="/mnt/data/yaodong/codes/Trace2Skill/data/spreadsheetbench_verified/spreadsheetbench_verified_400"
+export RECORDS_PATH="/absolute/path/to/current/recalc-aligned/records.json"
+export BASELINE_CDOST_RUN_DIR="/absolute/path/to/reproducible/cdost-v3-run"
+export SOURCE_CDOST_RUN_DIR="/absolute/path/to/historical/cdost-v3-run"
+
+export MODEL="Qwen3.5-9B-AWQ"
+export OPENAI_BASE_URL="http://10.26.1.184:18080/v1"
+export OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
+export EMBEDDING_BASE_URL="http://10.26.1.184:18007/v1"
+export EMBEDDING_MODEL="Qwen3-Embedding-8B"
+export EMBEDDING_TOKENIZER="/absolute/path/to/Qwen3-Embedding-8B"
+export ANALYST_TOKENIZER="/absolute/path/to/Qwen3.5-9B-AWQ"
+
+export WORKERS="16"
+export THINKING="false"
+export ROLLOUT_TEMPERATURE="0.0"
+export GENERATION_TEMPERATURE="0.0"
+export GENERATION_MAX_CONCURRENCY="16"
+export EMBEDDING_MAX_MODEL_LEN="32000"
+export EMBEDDING_MAX_INPUT_TOKENS="32000"
+export EMBEDDING_BATCH_SIZE="8"
+export EMBEDDING_MAX_CONCURRENCY="8"
+export CHUNKED_EMBEDDING_CHUNK_TOKENS="8000"
+export CHUNKED_EMBEDDING_OVERLAP_TOKENS="1000"
+export CHUNKED_EMBEDDING_POOLING="mean"
+
+export RUN_DIR="$REPO_ROOT/runs/ebst_v4_$(date +%Y%m%d_%H%M%S)"

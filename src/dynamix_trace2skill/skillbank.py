@@ -26,6 +26,19 @@ except Exception:  # pragma: no cover
 
 from .openai_compat import OpenAI as CompatOpenAI
 
+_STRICT_SINGLE_VECTOR_TREE_POLICIES = frozenset(
+    {
+        "certified_dual_view_otd",
+        "evidence_balanced_skill_tree",
+    }
+)
+_FULL_PROMPT_ANALYST_MODES = frozenset(
+    {
+        "evidence_bucket_consolidation",
+        "cross_child_abstraction",
+    }
+)
+
 
 @dataclass(frozen=True)
 class SkillNodeDocument:
@@ -462,6 +475,141 @@ def _validate_cdost_tree_index(
     return root_node_id, children_by_node
 
 
+def _validate_ebst_tree_index(
+    manifest: dict[str, Any],
+) -> tuple[str, dict[str, tuple[str, ...]]]:
+    label = "evidence_balanced_skill_tree"
+    tree_index = manifest.get("tree_index")
+    if not isinstance(tree_index, dict):
+        raise ValueError(f"{label} nodebank requires a complete tree_index")
+    root_node_id = str(tree_index.get("root_node_id") or "").strip()
+    raw_children = tree_index.get("children_by_node")
+    if not root_node_id or not isinstance(raw_children, dict):
+        raise ValueError(f"{label} nodebank requires a complete tree_index")
+
+    children_by_node: dict[str, tuple[str, ...]] = {}
+    for raw_node_id, raw_child_ids in raw_children.items():
+        node_id = str(raw_node_id).strip()
+        if not node_id or not isinstance(raw_child_ids, list):
+            raise ValueError(f"{label} tree_index is malformed")
+        child_ids = tuple(str(child_id).strip() for child_id in raw_child_ids)
+        if (
+            any(not child_id for child_id in child_ids)
+            or len(child_ids) != len(set(child_ids))
+        ):
+            raise ValueError(
+                f"{label} tree_index contains an empty or duplicate edge"
+            )
+        children_by_node[node_id] = child_ids
+
+    node_ids = set(children_by_node)
+    if root_node_id not in node_ids:
+        raise ValueError(f"{label} tree_index root is missing")
+    reported_root = str(manifest.get("root_node_id") or "").strip()
+    if reported_root != root_node_id:
+        raise ValueError(f"{label} manifest root does not match tree_index")
+
+    parent_by_node: dict[str, str] = {}
+    for parent_id, child_ids in children_by_node.items():
+        for child_id in child_ids:
+            if child_id not in node_ids:
+                raise ValueError(f"{label} tree_index is not closed")
+            if child_id == root_node_id or child_id in parent_by_node:
+                raise ValueError(f"{label} tree_index must have unique parents")
+            parent_by_node[child_id] = parent_id
+    if set(parent_by_node) != node_ids - {root_node_id}:
+        raise ValueError(f"{label} tree_index contains unreachable nodes")
+
+    visited: set[str] = set()
+    stack = [root_node_id]
+    while stack:
+        node_id = stack.pop()
+        if node_id in visited:
+            raise ValueError(f"{label} tree_index contains a cycle")
+        visited.add(node_id)
+        stack.extend(children_by_node[node_id])
+    if visited != node_ids:
+        raise ValueError(f"{label} tree_index contains unreachable nodes")
+
+    manifest_nodes = manifest.get("nodes")
+    if not isinstance(manifest_nodes, list):
+        raise ValueError(f"{label} node entries are missing")
+    manifest_node_ids: list[str] = []
+    for node in manifest_nodes:
+        if not isinstance(node, dict):
+            raise ValueError(f"{label} node entry is malformed")
+        node_id = str(node.get("node_id") or node.get("item_id") or "").strip()
+        if (
+            not node_id
+            or "parent_node_id" not in node
+            or not isinstance(node.get("child_node_ids"), list)
+        ):
+            raise ValueError(f"{label} node lineage is incomplete")
+        name = str(node.get("name") or "").strip()
+        trigger = str(node.get("trigger") or "").strip()
+        content = str(node.get("content") or "").strip()
+        prompt_text = str(node.get("prompt_text") or "").strip()
+        analyst_mode = str(node.get("analyst_mode") or "").strip()
+        evidence_atom_ids = node.get("evidence_atom_ids")
+        if (
+            not name
+            or not trigger
+            or not content
+            or not prompt_text
+            or node.get("lifecycle_status") != "active"
+            or analyst_mode not in _FULL_PROMPT_ANALYST_MODES
+            or not isinstance(evidence_atom_ids, list)
+            or len(evidence_atom_ids) < 2
+            or len(evidence_atom_ids) != len(set(evidence_atom_ids))
+            or any(not str(atom_id).strip() for atom_id in evidence_atom_ids)
+        ):
+            raise ValueError(f"{label} node entry is not retrievable")
+        expected_embedding_text = (
+            f"name: {name}\n"
+            f"trigger: {trigger}\n"
+            f"content: {content}"
+        )
+        if str(node.get("embedding_text") or "") != expected_embedding_text:
+            raise ValueError(
+                f"{label} node embedding contract does not match"
+            )
+        expected_parent = parent_by_node.get(node_id)
+        reported_parent = str(node.get("parent_node_id") or "").strip() or None
+        reported_children = tuple(
+            str(child_id).strip()
+            for child_id in node["child_node_ids"]
+        )
+        if (
+            reported_parent != expected_parent
+            or reported_children != children_by_node.get(node_id)
+        ):
+            raise ValueError(
+                f"{label} node lineage does not match tree_index"
+            )
+        manifest_node_ids.append(node_id)
+
+    expected_manifest_ids = node_ids - {root_node_id}
+    if (
+        len(manifest_node_ids) != len(set(manifest_node_ids))
+        or set(manifest_node_ids) != expected_manifest_ids
+        or int(manifest.get("node_count", -1)) != len(manifest_node_ids)
+    ):
+        raise ValueError(
+            f"{label} retrievable nodes do not match tree_index"
+        )
+    return root_node_id, children_by_node
+
+
+def validate_ebst_nodebank_manifest(
+    manifest: Mapping[str, Any],
+) -> tuple[str, dict[str, tuple[str, ...]]]:
+    if manifest.get("tree_policy") != "evidence_balanced_skill_tree":
+        raise ValueError(
+            "expected evidence_balanced_skill_tree nodebank manifest"
+        )
+    return _validate_ebst_tree_index(dict(manifest))
+
+
 class SkillBankSelector:
     """Policy-aware selector over a DynaMix node bank.
 
@@ -572,13 +720,19 @@ class SkillBankSelector:
         )
         if is_cdost and not self.expected_tree_policy:
             self.expected_tree_policy = "certified_dual_view_otd"
+        is_ebst = (
+            reported_tree_policy == "evidence_balanced_skill_tree"
+            or self.expected_tree_policy == "evidence_balanced_skill_tree"
+        )
+        if is_ebst and not self.expected_tree_policy:
+            self.expected_tree_policy = "evidence_balanced_skill_tree"
         if (
-            is_cdost
+            (is_cdost or is_ebst)
             and export_policy.get("heldout_retrieval")
             != "tree_antichain_knapsack"
         ):
             raise ValueError(
-                "certified_dual_view_otd requires "
+                "single-parent nodebank requires "
                 "tree_antichain_knapsack retrieval"
             )
         antichain_retrieval = (
@@ -590,6 +744,14 @@ class SkillBankSelector:
             root_node_id, children_by_node = _validate_cdost_tree_index(
                 manifest,
                 manifest_path=manifest_path,
+            )
+            tree_index = {
+                "root_node_id": root_node_id,
+                "children_by_node": children_by_node,
+            }
+        elif is_ebst:
+            root_node_id, children_by_node = validate_ebst_nodebank_manifest(
+                manifest
             )
             tree_index = {
                 "root_node_id": root_node_id,
@@ -751,7 +913,10 @@ class SkillBankSelector:
                         ],
                         dtype=float,
                     )
-                    if self.expected_tree_policy == "certified_dual_view_otd":
+                    if (
+                        self.expected_tree_policy
+                        in _STRICT_SINGLE_VECTOR_TREE_POLICIES
+                    ):
                         self._embeddings = _require_unit_matrix(
                             self._embeddings,
                             field_name="cached CDOST skillbank embeddings",
@@ -792,8 +957,11 @@ class SkillBankSelector:
         return docs, embeddings
 
     def _embed(self, texts: list[str]) -> list[list[float]]:
-        is_cdost = self.expected_tree_policy == "certified_dual_view_otd"
-        if is_cdost:
+        strict_single_vector = (
+            self.expected_tree_policy
+            in _STRICT_SINGLE_VECTOR_TREE_POLICIES
+        )
+        if strict_single_vector:
             tokenizer = get_tokenizer(
                 self.tokenizer_model or None,
                 allow_regex_fallback=not bool(self.tokenizer_model),
@@ -944,7 +1112,10 @@ class SkillBankSelector:
             "batch_size": self.batch_size,
             "tokenizer_model": self.tokenizer_model,
         }
-        if self.expected_tree_policy == "certified_dual_view_otd":
+        if (
+            self.expected_tree_policy
+            in _STRICT_SINGLE_VECTOR_TREE_POLICIES
+        ):
             payload.update(
                 {
                     "input_policy": "single_vector_fail_if_over_limit",
@@ -971,7 +1142,8 @@ class SkillBankSelector:
         if cached == current:
             return True
         if (
-            self.expected_tree_policy == "certified_dual_view_otd"
+            self.expected_tree_policy
+            in _STRICT_SINGLE_VECTOR_TREE_POLICIES
             or not isinstance(cached, dict)
         ):
             return False
@@ -993,7 +1165,11 @@ def selected_experience_to_system_content(selections: Iterable[SkillSelection]) 
     lines: list[str] = [retrieved_experience_preamble(), ""]
     for rank, selection in enumerate(selections, start=1):
         node = selection.skill
-        if node.analyst_mode.startswith("cdost_") and node.prompt_text:
+        use_full_prompt = (
+            node.analyst_mode.startswith("cdost_")
+            or node.analyst_mode in _FULL_PROMPT_ANALYST_MODES
+        )
+        if use_full_prompt and node.prompt_text:
             lines.extend([node.prompt_text.strip(), ""])
             continue
         lines.extend([

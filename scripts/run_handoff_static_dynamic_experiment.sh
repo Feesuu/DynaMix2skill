@@ -112,8 +112,8 @@ MODEL="${MODEL:-Qwen3.5-9B-AWQ}"
 OPENAI_BASE_URL="${OPENAI_BASE_URL:-http://asmiatbrqksz.10.27.127.9.nip.io/v1}"
 OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
 
-# Thinking mode for train/heldout rollout and static DynaMix analyst calls.
-# Dynamic patch analyst calls use enable_thinking=true by default.
+# Thinking mode passed to train/heldout rollout and DynaMix generation clients.
+# Policy-specific generation temperatures remain explicit below.
 # Allowed: true, false, null.
 THINKING="${THINKING:-true}"
 
@@ -180,6 +180,27 @@ GRAPH_KIND="${GRAPH_KIND:-overlapping_experience_hierarchy}"
 ALLOW_OVERLAP="${ALLOW_OVERLAP:-true}"
 ALLOW_MULTI_PARENT="${ALLOW_MULTI_PARENT:-true}"
 USE_SUPPORT_MASS="${USE_SUPPORT_MASS:-true}"
+
+# Certified dual-view OTD control. These values are inert for other policies.
+OTD_DUAL_VIEW_LAMBDA="${OTD_DUAL_VIEW_LAMBDA:-0.5}"
+OTD_TIE_EPSILON="${OTD_TIE_EPSILON:-0.0}"
+OTD_ATOM_TEMPERATURE="${OTD_ATOM_TEMPERATURE:-0.0}"
+OTD_PARENT_TEMPERATURE="${OTD_PARENT_TEMPERATURE:-0.0}"
+OTD_ATOM_CACHE_PATH="${OTD_ATOM_CACHE_PATH:-}"
+OTD_RETRIEVAL_TOKEN_BUDGET="${OTD_RETRIEVAL_TOKEN_BUDGET:-24000}"
+OTD_RETRIEVAL_TOKEN_UNIT="${OTD_RETRIEVAL_TOKEN_UNIT:-128}"
+OTD_RETRIEVAL_EXACT_SEARCH_MAX_STATES="${OTD_RETRIEVAL_EXACT_SEARCH_MAX_STATES:-250000}"
+
+# Evidence-Balanced Skill Tree v4. These values are inert for other policies.
+EBST_MAX_ENTRIES="${EBST_MAX_ENTRIES:-8}"
+EBST_DUAL_VIEW_LAMBDA="${EBST_DUAL_VIEW_LAMBDA:-0.5}"
+EBST_ATOM_TEMPERATURE="${EBST_ATOM_TEMPERATURE:-0.0}"
+EBST_CAPSULE_TEMPERATURE="${EBST_CAPSULE_TEMPERATURE:-0.0}"
+EBST_VALIDATOR_TEMPERATURE="${EBST_VALIDATOR_TEMPERATURE:-0.0}"
+EBST_ATOM_CACHE_PATH="${EBST_ATOM_CACHE_PATH:-}"
+EBST_RETRIEVAL_TOKEN_BUDGET="${EBST_RETRIEVAL_TOKEN_BUDGET:-24000}"
+EBST_RETRIEVAL_TOKEN_UNIT="${EBST_RETRIEVAL_TOKEN_UNIT:-128}"
+EBST_RETRIEVAL_EXACT_SEARCH_MAX_STATES="${EBST_RETRIEVAL_EXACT_SEARCH_MAX_STATES:-250000}"
 
 PROJECTION_METHOD="${PROJECTION_METHOD:-local_pca}"
 PROJECTION_VARIANCE_RATIO="${PROJECTION_VARIANCE_RATIO:-0.90}"
@@ -307,6 +328,10 @@ if [[ ! -x "$DYNAMIX_PYTHON" ]]; then
   echo "ERROR: DYNAMIX_PYTHON is not executable: $DYNAMIX_PYTHON" >&2
   exit 2
 fi
+if [[ ! -f "$DATA_PATH/dataset.json" ]]; then
+  echo "ERROR: SpreadsheetBench dataset.json is missing: $DATA_PATH/dataset.json" >&2
+  exit 2
+fi
 
 cd "$REPO_ROOT"
 mkdir -p "$RUN_DIR/logs" "$TRAIN_ARTIFACT_DIR/logs" "$SCENARIO_OUTPUT_DIR/logs"
@@ -362,6 +387,23 @@ cmd=(
   "--allow-overlap" "$ALLOW_OVERLAP"
   "--allow-multi-parent" "$ALLOW_MULTI_PARENT"
   "--use-support-mass" "$USE_SUPPORT_MASS"
+  "--otd-dual-view-lambda" "$OTD_DUAL_VIEW_LAMBDA"
+  "--otd-tie-epsilon" "$OTD_TIE_EPSILON"
+  "--otd-atom-temperature" "$OTD_ATOM_TEMPERATURE"
+  "--otd-parent-temperature" "$OTD_PARENT_TEMPERATURE"
+  "--otd-atom-cache-path" "$OTD_ATOM_CACHE_PATH"
+  "--otd-retrieval-token-budget" "$OTD_RETRIEVAL_TOKEN_BUDGET"
+  "--otd-retrieval-token-unit" "$OTD_RETRIEVAL_TOKEN_UNIT"
+  "--otd-retrieval-exact-search-max-states" "$OTD_RETRIEVAL_EXACT_SEARCH_MAX_STATES"
+  "--ebst-max-entries" "$EBST_MAX_ENTRIES"
+  "--ebst-dual-view-lambda" "$EBST_DUAL_VIEW_LAMBDA"
+  "--ebst-atom-temperature" "$EBST_ATOM_TEMPERATURE"
+  "--ebst-capsule-temperature" "$EBST_CAPSULE_TEMPERATURE"
+  "--ebst-validator-temperature" "$EBST_VALIDATOR_TEMPERATURE"
+  "--ebst-atom-cache-path" "$EBST_ATOM_CACHE_PATH"
+  "--ebst-retrieval-token-budget" "$EBST_RETRIEVAL_TOKEN_BUDGET"
+  "--ebst-retrieval-token-unit" "$EBST_RETRIEVAL_TOKEN_UNIT"
+  "--ebst-retrieval-exact-search-max-states" "$EBST_RETRIEVAL_EXACT_SEARCH_MAX_STATES"
   "--dynamic-initial-count" "$DYNAMIC_INITIAL_COUNT"
   "--dynamic-arrival-count" "$DYNAMIC_ARRIVAL_COUNT"
   "--dynamic-update-batch-size" "$DYNAMIC_UPDATE_BATCH_SIZE"

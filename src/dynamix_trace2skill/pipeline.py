@@ -8,7 +8,7 @@ import random
 import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from dynamix_core import GmmBicConfig, ProjectedGmmDynamicTreeConfig, ProjectionConfig, SoftMembershipConfig, SummaryBudgetConfig
 from dynamix_core.data_structures import ExperienceCommunity, ExperienceHierarchyState, ExperienceItem, ExperienceLayer, ITEM_KIND_TRAJECTORY
@@ -139,7 +139,14 @@ def default_hierarchy_config(payload: dict[str, Any] | None = None) -> Projected
 async def build_tree_from_records(config: DynaMixRunConfig) -> dict[str, Any]:
     """Dispatch CDOST before entering the legacy projected-GMM static path."""
 
-    if str(config.hierarchy.get("tree_policy", "")).strip() == "certified_dual_view_otd":
+    tree_policy = str(config.hierarchy.get("tree_policy", "")).strip()
+    if tree_policy == "evidence_balanced_skill_tree":
+        from .evidence_balanced_skill_pipeline import (
+            build_evidence_balanced_tree_from_records,
+        )
+
+        return await build_evidence_balanced_tree_from_records(config)
+    if tree_policy == "certified_dual_view_otd":
         from .certified_otd_pipeline import build_certified_otd_tree_from_records
 
         return await build_certified_otd_tree_from_records(config)
@@ -220,7 +227,14 @@ async def build_dynamic_tree_from_records(config: DynaMixRunConfig) -> dict[str,
     projected-GMM policy. CDOST returns through its dedicated branch before any
     of that code executes.
     """
-    if str(config.hierarchy.get("tree_policy", "")).strip() == "certified_dual_view_otd":
+    tree_policy = str(config.hierarchy.get("tree_policy", "")).strip()
+    if tree_policy == "evidence_balanced_skill_tree":
+        from .evidence_balanced_skill_pipeline import (
+            build_evidence_balanced_dynamic_tree_from_records,
+        )
+
+        return await build_evidence_balanced_dynamic_tree_from_records(config)
+    if tree_policy == "certified_dual_view_otd":
         from .certified_otd_pipeline import (
             build_certified_otd_dynamic_tree_from_records,
         )
@@ -498,6 +512,11 @@ def _refresh_skillbank_index(skillbank_root: str | Path, config: DynaMixRunConfi
     index_path = root / ".dynamix_skillbank_index.json"
     chunked_payload = dict(config.chunked_embedding or {})
     chunked_enabled = bool(chunked_payload.get("enabled", False))
+    tree_policy = str(config.hierarchy.get("tree_policy") or "")
+    certified_single_parent = tree_policy in {
+        "certified_dual_view_otd",
+        "evidence_balanced_skill_tree",
+    }
     selector = SkillBankSelector(
         skillbank_root=root,
         base_url=config.embedding.base_url,
@@ -505,14 +524,10 @@ def _refresh_skillbank_index(skillbank_root: str | Path, config: DynaMixRunConfi
         api_key=config.embedding.resolved_api_key,
         cache_path=index_path,
         vector_cache_path=(
-            config.embedding.cache_path
-            if config.hierarchy.get("tree_policy")
-            == "certified_dual_view_otd"
-            else None
+            config.embedding.cache_path if certified_single_parent else None
         ),
         require_vector_cache_match=(
-            config.hierarchy.get("tree_policy")
-            == "certified_dual_view_otd"
+            tree_policy == "certified_dual_view_otd"
             and config.scenario == "dynamic_update"
         ),
         max_model_len=config.embedding.max_model_len,
@@ -522,10 +537,7 @@ def _refresh_skillbank_index(skillbank_root: str | Path, config: DynaMixRunConfi
         chunk_tokens=int(chunked_payload["chunk_tokens"]) if chunked_enabled and chunked_payload.get("chunk_tokens") is not None else None,
         chunk_overlap_tokens=int(chunked_payload["overlap_tokens"]) if chunked_enabled and chunked_payload.get("overlap_tokens") is not None else None,
         expected_tree_policy=(
-            str(config.hierarchy.get("tree_policy") or "")
-            if config.hierarchy.get("tree_policy")
-            == "certified_dual_view_otd"
-            else None
+            tree_policy if certified_single_parent else None
         ),
     )
     selector._load_or_build_index()
@@ -899,6 +911,26 @@ async def run_config(config: DynaMixRunConfig) -> dict[str, Any]:
     raise ValueError(f"unknown scenario={config.scenario!r}")
 
 
+def _raise_if_ebst_build_incomplete(
+    config: DynaMixRunConfig,
+    summary: Mapping[str, Any],
+) -> None:
+    if (
+        str(config.hierarchy.get("tree_policy") or "")
+        != "evidence_balanced_skill_tree"
+    ):
+        return
+    runtime_errors = int(summary.get("runtime_generation_error_count", 0))
+    prompt_budget_errors = int(summary.get("prompt_budget_error_count", 0))
+    if runtime_errors or prompt_budget_errors:
+        raise RuntimeError(
+            "evidence-balanced tree build produced incomplete capsule "
+            "artifacts: "
+            f"runtime_generation_error_count={runtime_errors}, "
+            f"prompt_budget_error_count={prompt_budget_errors}"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build DynaMix hierarchy from Trace2Skill trajectories")
     parser.add_argument("--config", required=True, help="JSON config file")
@@ -906,6 +938,7 @@ def main() -> None:
     config = DynaMixRunConfig.from_json(args.config)
     summary = asyncio.run(run_config(config))
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+    _raise_if_ebst_build_incomplete(config, summary)
 
 
 if __name__ == "__main__":

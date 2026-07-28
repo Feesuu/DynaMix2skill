@@ -15,6 +15,24 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 
+CERTIFIED_SINGLE_PARENT_TREE_POLICIES = frozenset(
+    {
+        "certified_dual_view_otd",
+        "evidence_balanced_skill_tree",
+    }
+)
+
+
+def is_certified_single_parent_tree(tree_policy: str) -> bool:
+    return str(tree_policy).strip() in CERTIFIED_SINGLE_PARENT_TREE_POLICIES
+
+
+def atom_cache_path_for_args(args: argparse.Namespace) -> str | None:
+    if args.tree_policy == "evidence_balanced_skill_tree":
+        return args.ebst_atom_cache_path
+    return args.otd_atom_cache_path
+
+
 def run(
     cmd: list[str],
     *,
@@ -326,7 +344,7 @@ def resolve_embedding_cache_path(
 ) -> Path:
     explicit = resolved_optional_path(explicit_path)
     if (
-        tree_policy != "certified_dual_view_otd"
+        not is_certified_single_parent_tree(tree_policy)
         or tree_scenario != "dynamic_update"
     ):
         return explicit or (scenario_dir / "cache" / "embedding_cache.sqlite")
@@ -334,7 +352,7 @@ def resolve_embedding_cache_path(
     atom_cache = resolved_optional_path(atom_cache_path)
     if atom_cache is None:
         raise ValueError(
-            "controlled certified_dual_view_otd dynamic runs require a "
+            f"controlled {tree_policy} dynamic runs require a "
             "frozen atom cache"
         )
     if not atom_cache.is_file():
@@ -359,11 +377,11 @@ def resolve_embedding_cache_path(
     if (
         source_config.get("scenario") != "static_build"
         or source_config.get("hierarchy", {}).get("tree_policy")
-        != "certified_dual_view_otd"
+        != tree_policy
         or atom_cache != (source_output / "experience_atoms.json").resolve()
     ):
         raise ValueError(
-            "frozen atom cache is not bound to a matching static CDOST run"
+            "frozen atom cache is not bound to a matching static tree run"
         )
     source_cache = resolved_optional_path(
         source_config.get("embedding", {}).get("cache_path")
@@ -375,7 +393,7 @@ def resolve_embedding_cache_path(
         )
     if explicit is not None and explicit != source_cache:
         raise ValueError(
-            "controlled static/dynamic CDOST runs must share the same "
+            "controlled static/dynamic tree runs must share the same "
             "content-addressed embedding vector cache"
         )
     source_vector_manifest = (
@@ -409,6 +427,12 @@ def stage_source_fingerprints(repo: Path) -> dict[str, dict[str, str | bool | in
         "spreadsheetbench_support": path_fingerprint(repo / "spreadsheetbench_support.py"),
         "spreadsheet_agent": path_fingerprint(repo / "spreadsheet_agent", source_only=True),
         "react_agent": path_fingerprint(repo / "src" / "react_agent", source_only=True),
+        "skillbank": path_fingerprint(
+            repo / "src" / "dynamix_trace2skill" / "skillbank.py"
+        ),
+        "antichain_retrieval": path_fingerprint(
+            repo / "src" / "dynamix_core" / "certified_otd.py"
+        ),
         "dynamix_core": path_fingerprint(repo / "src" / "dynamix_core", source_only=True),
         "dynamix_trace2skill": path_fingerprint(repo / "src" / "dynamix_trace2skill", source_only=True),
     }
@@ -595,6 +619,8 @@ def cdost_control_contract(
                 "spreadsheetbench_support",
                 "spreadsheet_agent",
                 "react_agent",
+                "skillbank",
+                "antichain_retrieval",
                 "dynamix_core",
                 "dynamix_trace2skill",
             )
@@ -613,6 +639,230 @@ def write_cdost_control_manifest(
     }
     write_json_atomic(path, payload)
     return payload
+
+
+def ebst_control_contract(
+    *,
+    args: argparse.Namespace,
+    config: Mapping[str, Any],
+    records_path: Path,
+    dataset_fingerprint: Mapping[str, Any],
+    generation_config_path: Path,
+    evaluator_identity: Mapping[str, Any],
+    source_fingerprints: Mapping[str, Mapping[str, Any]],
+) -> dict[str, object]:
+    contract = cdost_control_contract(
+        args=args,
+        config=config,
+        records_path=records_path,
+        dataset_fingerprint=dataset_fingerprint,
+        generation_config_path=generation_config_path,
+        evaluator_identity=evaluator_identity,
+        source_fingerprints=source_fingerprints,
+    )
+    hierarchy = config.get("hierarchy")
+    if not isinstance(hierarchy, Mapping):
+        raise ValueError("hierarchy config must be a mapping")
+    raw_ebst = hierarchy.get("ebst")
+    if not isinstance(raw_ebst, Mapping):
+        raise ValueError("hierarchy.ebst config must be a mapping")
+    ebst = dict(raw_ebst)
+    ebst.pop("atom_cache_path", None)
+    tree_contract = contract.get("tree")
+    if not isinstance(tree_contract, Mapping):
+        raise RuntimeError("CDOST control contract is missing tree settings")
+    contract["format"] = "ebst_control_contract_v1"
+    contract["tree"] = {
+        **dict(tree_contract),
+        "tree_policy": "evidence_balanced_skill_tree",
+        "ebst": ebst,
+    }
+    contract["tree"].pop("otd", None)
+    return contract
+
+
+def write_ebst_control_manifest(
+    path: Path,
+    contract: dict[str, object],
+) -> dict[str, object]:
+    payload = {
+        "format": "ebst_control_manifest_v1",
+        "contract_sha256": _canonical_sha256(contract),
+        "contract": contract,
+    }
+    write_json_atomic(path, payload)
+    return payload
+
+
+def validate_matching_ebst_control_manifest(
+    *,
+    current_manifest: Path,
+    source_manifest: Path,
+) -> None:
+    current = json.loads(current_manifest.read_text(encoding="utf-8"))
+    source = json.loads(source_manifest.read_text(encoding="utf-8"))
+    for path, payload in (
+        (current_manifest, current),
+        (source_manifest, source),
+    ):
+        if (
+            payload.get("format") != "ebst_control_manifest_v1"
+            or payload.get("contract_sha256")
+            != _canonical_sha256(payload.get("contract"))
+        ):
+            raise ValueError(
+                f"invalid evidence-balanced control manifest: {path}"
+            )
+    if current["contract"] != source["contract"]:
+        raise ValueError(
+            "dynamic evidence-balanced control contract differs from the "
+            "source static run"
+        )
+
+
+def _without_keys(
+    payload: Mapping[str, Any],
+    *keys: str,
+) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in set(keys)
+    }
+
+
+def _ebst_baseline_invariants(
+    contract: Mapping[str, Any],
+    *,
+    tree_policy: str,
+) -> dict[str, Any]:
+    tree = dict(contract.get("tree") or {})
+    source = dict(contract.get("source") or {})
+    rollout_evaluator_source = {
+        key: source.get(key)
+        for key in (
+            "run_spreadsheetbench",
+            "evaluate_with_official",
+            "spreadsheetbench_support",
+            "spreadsheet_agent",
+            "react_agent",
+            "skillbank",
+            "antichain_retrieval",
+        )
+    }
+    generation = _without_keys(
+        dict(tree.get("generation") or {}),
+        "base_url",
+        "api_key_fingerprint",
+    )
+    embedding = _without_keys(
+        dict(tree.get("embedding") or {}),
+        "base_url",
+        "api_key_fingerprint",
+    )
+    retrieval = _without_keys(
+        dict(contract.get("retrieval") or {}),
+        "embedding_base_url",
+        "embedding_api_key_fingerprint",
+    )
+    rollout = _without_keys(
+        dict(contract.get("rollout") or {}),
+        "openai_base_url",
+        "openai_api_key_fingerprint",
+        "instance_ids",
+        "missing_only",
+        "sample",
+    )
+    if tree_policy == "certified_dual_view_otd":
+        method = dict(tree.get("otd") or {})
+        method_invariants = {
+            "dual_view_lambda": method.get("dual_view_lambda"),
+            "atom_temperature": method.get("atom_temperature"),
+            "skill_temperature": method.get("parent_temperature"),
+            "retrieval_token_budget": method.get(
+                "retrieval_token_budget"
+            ),
+            "retrieval_token_unit": method.get("retrieval_token_unit"),
+            "retrieval_exact_search_max_states": method.get(
+                "retrieval_exact_search_max_states"
+            ),
+            "validation_mode": method.get("validation_mode"),
+        }
+    elif tree_policy == "evidence_balanced_skill_tree":
+        method = dict(tree.get("ebst") or {})
+        method_invariants = {
+            "dual_view_lambda": method.get("dual_view_lambda"),
+            "atom_temperature": method.get("atom_temperature"),
+            "skill_temperature": method.get("capsule_temperature"),
+            "retrieval_token_budget": method.get(
+                "retrieval_token_budget"
+            ),
+            "retrieval_token_unit": method.get("retrieval_token_unit"),
+            "retrieval_exact_search_max_states": method.get(
+                "retrieval_exact_search_max_states"
+            ),
+            "validation_mode": method.get("validation_mode"),
+        }
+    else:
+        raise ValueError(f"unsupported control tree policy: {tree_policy}")
+    return {
+        "dataset": contract.get("dataset"),
+        "records_sha256": contract.get("records_sha256"),
+        "train_split": contract.get("train_split"),
+        "heldout_split": contract.get("heldout_split"),
+        "generation": generation,
+        "embedding": embedding,
+        "analyst": tree.get("analyst"),
+        "method_invariants": method_invariants,
+        "paired_dynamic_schedule": contract.get(
+            "paired_dynamic_schedule"
+        ),
+        "retrieval": retrieval,
+        "rollout": rollout,
+        "evaluator": contract.get("evaluator"),
+        "rollout_evaluator_source": rollout_evaluator_source,
+    }
+
+
+def validate_ebst_against_cdost_baseline(
+    *,
+    current_contract: Mapping[str, Any],
+    baseline_manifest: Path,
+) -> dict[str, Any]:
+    baseline = json.loads(baseline_manifest.read_text(encoding="utf-8"))
+    if (
+        baseline.get("format") != "cdost_control_manifest_v1"
+        or baseline.get("contract_sha256")
+        != _canonical_sha256(baseline.get("contract"))
+    ):
+        raise ValueError(
+            f"invalid baseline CDOST control manifest: {baseline_manifest}"
+        )
+    expected = _ebst_baseline_invariants(
+        dict(baseline["contract"]),
+        tree_policy="certified_dual_view_otd",
+    )
+    observed = _ebst_baseline_invariants(
+        current_contract,
+        tree_policy="evidence_balanced_skill_tree",
+    )
+    if observed != expected:
+        differing = sorted(
+            key
+            for key in expected
+            if observed.get(key) != expected.get(key)
+        )
+        raise ValueError(
+            "evidence-balanced treatment is not protocol-compatible with "
+            f"its CDOST baseline; differing sections: {differing}"
+        )
+    return {
+        "format": "ebst_cdost_baseline_compatibility_v1",
+        "compatible": True,
+        "baseline_manifest": path_fingerprint(baseline_manifest),
+        "baseline_contract_sha256": baseline["contract_sha256"],
+        "invariants_sha256": _canonical_sha256(observed),
+    }
 
 
 def validate_matching_cdost_control_manifest(
@@ -670,7 +920,7 @@ def skillbank_retrieval_protocol(
     vector_cache_path: Path,
     selection_log: Path,
 ) -> dict[str, object]:
-    is_cdost = args.tree_policy == "certified_dual_view_otd"
+    strict_tree = is_certified_single_parent_tree(args.tree_policy)
     protocol: dict[str, object] = {
         "query_policy": "instruction + Task type; answer_position excluded",
         "top_k": int(args.skillbank_top_k),
@@ -683,14 +933,14 @@ def skillbank_retrieval_protocol(
         "embedding_tokenizer": args.embedding_tokenizer,
         "vector_cache_path": str(vector_cache_path),
         "require_vector_cache_match": (
-            is_cdost
+            strict_tree
             and args.tree_scenario == "dynamic_update"
         ),
-        "require_cache_match": is_cdost,
+        "require_cache_match": strict_tree,
         "cache_path": str(cache_path),
         "selection_log": str(selection_log),
     }
-    if is_cdost:
+    if strict_tree:
         protocol.update(
             {
                 "embedding_input_policy": (
@@ -867,6 +1117,49 @@ def validate_tree_summary_for_heldout(summary: dict, args: argparse.Namespace) -
         ):
             raise RuntimeError(
                 "controlled CDOST dynamic heldout requires frozen_cache atoms"
+            )
+    if getattr(args, "tree_policy", "") == "evidence_balanced_skill_tree":
+        if summary.get("tree_policy") != "evidence_balanced_skill_tree":
+            raise RuntimeError(
+                "heldout requires an evidence_balanced_skill_tree"
+            )
+        if int(summary.get("excluded_count", -1)) != 0:
+            raise RuntimeError(
+                "heldout is blocked because the evidence-balanced tree "
+                "excluded input records"
+            )
+        if int(summary.get("atom_count", -1)) != int(
+            summary.get("record_count", -2)
+        ):
+            raise RuntimeError(
+                "heldout is blocked because atom_count does not match "
+                "record_count"
+            )
+        if int(summary.get("retrievable_atom_count", -1)) != 0:
+            raise RuntimeError(
+                "heldout is blocked because raw evidence atoms are retrievable"
+            )
+        if int(summary.get("active_capsule_count", 0)) <= 0:
+            raise RuntimeError(
+                "heldout is blocked because no active skill capsule exists"
+            )
+        if int(summary.get("runtime_generation_error_count", -1)) != 0:
+            raise RuntimeError(
+                "heldout is blocked because skill capsule generation had "
+                "runtime errors"
+            )
+        if int(summary.get("prompt_budget_error_count", -1)) != 0:
+            raise RuntimeError(
+                "heldout is blocked because skill capsule generation exceeded "
+                "the configured prompt budget"
+            )
+        if (
+            scenario == "dynamic_update"
+            and summary.get("atom_source") != "frozen_cache"
+        ):
+            raise RuntimeError(
+                "controlled evidence-balanced dynamic heldout requires "
+                "frozen_cache atoms"
             )
     if args.tree_scenario != "dynamic_update":
         return
@@ -1051,9 +1344,8 @@ def collect_chunked_embedding_stats(path: Path) -> dict[str, Any]:
 
 def runtime_dead_corner_findings(args: argparse.Namespace) -> list[dict[str, str]]:
     findings: list[dict[str, str]] = []
-    is_cdost = (
+    strict_tree = is_certified_single_parent_tree(
         str(getattr(args, "tree_policy", "")).strip()
-        == "certified_dual_view_otd"
     )
     analyst_budget = int(float(args.summary_max_model_tokens) * float(args.summary_budget_ratio))
     evidence_budget = analyst_budget - int(args.summary_prompt_overhead_reserve_tokens)
@@ -1064,7 +1356,7 @@ def runtime_dead_corner_findings(args: argparse.Namespace) -> list[dict[str, str
             "finding": "analyst prompt budget leaves little context-window headroom for chat-template/thinking overhead.",
             "evidence": f"analyst_budget={analyst_budget}, max_model_tokens={args.summary_max_model_tokens}",
         })
-    if not is_cdost and evidence_budget <= 0:
+    if not strict_tree and evidence_budget <= 0:
         findings.append({
             "severity": "blocker",
             "area": "summary_budget",
@@ -1072,7 +1364,7 @@ def runtime_dead_corner_findings(args: argparse.Namespace) -> list[dict[str, str
             "evidence": f"analyst_budget={analyst_budget}, overhead={args.summary_prompt_overhead_reserve_tokens}",
         })
     if (
-        not is_cdost
+        not strict_tree
         and int(args.analyst_max_prompt_tokens) > 0
         and int(args.analyst_max_prompt_tokens) < evidence_budget
     ):
@@ -1082,21 +1374,21 @@ def runtime_dead_corner_findings(args: argparse.Namespace) -> list[dict[str, str
             "finding": "analyst max prompt override is smaller than the tree-builder evidence budget; build may pass but analyst preflight can fail.",
             "evidence": f"analyst_max_prompt_tokens={args.analyst_max_prompt_tokens}, evidence_budget={evidence_budget}",
         })
-    if not is_cdost and int(args.budget_refinement_apply_to_level) == 0:
+    if not strict_tree and int(args.budget_refinement_apply_to_level) == 0:
         findings.append({
             "severity": "watch",
             "area": "budget_refinement",
             "finding": "budget refinement only protects L0 raw-trajectory communities; unusually verbose L1+ cards can still trigger analyst over-budget failures.",
             "evidence": "budget_refinement_apply_to_level=0",
         })
-    if not is_cdost and args.soft_recursive_assignment == "cumulative_mass":
+    if not strict_tree and args.soft_recursive_assignment == "cumulative_mass":
         findings.append({
             "severity": "info",
             "area": "soft_membership",
             "finding": "top_r_memberships is inactive under cumulative_mass assignment; max_membership_gap and cumulative_mass_coverage control fan-out.",
             "evidence": f"recursive_assignment={args.soft_recursive_assignment}, top_r={args.soft_top_r_memberships}",
         })
-    if not is_cdost and args.soft_recursive_assignment == "cumulative_mass":
+    if not strict_tree and args.soft_recursive_assignment == "cumulative_mass":
         findings.append({
             "severity": "info",
             "area": "soft_membership",
@@ -1137,13 +1429,35 @@ def validate_nodebank_manifest_for_heldout(
     manifest: dict[str, Any],
     args: argparse.Namespace,
 ) -> None:
-    if args.tree_policy != "certified_dual_view_otd":
+    if not is_certified_single_parent_tree(args.tree_policy):
         return
-    if manifest.get("tree_policy") != "certified_dual_view_otd":
-        raise RuntimeError("CDOST nodebank tree_policy identity is missing")
+    if manifest.get("tree_policy") != args.tree_policy:
+        raise RuntimeError(
+            f"{args.tree_policy} nodebank tree_policy identity is missing"
+        )
     export_policy = dict(manifest.get("export_policy", {}))
     if export_policy.get("heldout_retrieval") != "tree_antichain_knapsack":
-        raise RuntimeError("CDOST nodebank antichain retrieval policy is missing")
+        raise RuntimeError(
+            f"{args.tree_policy} nodebank antichain retrieval policy is missing"
+        )
+    if args.tree_policy == "evidence_balanced_skill_tree":
+        if export_policy.get("experience_atoms_exported") is not False:
+            raise RuntimeError(
+                "evidence-balanced nodebank must exclude experience atoms"
+            )
+        if export_policy.get("retrieval_unit") != "validated_skill_capsule":
+            raise RuntimeError(
+                "evidence-balanced nodebank must retrieve skill capsules"
+            )
+        source_root = Path(__file__).resolve().parents[1] / "src"
+        source_root_text = str(source_root)
+        if source_root_text not in sys.path:
+            sys.path.insert(0, source_root_text)
+        from dynamix_trace2skill.skillbank import (
+            validate_ebst_nodebank_manifest,
+        )
+
+        validate_ebst_nodebank_manifest(manifest)
 
 
 def active_hierarchy_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1153,10 +1467,15 @@ def active_hierarchy_payload(payload: dict[str, Any]) -> dict[str, Any]:
             key: payload[key]
             for key in ("tree_policy", "otd", "summary_budget")
         }
+    if tree_policy == "evidence_balanced_skill_tree":
+        return {
+            key: payload[key]
+            for key in ("tree_policy", "ebst", "summary_budget")
+        }
     return {
         key: value
         for key, value in payload.items()
-        if key != "otd"
+        if key not in {"otd", "ebst"}
     }
 
 
@@ -1165,7 +1484,7 @@ def active_dynamic_payload(
     *,
     tree_policy: str,
 ) -> dict[str, Any]:
-    if tree_policy != "certified_dual_view_otd":
+    if not is_certified_single_parent_tree(tree_policy):
         return dict(payload)
     return {
         key: payload[key]
@@ -1181,7 +1500,7 @@ def active_dynamic_payload(
 
 
 def method_runtime_identity(args: argparse.Namespace) -> dict[str, Any]:
-    if args.tree_policy != "certified_dual_view_otd":
+    if not is_certified_single_parent_tree(args.tree_policy):
         return {
             "tree_policy": args.tree_policy,
             "structural_graph_kind": args.graph_kind,
@@ -1189,6 +1508,35 @@ def method_runtime_identity(args: argparse.Namespace) -> dict[str, Any]:
             "allow_multi_parent": bool(args.allow_multi_parent),
         }
     dynamic = args.tree_scenario == "dynamic_update"
+    if args.tree_policy == "evidence_balanced_skill_tree":
+        return {
+            "tree_policy": "evidence_balanced_skill_tree",
+            "structural_graph_kind": "single_parent_balanced_metric_tree",
+            "allow_overlap": False,
+            "allow_multi_parent": False,
+            "arrival_update_semantics": (
+                "sequential_structural_insert"
+                if dynamic
+                else "static_dataset_order_same_insert_operation"
+            ),
+            "parent_refresh_semantics": (
+                "changed_path_batched_bottom_up"
+                if dynamic
+                else "all_nodes_bottom_up_after_build"
+            ),
+            "snapshot_interval": (
+                max(1, int(args.dynamic_update_batch_size))
+                if dynamic
+                else None
+            ),
+            "nodebank_scope": "active_skill_capsules_only",
+            "retrieval_policy": "tree_antichain_knapsack",
+            "embedding_vector_control": (
+                "shared_content_addressed_cache_required"
+                if dynamic
+                else "content_addressed_cache_populates_control"
+            ),
+        }
     return {
         "tree_policy": "certified_dual_view_otd",
         "structural_graph_kind": "single_parent_binary_tree",
@@ -1478,6 +1826,38 @@ def main() -> None:
             "antichain retrieval cannot use its unique-optimum fast path."
         ),
     )
+    parser.add_argument("--ebst-max-entries", type=int, default=8)
+    parser.add_argument("--ebst-dual-view-lambda", type=float, default=0.5)
+    parser.add_argument("--ebst-atom-temperature", type=float, default=0.0)
+    parser.add_argument("--ebst-capsule-temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--ebst-validator-temperature",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--ebst-atom-cache-path",
+        default=None,
+        help=(
+            "Frozen experience_atoms.json used by the paired dynamic "
+            "evidence-balanced tree run"
+        ),
+    )
+    parser.add_argument(
+        "--ebst-retrieval-token-budget",
+        type=int,
+        default=24000,
+    )
+    parser.add_argument(
+        "--ebst-retrieval-token-unit",
+        type=int,
+        default=128,
+    )
+    parser.add_argument(
+        "--ebst-retrieval-exact-search-max-states",
+        type=int,
+        default=250_000,
+    )
     parser.add_argument("--graph-kind", default="overlapping_experience_hierarchy")
     parser.add_argument("--allow-overlap", type=parse_bool, default=True)
     parser.add_argument("--allow-multi-parent", type=parse_bool, default=True)
@@ -1492,7 +1872,9 @@ def main() -> None:
             "Legacy dynamic policies: sequential admissions per layer-local "
             "summary batch. certified_dual_view_otd: snapshot interval only; "
             "every atom is inserted and its changed parent path refreshed "
-            "before the next arrival."
+            "before the next arrival. evidence_balanced_skill_tree: structural "
+            "insertions remain sequential; this controls how many arrivals "
+            "share one parallel local Skill Capsule refresh."
         ),
     )
     parser.add_argument(
@@ -1511,8 +1893,8 @@ def main() -> None:
         default=True,
         help=(
             "Legacy dynamic snapshot embedding control. "
-            "certified_dual_view_otd snapshots its complete immutable atom "
-            "state and requires this to remain true."
+            "Both certified single-parent policies snapshot their complete "
+            "immutable atom state and require this to remain true."
         ),
     )
     parser.add_argument(
@@ -1521,8 +1903,8 @@ def main() -> None:
         default=False,
         help=(
             "Legacy dynamic snapshot resume control. "
-            "certified_dual_view_otd rejects snapshot resume until a "
-            "validated resume protocol is implemented."
+            "Certified single-parent policies reject snapshot resume until "
+            "a validated resume protocol is implemented."
         ),
     )
     parser.add_argument("--max-levels", type=int, default=8)
@@ -1649,42 +2031,42 @@ def main() -> None:
     args = parser.parse_args()
 
     if (
-        args.tree_policy == "certified_dual_view_otd"
+        is_certified_single_parent_tree(args.tree_policy)
         and int(args.dynamic_shuffle_seed) >= 0
     ):
         parser.error(
-            "certified_dual_view_otd paired runs require dataset order; "
+            f"{args.tree_policy} paired runs require dataset order; "
             "pass --dynamic-shuffle-seed -1"
         )
     if (
-        args.tree_policy == "certified_dual_view_otd"
+        is_certified_single_parent_tree(args.tree_policy)
         and args.tree_scenario == "dynamic_update"
-        and not str(args.otd_atom_cache_path or "").strip()
+        and not str(atom_cache_path_for_args(args) or "").strip()
     ):
         parser.error(
-            "controlled certified_dual_view_otd dynamic runs require "
-            "--otd-atom-cache-path from the matching static extraction"
+            f"controlled {args.tree_policy} dynamic runs require the "
+            "matching --otd-atom-cache-path or --ebst-atom-cache-path"
         )
     if (
-        args.tree_policy == "certified_dual_view_otd"
+        is_certified_single_parent_tree(args.tree_policy)
         and bool(args.dynamic_resume_from_snapshots)
     ):
         parser.error(
-            "certified_dual_view_otd snapshot resume is not implemented with "
+            f"{args.tree_policy} snapshot resume is not implemented with "
             "fingerprint validation; pass --dynamic-resume-from-snapshots false"
         )
     if (
-        args.tree_policy == "certified_dual_view_otd"
+        is_certified_single_parent_tree(args.tree_policy)
         and not bool(args.dynamic_snapshot_include_embeddings)
     ):
         parser.error(
-            "certified_dual_view_otd requires "
+            f"{args.tree_policy} requires "
             "--dynamic-snapshot-include-embeddings true"
         )
-    if args.tree_policy == "certified_dual_view_otd":
+    if is_certified_single_parent_tree(args.tree_policy):
         if int(args.max_levels) != 8:
             parser.error(
-                "certified_dual_view_otd builds the complete binary tree; "
+                f"{args.tree_policy} builds its complete structural tree; "
                 "--max-levels is inactive and must remain 8"
             )
         if (
@@ -1692,10 +2074,15 @@ def main() -> None:
             or int(args.skill_export_max_level) >= 0
         ):
             parser.error(
-                "certified_dual_view_otd antichain retrieval requires the "
+                f"{args.tree_policy} antichain retrieval requires the "
                 "complete tree; skill-export level filters are not allowed"
             )
-    if args.tree_policy != "certified_dual_view_otd":
+    if args.tree_policy == "evidence_balanced_skill_tree":
+        if int(args.ebst_max_entries) < 4:
+            parser.error("--ebst-max-entries must be at least 4")
+        if not 0.0 <= float(args.ebst_dual_view_lambda) <= 1.0:
+            parser.error("--ebst-dual-view-lambda must be in [0, 1]")
+    if not is_certified_single_parent_tree(args.tree_policy):
         if args.dynamic_update_mode != "budget_constrained_online_gmm":
             parser.error("--dynamic-update-mode is currently fixed to budget_constrained_online_gmm; this is not a tunable protocol knob")
         if not bool(args.dynamic_update_routing_model):
@@ -1741,10 +2128,30 @@ def main() -> None:
         parser.error("--records-path and --reuse-train-run-dir are mutually exclusive")
     if reuse_train_run_dir is not None:
         train_artifact_dir = reuse_train_run_dir
-    if reuse_tree_dir is not None and not (reuse_tree_dir / "hierarchy_state.json").is_file():
-        raise FileNotFoundError(f"--reuse-tree-dir must contain hierarchy_state.json: {reuse_tree_dir}")
+    reuse_tree_state_name = (
+        "balanced_tree_state.json"
+        if args.tree_policy == "evidence_balanced_skill_tree"
+        else "hierarchy_state.json"
+    )
+    if (
+        reuse_tree_dir is not None
+        and not (reuse_tree_dir / reuse_tree_state_name).is_file()
+    ):
+        raise FileNotFoundError(
+            f"--reuse-tree-dir must contain {reuse_tree_state_name}: "
+            f"{reuse_tree_dir}"
+        )
     if reuse_tree_dir is not None and records_path_arg is None and reuse_train_run_dir is None:
         raise RuntimeError("--reuse-tree-dir requires --records-path or --reuse-train-run-dir so train stages are not re-run for retrieval-only ablations")
+    if (
+        reuse_tree_dir is not None
+        and args.tree_policy == "evidence_balanced_skill_tree"
+    ):
+        raise RuntimeError(
+            "--reuse-tree-dir export is not implemented for "
+            "evidence_balanced_skill_tree; use the original completed run "
+            "directly"
+        )
     run_dir.mkdir(parents=True, exist_ok=True)
     train_artifact_dir.mkdir(parents=True, exist_ok=True)
     scenario_dir.mkdir(parents=True, exist_ok=True)
@@ -1753,7 +2160,7 @@ def main() -> None:
         scenario_dir=scenario_dir,
         tree_policy=args.tree_policy,
         tree_scenario=args.tree_scenario,
-        atom_cache_path=args.otd_atom_cache_path,
+        atom_cache_path=atom_cache_path_for_args(args),
     )
     train_stage_logs = train_artifact_dir / "logs"
     train_markers = train_artifact_dir / "stage_markers"
@@ -1809,19 +2216,19 @@ def main() -> None:
         "method_identity": method_runtime_identity(args),
         "dynamic_initial_count": (
             int(args.dynamic_initial_count)
-            if args.tree_policy != "certified_dual_view_otd"
+            if not is_certified_single_parent_tree(args.tree_policy)
             or args.tree_scenario == "dynamic_update"
             else None
         ),
         "dynamic_arrival_count": (
             int(args.dynamic_arrival_count)
-            if args.tree_policy != "certified_dual_view_otd"
+            if not is_certified_single_parent_tree(args.tree_policy)
             or args.tree_scenario == "dynamic_update"
             else None
         ),
         "dynamic_snapshot_interval": (
             max(1, int(args.dynamic_update_batch_size))
-            if args.tree_policy == "certified_dual_view_otd"
+            if is_certified_single_parent_tree(args.tree_policy)
             and args.tree_scenario == "dynamic_update"
             else None
         ),
@@ -1833,13 +2240,13 @@ def main() -> None:
         "dynamic_shuffle_seed": None if int(args.dynamic_shuffle_seed) < 0 else int(args.dynamic_shuffle_seed),
         "dynamic_snapshot_include_embeddings": (
             bool(args.dynamic_snapshot_include_embeddings)
-            if args.tree_policy != "certified_dual_view_otd"
+            if not is_certified_single_parent_tree(args.tree_policy)
             or args.tree_scenario == "dynamic_update"
             else None
         ),
         "dynamic_resume_from_snapshots": (
             bool(args.dynamic_resume_from_snapshots)
-            if args.tree_policy != "certified_dual_view_otd"
+            if not is_certified_single_parent_tree(args.tree_policy)
             or args.tree_scenario == "dynamic_update"
             else None
         ),
@@ -2103,7 +2510,7 @@ def main() -> None:
             "cache_path": str(embedding_cache_path),
             "cache_write_policy": (
                 "first_write_wins"
-                if args.tree_policy == "certified_dual_view_otd"
+                if is_certified_single_parent_tree(args.tree_policy)
                 else "replace"
             ),
         },
@@ -2128,6 +2535,28 @@ def main() -> None:
                 "retrieval_token_unit": int(args.otd_retrieval_token_unit),
                 "retrieval_exact_search_max_states": int(
                     args.otd_retrieval_exact_search_max_states
+                ),
+                "validation_mode": "structural_only",
+            },
+            "ebst": {
+                "max_entries": int(args.ebst_max_entries),
+                "dual_view_lambda": float(args.ebst_dual_view_lambda),
+                "atom_temperature": float(args.ebst_atom_temperature),
+                "capsule_temperature": float(
+                    args.ebst_capsule_temperature
+                ),
+                "validator_temperature": float(
+                    args.ebst_validator_temperature
+                ),
+                "atom_cache_path": args.ebst_atom_cache_path,
+                "retrieval_token_budget": int(
+                    args.ebst_retrieval_token_budget
+                ),
+                "retrieval_token_unit": int(
+                    args.ebst_retrieval_token_unit
+                ),
+                "retrieval_exact_search_max_states": int(
+                    args.ebst_retrieval_exact_search_max_states
                 ),
                 "validation_mode": "structural_only",
             },
@@ -2238,7 +2667,11 @@ def main() -> None:
     cdost_control_manifest_path = (
         scenario_dir / "analysis" / "cdost_control_manifest.json"
     )
+    ebst_control_manifest_path = (
+        scenario_dir / "analysis" / "ebst_control_manifest.json"
+    )
     source_cdost_control_manifest: Path | None = None
+    source_ebst_control_manifest: Path | None = None
     if args.tree_policy == "certified_dual_view_otd":
         contract = cdost_control_contract(
             args=args,
@@ -2277,6 +2710,98 @@ def main() -> None:
             validate_matching_cdost_control_manifest(
                 current_manifest=cdost_control_manifest_path,
                 source_manifest=source_cdost_control_manifest,
+            )
+    if args.tree_policy == "evidence_balanced_skill_tree":
+        contract = ebst_control_contract(
+            args=args,
+            config=config,
+            records_path=records,
+            dataset_fingerprint=dataset_fp,
+            generation_config_path=scenario_gen_config_path,
+            evaluator_identity=evaluator_identity,
+            source_fingerprints=source_fp,
+        )
+        baseline_compatibility: dict[str, Any] | None = None
+        source_ebst_control_manifest: Path | None = None
+        atom_cache_for_control = resolved_optional_path(
+            args.ebst_atom_cache_path
+        )
+        if args.tree_scenario == "static_build":
+            if atom_cache_for_control is None:
+                raise ValueError(
+                    "controlled evidence-balanced static runs require the "
+                    "baseline CDOST experience_atoms.json"
+                )
+            baseline_cdost_manifest = (
+                atom_cache_for_control.parent.parent
+                / "analysis"
+                / "cdost_control_manifest.json"
+            )
+            validate_source_build_output(
+                marker_path=(
+                    atom_cache_for_control.parent.parent
+                    / "stage_markers"
+                    / "04_build_tree.done"
+                ),
+                output_path=baseline_cdost_manifest,
+            )
+            baseline_compatibility = validate_ebst_against_cdost_baseline(
+                current_contract=contract,
+                baseline_manifest=baseline_cdost_manifest,
+            )
+            contract["baseline_cdost"] = baseline_compatibility
+        else:
+            if atom_cache_for_control is None:
+                raise ValueError(
+                    "dynamic evidence-balanced tree requires a source atom "
+                    "cache"
+                )
+            source_ebst_control_manifest = (
+                atom_cache_for_control.parent.parent
+                / "analysis"
+                / "ebst_control_manifest.json"
+            )
+            validate_source_build_output(
+                marker_path=(
+                    atom_cache_for_control.parent.parent
+                    / "stage_markers"
+                    / "04_build_tree.done"
+                ),
+                output_path=source_ebst_control_manifest,
+            )
+            source_payload = json.loads(
+                source_ebst_control_manifest.read_text(encoding="utf-8")
+            )
+            if (
+                source_payload.get("format")
+                != "ebst_control_manifest_v1"
+                or source_payload.get("contract_sha256")
+                != _canonical_sha256(source_payload.get("contract"))
+            ):
+                raise ValueError(
+                    "invalid source evidence-balanced control manifest"
+                )
+            baseline_compatibility = dict(
+                source_payload["contract"].get("baseline_cdost") or {}
+            )
+            if not baseline_compatibility.get("compatible"):
+                raise ValueError(
+                    "source static evidence-balanced run has no validated "
+                    "CDOST baseline binding"
+                )
+            contract["baseline_cdost"] = baseline_compatibility
+        write_ebst_control_manifest(
+            ebst_control_manifest_path,
+            contract,
+        )
+        write_json_atomic(
+            scenario_dir / "analysis" / "ebst_baseline_compatibility.json",
+            baseline_compatibility,
+        )
+        if source_ebst_control_manifest is not None:
+            validate_matching_ebst_control_manifest(
+                current_manifest=ebst_control_manifest_path,
+                source_manifest=source_ebst_control_manifest,
             )
     if reuse_tree_dir is not None:
         if tree_dir.resolve() == reuse_tree_dir.resolve():
@@ -2317,7 +2842,7 @@ def main() -> None:
             "dynamix_trace2skill": source_fp["dynamix_trace2skill"],
         }
         reuse_tree_fingerprint = {"exists": False}
-    atom_cache_path = resolved_optional_path(args.otd_atom_cache_path)
+    atom_cache_path = resolved_optional_path(atom_cache_path_for_args(args))
     source_vector_cache_manifest = (
         atom_cache_path.parent / "embedding_vector_cache_manifest.json"
         if atom_cache_path is not None
@@ -2346,6 +2871,16 @@ def main() -> None:
         "source_cdost_control_manifest": (
             path_fingerprint(source_cdost_control_manifest)
             if source_cdost_control_manifest is not None
+            else {"exists": False}
+        ),
+        "ebst_control_manifest": (
+            path_fingerprint(ebst_control_manifest_path)
+            if args.tree_policy == "evidence_balanced_skill_tree"
+            else {"exists": False}
+        ),
+        "source_ebst_control_manifest": (
+            path_fingerprint(source_ebst_control_manifest)
+            if source_ebst_control_manifest is not None
             else {"exists": False}
         ),
         "openai_api_key": api_key_fingerprint(args.openai_api_key),
@@ -2381,6 +2916,25 @@ def main() -> None:
                 cdost_control_manifest_path,
             ]
         )
+    if args.tree_policy == "evidence_balanced_skill_tree":
+        build_outputs.extend(
+            [
+                tree_dir / "experience_atoms.json",
+                tree_dir / "balanced_tree_state.json",
+                tree_dir / "balanced_tree_insertions.jsonl",
+                tree_dir / "skill_capsules.json",
+                tree_dir / "skill_capsules.jsonl",
+                tree_dir / "skill_lifecycle_events.jsonl",
+                tree_dir / "tree_quality_audit.json",
+                tree_dir / "analysis" / "runtime_config.json",
+                tree_dir / "analysis" / "run_manifest.json",
+                tree_dir / "embedding_vector_cache_manifest.json",
+                ebst_control_manifest_path,
+                scenario_dir
+                / "analysis"
+                / "ebst_baseline_compatibility.json",
+            ]
+        )
     run_stage(
         "04_build_tree",
         build_tree_cmd,
@@ -2396,7 +2950,7 @@ def main() -> None:
         ],
         fingerprint=build_tree_fingerprint,
     )
-    if args.tree_policy == "certified_dual_view_otd":
+    if is_certified_single_parent_tree(args.tree_policy):
         validate_cdost_vector_cache(
             cache_path=embedding_cache_path,
             manifest_path=(
@@ -2433,28 +2987,28 @@ def main() -> None:
     )
     env["DYNAMIX_SKILLBANK_CHUNK_TOKENS"] = (
         ""
-        if args.tree_policy == "certified_dual_view_otd"
+        if is_certified_single_parent_tree(args.tree_policy)
         or not args.chunked_embedding_enabled
         else str(args.chunked_embedding_chunk_tokens)
     )
     env["DYNAMIX_SKILLBANK_CHUNK_OVERLAP_TOKENS"] = (
         ""
-        if args.tree_policy == "certified_dual_view_otd"
+        if is_certified_single_parent_tree(args.tree_policy)
         or not args.chunked_embedding_enabled
         else str(args.chunked_embedding_overlap_tokens)
     )
     env["DYNAMIX_SKILLBANK_REQUIRE_CACHE_MATCH"] = (
         "true"
-        if args.tree_policy == "certified_dual_view_otd"
+        if is_certified_single_parent_tree(args.tree_policy)
         else "false"
     )
-    if args.tree_policy == "certified_dual_view_otd":
+    if is_certified_single_parent_tree(args.tree_policy):
         env["DYNAMIX_SKILLBANK_EXPECT_TREE_POLICY"] = args.tree_policy
     skillbank_cache_path = Path(summary.get("skillbank_index") or (skillbank_root / ".dynamix_skillbank_index.json"))
     if not skillbank_cache_path.is_file():
         raise RuntimeError(f"DynaMix skillbank index missing before heldout: {skillbank_cache_path}")
     env["DYNAMIX_SKILLBANK_CACHE_PATH"] = str(skillbank_cache_path)
-    if args.tree_policy == "certified_dual_view_otd":
+    if is_certified_single_parent_tree(args.tree_policy):
         env["DYNAMIX_SKILLBANK_VECTOR_CACHE_PATH"] = str(
             embedding_cache_path
         )
@@ -2462,7 +3016,7 @@ def main() -> None:
         env.pop("DYNAMIX_SKILLBANK_VECTOR_CACHE_PATH", None)
     env["DYNAMIX_SKILLBANK_REQUIRE_VECTOR_CACHE_MATCH"] = (
         "true"
-        if args.tree_policy == "certified_dual_view_otd"
+        if is_certified_single_parent_tree(args.tree_policy)
         and args.tree_scenario == "dynamic_update"
         else "false"
     )
@@ -2476,11 +3030,13 @@ def main() -> None:
     )
     source_query_vector_manifest: Path | None = None
     if (
-        args.tree_policy == "certified_dual_view_otd"
+        is_certified_single_parent_tree(args.tree_policy)
         and args.tree_scenario == "dynamic_update"
     ):
         if atom_cache_path is None:
-            raise ValueError("dynamic CDOST requires a source atom cache")
+            raise ValueError(
+                f"dynamic {args.tree_policy} requires a source atom cache"
+            )
         source_query_vector_manifest = (
             atom_cache_path.parent.parent
             / "raw"
@@ -2598,7 +3154,7 @@ def main() -> None:
         ),
     )
 
-    if args.tree_policy == "certified_dual_view_otd":
+    if is_certified_single_parent_tree(args.tree_policy):
         query_audit_cmd = [
             python_executable,
             "scripts/audit_cdost_query_vector_cache.py",
@@ -2684,7 +3240,7 @@ def main() -> None:
             heldout_results=path_fingerprint(heldout_results),
             query_vector_manifest=(
                 path_fingerprint(query_vector_manifest)
-                if args.tree_policy == "certified_dual_view_otd"
+                if is_certified_single_parent_tree(args.tree_policy)
                 else {"exists": False}
             ),
             evaluator_identity=evaluator_identity,
@@ -2714,13 +3270,13 @@ def main() -> None:
         "skill_selection_records": str(selection_log),
         "heldout_query_embedding_cache_manifest": (
             str(query_vector_manifest)
-            if args.tree_policy == "certified_dual_view_otd"
+            if is_certified_single_parent_tree(args.tree_policy)
             else None
         ),
         "heldout_eval": str(heldout_eval),
     }
     scenario_stages = ["04_build_tree", "06_heldout_collect"]
-    if args.tree_policy == "certified_dual_view_otd":
+    if is_certified_single_parent_tree(args.tree_policy):
         scenario_stages.append("06b_query_vector_audit")
     scenario_stages.append("07_heldout_eval")
     stage_report = write_experiment_stage_report(

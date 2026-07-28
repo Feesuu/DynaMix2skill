@@ -999,6 +999,8 @@ def test_cdost_control_contract_covers_method_and_redacts_secrets(tmp_path):
         "spreadsheetbench_support",
         "spreadsheet_agent",
         "react_agent",
+        "skillbank",
+        "antichain_retrieval",
         "dynamix_core",
         "dynamix_trace2skill",
     )
@@ -5102,3 +5104,279 @@ def test_l1_singleton_community_is_summarized_by_analyst():
     generated = asyncio.run(ProjectedGmmTreeBuilder(default_hierarchy_config({}))._summarize_communities(clustering, items_by_id={"e1": member}, summary_fn=summary_fn))
     assert calls == [("L1_C000", ["e1"])]
     assert [item.item_id for item in generated] == ["e2"]
+
+
+def test_ebst_hierarchy_fingerprint_uses_only_active_policy_fields():
+    runner = _load_experiment_runner_module()
+    payload = {
+        "tree_policy": "evidence_balanced_skill_tree",
+        "ebst": {"max_entries": 8, "dual_view_lambda": 0.5},
+        "summary_budget": {"max_model_tokens": 100000},
+        "otd": {"dual_view_lambda": 0.1},
+        "gmm_bic": {"min_split_size": 999},
+    }
+    assert runner.active_hierarchy_payload(payload) == {
+        "tree_policy": "evidence_balanced_skill_tree",
+        "ebst": payload["ebst"],
+        "summary_budget": payload["summary_budget"],
+    }
+
+
+def test_ebst_runtime_identity_records_online_balanced_semantics():
+    runner = _load_experiment_runner_module()
+    args = SimpleNamespace(
+        tree_policy="evidence_balanced_skill_tree",
+        tree_scenario="dynamic_update",
+        dynamic_update_batch_size=8,
+        graph_kind="overlapping_experience_hierarchy",
+        allow_overlap=True,
+        allow_multi_parent=True,
+    )
+    identity = runner.method_runtime_identity(args)
+    assert identity["structural_graph_kind"] == (
+        "single_parent_balanced_metric_tree"
+    )
+    assert identity["allow_overlap"] is False
+    assert identity["arrival_update_semantics"] == (
+        "sequential_structural_insert"
+    )
+    assert identity["parent_refresh_semantics"] == (
+        "changed_path_batched_bottom_up"
+    )
+
+
+def test_ebst_runner_requires_capsule_only_nodebank():
+    runner = _load_experiment_runner_module()
+    args = SimpleNamespace(
+        tree_policy="evidence_balanced_skill_tree"
+    )
+    valid = {
+        "tree_policy": "evidence_balanced_skill_tree",
+        "root_node_id": "__root__",
+        "node_count": 1,
+        "nodes": [
+            {
+                "node_id": "capsule-1",
+                "item_id": "capsule-1",
+                "name": "Capsule",
+                "trigger": "matching tasks",
+                "content": "Apply the validated rule.",
+                "embedding_text": (
+                    "name: Capsule\n"
+                    "trigger: matching tasks\n"
+                    "content: Apply the validated rule."
+                ),
+                "prompt_text": "Validated capsule prompt.",
+                "analyst_mode": "evidence_bucket_consolidation",
+                "lifecycle_status": "active",
+                "evidence_atom_ids": ["atom-1", "atom-2"],
+                "parent_node_id": "__root__",
+                "child_node_ids": [],
+            }
+        ],
+        "tree_index": {
+            "root_node_id": "__root__",
+            "children_by_node": {
+                "__root__": ["capsule-1"],
+                "capsule-1": [],
+            },
+        },
+        "export_policy": {
+            "heldout_retrieval": "tree_antichain_knapsack",
+            "experience_atoms_exported": False,
+            "retrieval_unit": "validated_skill_capsule",
+        },
+    }
+    runner.validate_nodebank_manifest_for_heldout(valid, args)
+    archived = json.loads(json.dumps(valid))
+    archived["nodes"][0]["lifecycle_status"] = "archived"
+    with pytest.raises(ValueError, match="node entry is not retrievable"):
+        runner.validate_nodebank_manifest_for_heldout(archived, args)
+    with pytest.raises(RuntimeError, match="exclude experience atoms"):
+        runner.validate_nodebank_manifest_for_heldout(
+            {
+                **valid,
+                "export_policy": {
+                    **valid["export_policy"],
+                    "experience_atoms_exported": True,
+                },
+            },
+            args,
+        )
+
+
+def test_ebst_summary_gate_blocks_retrievable_atoms():
+    runner = _load_experiment_runner_module()
+    args = SimpleNamespace(
+        tree_scenario="static_build",
+        tree_policy="evidence_balanced_skill_tree",
+    )
+    valid = {
+        "scenario": "static_build",
+        "tree_policy": "evidence_balanced_skill_tree",
+        "record_count": 4,
+        "atom_count": 4,
+        "excluded_count": 0,
+        "retrievable_atom_count": 0,
+        "active_capsule_count": 2,
+        "runtime_generation_error_count": 0,
+        "prompt_budget_error_count": 0,
+    }
+    runner.validate_tree_summary_for_heldout(valid, args)
+    with pytest.raises(RuntimeError, match="raw evidence atoms"):
+        runner.validate_tree_summary_for_heldout(
+            {**valid, "retrievable_atom_count": 1},
+            args,
+        )
+    with pytest.raises(RuntimeError, match="runtime errors"):
+        runner.validate_tree_summary_for_heldout(
+            {**valid, "runtime_generation_error_count": 1},
+            args,
+        )
+    with pytest.raises(RuntimeError, match="prompt budget"):
+        runner.validate_tree_summary_for_heldout(
+            {**valid, "prompt_budget_error_count": 1},
+            args,
+        )
+
+
+def test_ebst_control_requires_cdost_baseline_protocol_match(
+    tmp_path: Path,
+):
+    runner = _load_experiment_runner_module()
+    shared = {
+        "dataset": {"sha256": "dataset"},
+        "records_sha256": "records",
+        "train_split": [0, 200],
+        "heldout_split": [200, 400],
+        "paired_dynamic_schedule": {
+            "initial_count": 120,
+            "arrival_count": 80,
+        },
+        "retrieval": {
+            "top_k": 10,
+            "embedding_model": "Qwen3-Embedding-8B",
+        },
+        "rollout": {
+            "model": "Qwen3.5-9B-AWQ",
+            "thinking": "false",
+            "max_turns": 30,
+            "workers": 16,
+            "generation_config": {"temperature": 0.0},
+        },
+        "evaluator": {"libreoffice": {"version": "test"}},
+        "source": {
+            "run_spreadsheetbench": "runner-sha",
+            "evaluate_with_official": "evaluator-sha",
+            "spreadsheetbench_support": "support-sha",
+            "spreadsheet_agent": "agent-sha",
+            "react_agent": "react-sha",
+            "skillbank": "skillbank-sha",
+            "antichain_retrieval": "antichain-sha",
+            "dynamix_core": "baseline-core-sha",
+        },
+    }
+    generation = {
+        "model": "Qwen3.5-9B-AWQ",
+        "temperature": 0.0,
+        "thinking_mode": False,
+    }
+    embedding = {
+        "model": "Qwen3-Embedding-8B",
+        "max_model_len": 32000,
+    }
+    analyst = {"max_output_tokens": 4096}
+    baseline_contract = {
+        **shared,
+        "tree": {
+            "tree_policy": "certified_dual_view_otd",
+            "generation": generation,
+            "embedding": embedding,
+            "analyst": analyst,
+            "otd": {
+                "dual_view_lambda": 0.5,
+                "atom_temperature": 0.0,
+                "parent_temperature": 0.0,
+                "retrieval_token_budget": 24000,
+                "retrieval_token_unit": 128,
+                "retrieval_exact_search_max_states": 250000,
+                "validation_mode": "structural_only",
+            },
+        },
+    }
+    baseline_manifest = tmp_path / "cdost_control_manifest.json"
+    baseline_manifest.write_text(
+        json.dumps(
+            {
+                "format": "cdost_control_manifest_v1",
+                "contract_sha256": runner._canonical_sha256(
+                    baseline_contract
+                ),
+                "contract": baseline_contract,
+            }
+        ),
+        encoding="utf-8",
+    )
+    current_contract = {
+        **shared,
+        "tree": {
+            "tree_policy": "evidence_balanced_skill_tree",
+            "generation": generation,
+            "embedding": embedding,
+            "analyst": analyst,
+            "ebst": {
+                "max_entries": 8,
+                "dual_view_lambda": 0.5,
+                "atom_temperature": 0.0,
+                "capsule_temperature": 0.0,
+                "validator_temperature": 0.0,
+                "retrieval_token_budget": 24000,
+                "retrieval_token_unit": 128,
+                "retrieval_exact_search_max_states": 250000,
+                "validation_mode": "structural_only",
+            },
+        },
+    }
+    report = runner.validate_ebst_against_cdost_baseline(
+        current_contract=current_contract,
+        baseline_manifest=baseline_manifest,
+    )
+    assert report["compatible"] is True
+
+    mismatched = json.loads(json.dumps(current_contract))
+    mismatched["rollout"]["workers"] = 8
+    with pytest.raises(ValueError, match="differing sections.*rollout"):
+        runner.validate_ebst_against_cdost_baseline(
+            current_contract=mismatched,
+            baseline_manifest=baseline_manifest,
+        )
+
+    mismatched_source = json.loads(json.dumps(current_contract))
+    mismatched_source["source"]["react_agent"] = "changed-react-sha"
+    with pytest.raises(
+        ValueError,
+        match="differing sections.*rollout_evaluator_source",
+    ):
+        runner.validate_ebst_against_cdost_baseline(
+            current_contract=mismatched_source,
+            baseline_manifest=baseline_manifest,
+        )
+
+    mismatched_retrieval = json.loads(json.dumps(current_contract))
+    mismatched_retrieval["source"]["skillbank"] = "changed-skillbank-sha"
+    with pytest.raises(
+        ValueError,
+        match="differing sections.*rollout_evaluator_source",
+    ):
+        runner.validate_ebst_against_cdost_baseline(
+            current_contract=mismatched_retrieval,
+            baseline_manifest=baseline_manifest,
+        )
+
+    treatment_only_source_change = json.loads(json.dumps(current_contract))
+    treatment_only_source_change["source"]["dynamix_core"] = "ebst-core-sha"
+    report = runner.validate_ebst_against_cdost_baseline(
+        current_contract=treatment_only_source_change,
+        baseline_manifest=baseline_manifest,
+    )
+    assert report["compatible"] is True
