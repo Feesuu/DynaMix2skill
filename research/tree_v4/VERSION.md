@@ -3,7 +3,7 @@
 - Date: 2026-07-28
 - Branch: `research/ebst-v4-strict-online`
 - Base commit: `7e4b914`
-- Implementation commit: pending final checkpoint
+- Implementation commit: `9bce954`
 - Remote: `https://github.com/Feesuu/DynaMix2skill.git`
 - Method: Evidence-Balanced Skill Tree v4, strict online protocols
 
