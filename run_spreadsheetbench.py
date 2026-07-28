@@ -435,6 +435,12 @@ def _serialize_result(result) -> dict:
             {
                 "input_file": tc.input_file,
                 "output_file": tc.output_file,
+                "output_file_sha256": (
+                    _sha256_file(Path(tc.output_file).resolve())
+                    if tc.output_file
+                    and Path(tc.output_file).resolve().is_file()
+                    else None
+                ),
                 "success": tc.success,
                 "agent_answer": tc.agent_answer,
                 "turns": tc.turns,
@@ -453,6 +459,71 @@ def _sha256_file(path: Path) -> str | None:
         for block in iter(lambda: fh.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _dataset_workbook_identity(
+    runner: SpreadsheetBenchRunner,
+    instances: list,
+) -> list[dict]:
+    identity = []
+    for instance in instances:
+        spreadsheet_dir_text = runner._find_spreadsheet_dir(instance)
+        if spreadsheet_dir_text is None:
+            raise FileNotFoundError(
+                f"spreadsheet directory not found for task {instance.id}"
+            )
+        spreadsheet_dir = Path(spreadsheet_dir_text).resolve()
+        input_names = runner._find_input_files(str(spreadsheet_dir))
+        ground_truth_names = sorted(
+            path.name
+            for path in spreadsheet_dir.iterdir()
+            if path.name.endswith("_answer.xlsx")
+            or path.name.endswith("_golden.xlsx")
+            or path.name == "golden.xlsx"
+        )
+        if not input_names or not ground_truth_names:
+            raise FileNotFoundError(
+                "input or ground-truth workbook is missing for task "
+                f"{instance.id}"
+            )
+        identity.append(
+            {
+                "task_id": str(instance.id),
+                "input_workbooks": {
+                    name: _sha256_file(spreadsheet_dir / name)
+                    for name in input_names
+                },
+                "ground_truth_workbooks": {
+                    name: _sha256_file(spreadsheet_dir / name)
+                    for name in ground_truth_names
+                },
+            }
+        )
+    return identity
+
+
+def _validate_existing_output_artifacts(
+    rows: dict[str, dict],
+) -> None:
+    for task_id, row in rows.items():
+        for test_case in row.get("test_cases") or []:
+            if not bool(test_case.get("success")):
+                continue
+            output_file = Path(
+                str(test_case.get("output_file") or "")
+            ).resolve()
+            expected_sha256 = str(
+                test_case.get("output_file_sha256") or ""
+            )
+            if (
+                not expected_sha256
+                or not output_file.is_file()
+                or _sha256_file(output_file) != expected_sha256
+            ):
+                raise RuntimeError(
+                    "successful resumed output workbook is missing or "
+                    f"changed for task {task_id}: {output_file}"
+                )
 
 
 def _write_json_atomic(path: Path, payload: dict) -> None:
@@ -494,6 +565,7 @@ def _result_ledger_identity(
     instances: list,
     *,
     results_file: Path,
+    runner: SpreadsheetBenchRunner,
 ) -> dict:
     data_path = Path(args.data_path).resolve()
     dataset_source = (
@@ -511,6 +583,10 @@ def _result_ledger_identity(
         skills_dir / "node_bank_manifest.json"
         if skills_dir is not None
         else None
+    )
+    skillbank_cache = os.getenv("DYNAMIX_SKILLBANK_CACHE_PATH")
+    vector_cache_manifest = os.getenv(
+        "DYNAMIX_SKILLBANK_VECTOR_CACHE_MANIFEST"
     )
     protocol = {
         "agent": getattr(args, "agent", None),
@@ -538,6 +614,10 @@ def _result_ledger_identity(
         "shuffle_seed": getattr(args, "shuffle_seed", None),
         "sample": getattr(args, "sample", None),
         "task_ids": [str(instance.id) for instance in instances],
+        "task_workbooks": _dataset_workbook_identity(
+            runner,
+            instances,
+        ),
         "skills_dir": str(skills_dir) if skills_dir is not None else None,
         "skillbank_manifest_sha256": (
             _sha256_file(skillbank_manifest)
@@ -551,6 +631,32 @@ def _result_ledger_identity(
         "skillbank_embed_model": os.getenv(
             "DYNAMIX_SKILLBANK_EMBED_MODEL"
         ),
+        "skillbank_retrieval_environment": {
+            name: os.getenv(name)
+            for name in (
+                "DYNAMIX_SKILLBANK_EMBED_TOKENIZER",
+                "DYNAMIX_SKILLBANK_EMBED_MAX_MODEL_LEN",
+                "DYNAMIX_SKILLBANK_EMBED_MAX_INPUT_TOKENS",
+                "DYNAMIX_SKILLBANK_EMBED_BATCH_SIZE",
+                "DYNAMIX_SKILLBANK_REQUIRE_CACHE_MATCH",
+                "DYNAMIX_SKILLBANK_REQUIRE_VECTOR_CACHE_MATCH",
+                "DYNAMIX_SKILLBANK_CHUNK_TOKENS",
+                "DYNAMIX_SKILLBANK_CHUNK_OVERLAP_TOKENS",
+                "DYNAMIX_SKILLBANK_CACHE_PATH",
+                "DYNAMIX_SKILLBANK_VECTOR_CACHE_PATH",
+                "DYNAMIX_SKILLBANK_VECTOR_CACHE_MANIFEST",
+            )
+        },
+        "skillbank_cache_sha256": (
+            _sha256_file(Path(skillbank_cache).resolve())
+            if skillbank_cache
+            else None
+        ),
+        "skillbank_vector_cache_manifest_sha256": (
+            _sha256_file(Path(vector_cache_manifest).resolve())
+            if vector_cache_manifest
+            else None
+        ),
         "expected_tree_policy": os.getenv(
             "DYNAMIX_SKILLBANK_EXPECT_TREE_POLICY"
         ),
@@ -561,10 +667,69 @@ def _result_ledger_identity(
             / "react_agent"
             / "models.py"
         ),
+        "react_agent_sha256": _sha256_file(
+            Path(__file__).resolve().parent
+            / "src"
+            / "react_agent"
+            / "agent.py"
+        ),
+        "react_converter_sha256": _sha256_file(
+            Path(__file__).resolve().parent
+            / "src"
+            / "react_agent"
+            / "converter.py"
+        ),
+        "react_prompts_sha256": _sha256_file(
+            Path(__file__).resolve().parent
+            / "src"
+            / "react_agent"
+            / "prompts.py"
+        ),
+        "react_tools_sha256": _sha256_file(
+            Path(__file__).resolve().parent
+            / "src"
+            / "react_agent"
+            / "tools.py"
+        ),
+        "skillbank_sha256": _sha256_file(
+            Path(__file__).resolve().parent
+            / "src"
+            / "dynamix_trace2skill"
+            / "skillbank.py"
+        ),
         "spreadsheet_runner_sha256": _sha256_file(
             Path(__file__).resolve().parent
             / "spreadsheet_agent"
             / "runner.py"
+        ),
+        "skill_preloaded_agent_sha256": _sha256_file(
+            Path(__file__).resolve().parent
+            / "spreadsheet_agent"
+            / "agents"
+            / "cli_skill_preloaded_agent.py"
+        ),
+        "cli_only_agent_sha256": _sha256_file(
+            Path(__file__).resolve().parent
+            / "spreadsheet_agent"
+            / "agents"
+            / "cli_only_agent.py"
+        ),
+        "spreadsheet_agent_base_sha256": _sha256_file(
+            Path(__file__).resolve().parent
+            / "spreadsheet_agent"
+            / "agents"
+            / "base.py"
+        ),
+        "spreadsheet_system_prompts_sha256": _sha256_file(
+            Path(__file__).resolve().parent
+            / "spreadsheet_agent"
+            / "system_prompts.py"
+        ),
+        "spreadsheet_bash_tool_sha256": _sha256_file(
+            Path(__file__).resolve().parent
+            / "spreadsheet_agent"
+            / "tools"
+            / "bash.py"
         ),
     }
     canonical = json.dumps(
@@ -574,7 +739,7 @@ def _result_ledger_identity(
         separators=(",", ":"),
     )
     return {
-        "format": "spreadsheetbench_result_ledger_v1",
+        "format": "spreadsheetbench_result_ledger_v2",
         "fingerprint": hashlib.sha256(
             canonical.encode("utf-8")
         ).hexdigest(),
@@ -839,6 +1004,7 @@ def _run_parallel_unlocked(args):
         args,
         selected_instances,
         results_file=Path(results_file),
+        runner=runner,
     )
     existing_rows = _prepare_result_ledger(
         results_jsonl,
@@ -847,6 +1013,7 @@ def _run_parallel_unlocked(args):
         resume=bool(args.missing_only),
     )
     if existing_rows:
+        _validate_existing_output_artifacts(existing_rows)
         before = len(instances)
         instances = [
             instance

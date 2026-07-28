@@ -1,28 +1,46 @@
 # Version Record
 
 - Date: 2026-07-28
-- Branch: `research/evidence-balanced-skill-tree-v4`
-- Implementation commit: `0d4a3e5`
+- Branch: `research/ebst-v4-strict-online`
+- Base commit: `7e4b914`
+- Implementation commit: pending final checkpoint
 - Remote: `https://github.com/Feesuu/DynaMix2skill.git`
-- Method: Evidence-Balanced Skill Tree v4
-- Frozen Atom audit source:
-  `runs/spreadsheet_cdost_static_runtimefixed_20260728_002122/dynamix_tree/experience_atoms.json`
-- Frozen Atom SHA256:
-  `f566aa1980576e3d33727945255d2b011a0eedccd6fb40cb990dd768caa18519`
+- Method: Evidence-Balanced Skill Tree v4, strict online protocols
+
+## Implemented Settings
+
+1. `open_loop_replay`
+   - starts from an empty tree;
+   - consumes frozen train trajectories `0:200` in dataset order;
+   - inserts one Atom at a time;
+   - refreshes only dirty capsule paths;
+   - validates and atomically checkpoints every arrival;
+   - never injects the current skill tree into later train trajectories.
+2. `closed_loop_skill_evolution`
+   - resumes a fingerprint-matched open-loop prefix, or starts from null;
+   - retrieves the current nodebank before each later train rollout;
+   - evaluates the task with LibreOffice recalc;
+   - records selected-skill exposure/outcome without causal attribution;
+   - extracts one Atom, inserts it, revises dirty capsules, validates, and
+     checkpoints before the next train task.
+
+Both settings reserve SpreadsheetBench `200:400` for heldout and enforce the
+same paired model, decoding, retrieval, cache, evaluator, timeout, retry, and
+worker protocol through the control manifest.
 
 ## Verification
 
-- `305 passed`, one pre-existing NumPy deprecation warning.
-- Python compilation passed with `PYTHONPYCACHEPREFIX` redirected to `/tmp`.
-- Shell syntax passed for the common runner and control/static/dynamic wrappers.
+- Full test suite: `323 passed`, one pre-existing NumPy deprecation warning.
+- Targeted EBST/closed-loop/reuse tests: `184 passed`.
+- Python compilation passed.
+- Shell syntax passed for all tree-v4 launchers.
 - `git diff --check` passed.
-- Independent spec/research and regression/fairness/security/Ponytail reviewers
-  completed second-pass review with no remaining actionable findings.
-- Offline structure audit: 200 atoms, 41 structural nodes, 35 leaves,
-  6 internal nodes, height 2, occupancy 4-8.
+- Secret scan found no API key or token in the changed source and artifacts.
+- Two independent reviewers completed final review with no remaining P0/P1.
 
 ## Result Status
 
-No live LLM or LibreOffice benchmark result is attached to this version.
-The first formal comparison must rerun the CDOST control from this same commit,
-then run EBST static and dynamic under the matched control manifest.
+No live LLM, embedding, LibreOffice, or heldout benchmark run is attached to
+this implementation checkpoint. The next formal run must execute the paired
+open-loop and closed-loop protocols under the same control manifest; smoke or
+partial results must not be reported as benchmark evidence.

@@ -3,7 +3,7 @@
 ## Status
 
 This document is the implementation contract for the
-`research/evidence-balanced-skill-tree-v4` branch. It is a new experimental
+`research/ebst-v4-strict-online` branch. It is a new experimental
 tree policy. It does not replace or silently change the legacy projected
 GMM-BIC tree or CDOST v3.
 
@@ -30,10 +30,12 @@ The method has three distinct objects:
 1. **Evidence atom**: one trajectory-local, provenance-preserving analysis.
    Atoms are immutable evidence and are never injected into heldout prompts.
 2. **Balanced metric tree**: the online structural index over atom embeddings.
-   Static construction is the same insertion operation applied in source
-   order. The current dynamic protocol deterministically rebuilds the first
-   120 frozen atoms, then applies the remaining 80 inserts online; direct
-   serialized-state resume is not yet implemented.
+   The evolutionary history starts from an empty tree and uses one
+   source-ordered insertion operation. The open-loop run performs that full
+   history directly; the formal closed-loop run resumes an exact checkpoint
+   from that empty-start history before processing policy-dependent arrivals.
+   Every committed arrival is followed by dirty-path capsule refresh,
+   validation, and an atomic, fingerprinted checkpoint.
 3. **Skill capsule**: a transferable procedure supported by a non-singleton
    evidence bucket or by at least two distinct child capsules. Only accepted
    capsules are exported to the nodebank.
@@ -86,19 +88,21 @@ An overflowing node is split by farthest-pair pivots. The remaining entries
 are assigned by distance-margin order while preserving `m` occupancy on both
 sides. Splits propagate only along the insertion path.
 
-Static and dynamic construction are identical:
+The structural update is identical in both settings:
 
 ```text
 for atom in source_order:
     tree.insert(atom)
 ```
 
-In the controlled 120+80 experiment, both methods reuse the same frozen Atom
-cache. The dynamic runner deterministically rebuilds the first 120 inserts,
-then applies the remaining 80 inserts online. Within that run, every arrival
-changes only its insertion path and the capsules supported by that path. Direct
-fingerprinted resume from a serialized tree is deliberately not claimed or
-enabled yet.
+`open_loop_replay` uses fixed, previously collected `0:200` train
+trajectories. Atom generation may be cached because it is policy-independent,
+but only the committed prefix is visible to the tree and capsule registry.
+`closed_loop_skill_evolution` uses an open-loop prefix checkpoint, then
+reruns each later train task with the current nodebank before extracting and
+inserting its Atom. The current formal protocol uses `0:120` as the bootstrap
+prefix and `120:200` as policy-dependent arrivals. This split is configurable
+but must be fixed before looking at heldout results.
 
 ## Verifiable Structural Guarantees
 
@@ -132,11 +136,11 @@ certified covering upper bounds. Looser internal radii can reduce pruning but
 cannot remove a valid candidate. No sublinear high-dimensional runtime claim
 is made; worst-case search remains linear.
 
-The property tests run full validation after every insertion. Production runs
-perform full validation after each dynamic capsule-refresh batch and before
-final export. Full-tree validation is intentionally not inside every
-`insert()` call because that would turn a local online update into an
-`O(n^2 d)` audit workload across a sequence of arrivals.
+The property tests run full validation after every insertion. Strict online
+production runs refresh the dirty path, validate the complete committed
+prefix, and write an atomic checkpoint after every arrival. The structural
+`insert()` itself remains local; the full validation is an explicit research
+audit cost and is not included in the `O(B h d)` structural-update claim.
 
 ## Skill Construction
 
@@ -186,8 +190,13 @@ Each capsule has one of:
   not misreported as a successful replacement.
 
 Every capsule records its evidence atom IDs, source item IDs, validation
-events, and reliability counts. The lifecycle ledger records the candidate
-event before the final active or rejected event. A smoothed reliability
+events, and exposure counts. In the closed loop, selected capsule IDs and the
+subsequent LibreOffice outcome are recorded before the new trajectory is
+inserted. These counts are carried into a replacement capsule on the dirty
+path. They are labelled `exposure_outcome_not_causal`: co-selection does not
+prove which skill caused the outcome. The lifecycle ledger records the
+candidate event before the final active or rejected event. A smoothed
+reliability
 estimate is:
 
 \[
@@ -232,6 +241,11 @@ heldout evaluation rather than silently producing a partial skill bank.
 - `node_bank_manifest.json`
 - `tree_quality_audit.json`
 - `summary.json`
+- `dynamic_snapshots/arrival_XXXX/checkpoint.complete.json` for strict
+  open-loop replay
+- `checkpoints/arrival_XXXX/checkpoint.complete.json`,
+  `online_records.json`, and `experiment_contract.json` for closed-loop
+  evolution
 
 `tree_quality_audit.json` must include occupancy, leaf-depth equality, height
 and bound, split count, locality diagnostics, covering-radius checks,

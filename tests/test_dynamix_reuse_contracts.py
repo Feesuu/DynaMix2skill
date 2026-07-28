@@ -370,6 +370,13 @@ def test_spreadsheet_parallel_runner_uses_shared_task_queue_and_jsonl(
         "instance_has_outputs",
         lambda instance, output_dir, data_path: False,
     )
+    monkeypatch.setattr(
+        run_spreadsheetbench,
+        "_dataset_workbook_identity",
+        lambda runner, selected: [
+            {"task_id": str(instance.id)} for instance in selected
+        ],
+    )
     args = SimpleNamespace(
         workers=2,
         data_path=str(tmp_path),
@@ -552,6 +559,34 @@ def test_spreadsheet_result_ledger_rejects_concurrent_process(tmp_path):
             run_spreadsheetbench._acquire_result_ledger_lock(results_jsonl)
     finally:
         first_lock.close()
+
+
+def test_spreadsheet_result_ledger_rejects_changed_success_output(
+    tmp_path,
+):
+    import run_spreadsheetbench
+
+    output = tmp_path / "task_output.xlsx"
+    output.write_bytes(b"original")
+    rows = {
+        "task-1": {
+            "id": "task-1",
+            "test_cases": [
+                {
+                    "success": True,
+                    "output_file": str(output),
+                    "output_file_sha256": (
+                        run_spreadsheetbench._sha256_file(output)
+                    ),
+                }
+            ],
+        }
+    }
+
+    run_spreadsheetbench._validate_existing_output_artifacts(rows)
+    output.write_bytes(b"changed")
+    with pytest.raises(RuntimeError, match="missing or changed"):
+        run_spreadsheetbench._validate_existing_output_artifacts(rows)
 
 
 def test_spreadsheet_runner_preserves_agent_timeout_failure(
@@ -1035,6 +1070,7 @@ def test_cdost_control_contract_covers_method_and_redacts_secrets(tmp_path):
         "snapshot_interval": 8,
         "snapshot_include_embeddings": True,
         "resume_from_snapshots": False,
+        "trajectory_source": "fixed_replay",
     }
     assert contract["tree"]["otd"]["dual_view_lambda"] == 0.5
     assert "atom_cache_path" not in contract["tree"]["otd"]
@@ -5236,6 +5272,46 @@ def test_ebst_summary_gate_blocks_retrievable_atoms():
     with pytest.raises(RuntimeError, match="prompt budget"):
         runner.validate_tree_summary_for_heldout(
             {**valid, "prompt_budget_error_count": 1},
+            args,
+        )
+
+
+def test_ebst_strict_open_loop_summary_gate_allows_empty_start():
+    runner = _load_experiment_runner_module()
+    args = SimpleNamespace(
+        tree_scenario="dynamic_update",
+        tree_policy="evidence_balanced_skill_tree",
+        dynamic_trajectory_source="open_loop_replay",
+        dynamic_initial_count=0,
+        dynamic_arrival_count=4,
+        train_start=0,
+        train_end=4,
+    )
+    valid = {
+        "scenario": "dynamic_update",
+        "tree_policy": "evidence_balanced_skill_tree",
+        "record_count": 4,
+        "atom_count": 4,
+        "atom_source": "frozen_cache",
+        "excluded_count": 0,
+        "retrievable_atom_count": 0,
+        "active_capsule_count": 2,
+        "runtime_generation_error_count": 0,
+        "prompt_budget_error_count": 0,
+        "initial_count": 0,
+        "arrival_count": 4,
+        "insertion_count": 4,
+        "updated_count": 4,
+        "trajectory_source": "open_loop_replay",
+        "started_from_empty": True,
+        "strict_online_protocol_verified": True,
+        "per_arrival_refresh": True,
+        "prefix_leakage_count": 0,
+    }
+    runner.validate_tree_summary_for_heldout(valid, args)
+    with pytest.raises(RuntimeError, match="strict online EBST"):
+        runner.validate_tree_summary_for_heldout(
+            {**valid, "prefix_leakage_count": 1},
             args,
         )
 

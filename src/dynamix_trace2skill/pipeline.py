@@ -38,6 +38,7 @@ class DynamicPipelineConfig:
     initial_count: int = 120
     arrival_count: int = 80
     update_batch_size: int = 8
+    trajectory_source: str = "fixed_replay"
     shuffle_seed: int | None = 42
     snapshot_include_embeddings: bool = True
     resume_from_snapshots: bool = False

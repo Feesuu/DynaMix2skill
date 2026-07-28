@@ -573,9 +573,22 @@ def cdost_control_contract(
         record_count=load_record_count(records_path),
         initial_count=int(args.dynamic_initial_count),
         arrival_count=int(args.dynamic_arrival_count),
+        allow_empty_initial=(
+            str(
+                getattr(
+                    args,
+                    "dynamic_trajectory_source",
+                    "fixed_replay",
+                )
+            )
+            == "open_loop_replay"
+        ),
     )
     paired_dynamic_schedule = {
         **dynamic_counts,
+        "trajectory_source": str(
+            getattr(args, "dynamic_trajectory_source", "fixed_replay")
+        ),
         "arrival_order": "dataset",
         "shuffle_seed": (
             None
@@ -982,9 +995,20 @@ def skillbank_retrieval_protocol(
     return protocol
 
 
-def expected_dynamic_counts(*, record_count: int, initial_count: int, arrival_count: int) -> dict[str, int]:
+def expected_dynamic_counts(
+    *,
+    record_count: int,
+    initial_count: int,
+    arrival_count: int,
+    allow_empty_initial: bool = False,
+) -> dict[str, int]:
     safe_record_count = max(0, int(record_count))
-    safe_initial = min(max(1, int(initial_count)), safe_record_count) if safe_record_count else 0
+    minimum_initial = 0 if allow_empty_initial else 1
+    safe_initial = (
+        min(max(minimum_initial, int(initial_count)), safe_record_count)
+        if safe_record_count
+        else 0
+    )
     remaining = max(0, safe_record_count - safe_initial)
     arrival_limit = int(arrival_count)
     arrivals = remaining if arrival_limit <= 0 else min(remaining, arrival_limit)
@@ -1156,11 +1180,43 @@ def validate_tree_summary_for_heldout(summary: dict, args: argparse.Namespace) -
         if (
             scenario == "dynamic_update"
             and summary.get("atom_source") != "frozen_cache"
+            and getattr(
+                args,
+                "dynamic_trajectory_source",
+                "fixed_replay",
+            )
+            != "closed_loop_skill_evolution"
         ):
             raise RuntimeError(
                 "controlled evidence-balanced dynamic heldout requires "
                 "frozen_cache atoms"
             )
+        if (
+            scenario == "dynamic_update"
+            and getattr(
+                args,
+                "dynamic_trajectory_source",
+                "fixed_replay",
+            )
+            == "open_loop_replay"
+        ):
+            required = {
+                "trajectory_source": "open_loop_replay",
+                "started_from_empty": True,
+                "strict_online_protocol_verified": True,
+                "per_arrival_refresh": True,
+                "prefix_leakage_count": 0,
+            }
+            mismatched = {
+                key: {"expected": value, "observed": summary.get(key)}
+                for key, value in required.items()
+                if summary.get(key) != value
+            }
+            if mismatched:
+                raise RuntimeError(
+                    "strict online EBST summary mismatch before heldout: "
+                    f"{mismatched}"
+                )
     if args.tree_scenario != "dynamic_update":
         return
     if hasattr(args, "train_start") and hasattr(args, "train_end"):
@@ -1171,6 +1227,16 @@ def validate_tree_summary_for_heldout(summary: dict, args: argparse.Namespace) -
         record_count=train_count,
         initial_count=int(args.dynamic_initial_count),
         arrival_count=int(args.dynamic_arrival_count),
+        allow_empty_initial=(
+            str(
+                getattr(
+                    args,
+                    "dynamic_trajectory_source",
+                    "fixed_replay",
+                )
+            )
+            == "open_loop_replay"
+        ),
     )
     observed = {key: int(summary.get(key, -1)) for key in expected}
     if observed != expected:
@@ -1414,6 +1480,16 @@ def runtime_dead_corner_findings(args: argparse.Namespace) -> list[dict[str, str
         record_count=train_count,
         initial_count=int(args.dynamic_initial_count),
         arrival_count=int(args.dynamic_arrival_count),
+        allow_empty_initial=(
+            str(
+                getattr(
+                    args,
+                    "dynamic_trajectory_source",
+                    "fixed_replay",
+                )
+            )
+            == "open_loop_replay"
+        ),
     )
     if args.tree_scenario == "dynamic_update" and expected_dynamic["initial_count"] + expected_dynamic["arrival_count"] != train_count:
         findings.append({
@@ -1492,10 +1568,12 @@ def active_dynamic_payload(
             "initial_count",
             "arrival_count",
             "update_batch_size",
+            "trajectory_source",
             "shuffle_seed",
             "snapshot_include_embeddings",
             "resume_from_snapshots",
         )
+        if key in payload
     }
 
 
@@ -1509,20 +1587,31 @@ def method_runtime_identity(args: argparse.Namespace) -> dict[str, Any]:
         }
     dynamic = args.tree_scenario == "dynamic_update"
     if args.tree_policy == "evidence_balanced_skill_tree":
+        trajectory_source = str(
+            getattr(args, "dynamic_trajectory_source", "fixed_replay")
+        )
+        strict_online = dynamic and trajectory_source == "open_loop_replay"
         return {
             "tree_policy": "evidence_balanced_skill_tree",
             "structural_graph_kind": "single_parent_balanced_metric_tree",
             "allow_overlap": False,
             "allow_multi_parent": False,
             "arrival_update_semantics": (
-                "sequential_structural_insert"
+                "strict_one_at_a_time_insert_refresh_validate_checkpoint"
+                if strict_online
+                else "sequential_structural_insert"
                 if dynamic
                 else "static_dataset_order_same_insert_operation"
             ),
             "parent_refresh_semantics": (
-                "changed_path_batched_bottom_up"
+                "changed_path_bottom_up_per_arrival"
+                if strict_online
+                else "changed_path_batched_bottom_up"
                 if dynamic
                 else "all_nodes_bottom_up_after_build"
+            ),
+            "trajectory_source": (
+                trajectory_source if dynamic else "static_records"
             ),
             "snapshot_interval": (
                 max(1, int(args.dynamic_update_batch_size))
@@ -1864,6 +1953,20 @@ def main() -> None:
     parser.add_argument("--use-support-mass", type=parse_bool, default=True)
     parser.add_argument("--dynamic-initial-count", type=int, default=120, help="Dynamic mode: number of initial train records used for the static seed tree")
     parser.add_argument("--dynamic-arrival-count", type=int, default=80, help="Dynamic mode: number of later train records inserted sequentially; <=0 consumes all remaining train records")
+    parser.add_argument(
+        "--dynamic-trajectory-source",
+        choices=[
+            "fixed_replay",
+            "open_loop_replay",
+            "closed_loop_skill_evolution",
+        ],
+        default="fixed_replay",
+        help=(
+            "Source of dynamic trajectories. open_loop_replay consumes fixed "
+            "records from an empty tree. closed_loop_skill_evolution is run "
+            "by the dedicated online rollout driver."
+        ),
+    )
     parser.add_argument(
         "--dynamic-update-batch-size",
         type=int,
@@ -2224,6 +2327,11 @@ def main() -> None:
             int(args.dynamic_arrival_count)
             if not is_certified_single_parent_tree(args.tree_policy)
             or args.tree_scenario == "dynamic_update"
+            else None
+        ),
+        "dynamic_trajectory_source": (
+            str(args.dynamic_trajectory_source)
+            if args.tree_scenario == "dynamic_update"
             else None
         ),
         "dynamic_snapshot_interval": (
@@ -2631,6 +2739,7 @@ def main() -> None:
             "initial_count": int(args.dynamic_initial_count),
             "arrival_count": int(args.dynamic_arrival_count),
             "update_batch_size": int(args.dynamic_update_batch_size),
+            "trajectory_source": str(args.dynamic_trajectory_source),
             "shuffle_seed": None if int(args.dynamic_shuffle_seed) < 0 else int(args.dynamic_shuffle_seed),
             "snapshot_include_embeddings": bool(args.dynamic_snapshot_include_embeddings),
             "resume_from_snapshots": bool(args.dynamic_resume_from_snapshots),

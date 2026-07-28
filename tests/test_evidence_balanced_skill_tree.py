@@ -19,8 +19,10 @@ from dynamix_core.skill_capsules import (
     validate_capsule_candidate,
 )
 from dynamix_trace2skill.evidence_balanced_skill_pipeline import (
+    EvidenceBalancedOnlineSession,
     EvidenceBalancedSkillConfig,
     SkillCapsuleAnalyst,
+    _dynamic_initial_count,
     _refresh_capsules,
     _write_nodebank_manifest,
 )
@@ -34,6 +36,11 @@ from dynamix_trace2skill.skillbank import (
     SkillSelection,
     selected_experience_to_system_content,
 )
+
+
+def test_only_strict_open_loop_allows_an_empty_dynamic_prefix() -> None:
+    assert _dynamic_initial_count(200, 0, strict_open_loop=True) == 0
+    assert _dynamic_initial_count(200, 0, strict_open_loop=False) == 1
 
 
 def _atom(
@@ -314,12 +321,18 @@ def test_registry_archives_replaced_capsules_and_rebuilds_links() -> None:
 
 
 class _FakeCapsuleAnalyst:
+    def __init__(self) -> None:
+        self.prior_capsules: list[SkillCapsule | None] = []
+
     async def generate_leaf(
         self,
         tree: BalancedMetricTreeState,
         registry: SkillCapsuleRegistry,
         tree_node_id: str,
+        *,
+        prior_capsule: SkillCapsule | None = None,
     ) -> SkillCapsule:
+        self.prior_capsules.append(prior_capsule)
         capsule_id, version = registry.next_identity(tree_node_id)
         atom_ids = tree.descendant_atom_ids(tree_node_id)
         return SkillCapsule(
@@ -348,7 +361,10 @@ class _FakeCapsuleAnalyst:
         registry: SkillCapsuleRegistry,
         tree_node_id: str,
         child_capsules: tuple[SkillCapsule, ...],
+        *,
+        prior_capsule: SkillCapsule | None = None,
     ) -> SkillCapsule:
+        self.prior_capsules.append(prior_capsule)
         capsule_id, version = registry.next_identity(tree_node_id)
         atom_ids = tree.descendant_atom_ids(tree_node_id)
         return SkillCapsule(
@@ -373,6 +389,129 @@ class _FakeCapsuleAnalyst:
             status="active",
             metadata={"analyst_mode": "fake_parent"},
         )
+
+
+def test_strict_online_session_checkpoints_every_arrival(tmp_path: Path) -> None:
+    async def run() -> None:
+        config = EvidenceBalancedSkillConfig(max_entries=4)
+        session = EvidenceBalancedOnlineSession.empty(config)
+        analyst = _FakeCapsuleAnalyst()
+        expected_ids: list[str] = []
+
+        for index in range(6):
+            atom = _atom(index)
+            expected_ids.append(atom.source_item_id)
+            await session.insert_atom(
+                atom,
+                analyst=analyst,
+                arrival_index=index,
+                reason="strict_open_loop_arrival",
+            )
+            session.validate_prefix(expected_ids)
+            session.write_checkpoint(
+                tmp_path / f"arrival_{index + 1:04d}",
+                trajectory_source="open_loop_replay",
+                record_prefix_sha256=f"record-prefix-{index + 1}",
+                atom_protocol_fingerprint="atom-protocol",
+                tree_protocol_fingerprint="tree-protocol",
+            )
+
+        restored = EvidenceBalancedOnlineSession.from_checkpoint(
+            tmp_path / "arrival_0006"
+        )
+        restored.validate_prefix(expected_ids)
+        assert restored.tree.to_dict() == session.tree.to_dict()
+        assert restored.registry.to_dict() == session.registry.to_dict()
+        assert restored.insertion_events == session.insertion_events
+        assert restored.refresh_events == session.refresh_events
+        assert all(
+            prior is None for prior in analyst.prior_capsules
+        )
+
+    asyncio.run(run())
+
+
+def test_online_skill_feedback_is_exposure_evidence_not_causal() -> None:
+    config = EvidenceBalancedSkillConfig(max_entries=4)
+    session = EvidenceBalancedOnlineSession.empty(config)
+    session.tree.insert(_atom(0))
+    session.tree.insert(_atom(1))
+    session.arrived_source_item_ids = ["task-0", "task-1"]
+    capsule = _capsule(
+        session.tree,
+        session.tree.root_id,
+        name="online capsule",
+    )
+    session.registry.register(capsule, event_reason="test_active")
+
+    event = session.record_skill_feedback(
+        task_id="task-2",
+        selected_capsule_ids=[capsule.capsule_id],
+        success=True,
+        verifier_score=1.0,
+    )
+
+    assert event["attribution"] == "exposure_outcome_not_causal"
+    updated = session.registry.capsules[capsule.capsule_id]
+    assert updated.replay_trials == 1
+    assert updated.replay_passes == 1
+    assert updated.reliability == pytest.approx(2 / 3)
+
+
+def test_capsule_revision_preserves_noncausal_exposure_counts() -> None:
+    async def run() -> None:
+        tree = BalancedMetricTreeState(max_entries=4)
+        tree.insert(_atom(0))
+        tree.insert(_atom(1))
+        registry = SkillCapsuleRegistry()
+        prior = _capsule(
+            tree,
+            tree.root_id,
+            name="prior capsule",
+        )
+        prior.replay_trials = 3
+        prior.replay_passes = 2
+        registry.register(prior, event_reason="test_prior")
+        generation = _FakeGeneration(
+            {
+                "promote": True,
+                "name": "revised capsule",
+                "trigger": "related synthetic tasks",
+                "content": "preserve the shared invariant",
+                "scope": "synthetic scope",
+                "verification": "check the expected result",
+                "failure_modes": ["incorrect result"],
+                "rationale": "supported by both evidence atoms",
+            }
+        )
+        analyst = SkillCapsuleAnalyst(
+            generation,
+            _FakeGeneration({}),
+            tokenizer=_FakeTokenizer(),
+            max_prompt_tokens=100000,
+            max_output_tokens=4096,
+            validation_mode="structural_and_semantic",
+        )
+
+        revised = await analyst.generate_leaf(
+            tree,
+            registry,
+            tree.root_id,
+            prior_capsule=prior,
+        )
+
+        assert revised is not None
+        assert revised.replay_trials == 3
+        assert revised.replay_passes == 2
+        assert revised.metadata["prior_capsule_id"] == prior.capsule_id
+        prompt_payload = json.loads(
+            generation.calls[0][0][0][1]["content"]
+        )
+        assert prompt_payload["prior_capsule_review"]["attribution"] == (
+            "exposure_outcome_not_causal"
+        )
+
+    asyncio.run(run())
 
 
 class _FakeTokenizer:
@@ -593,6 +732,7 @@ async def _run_local_capsule_refresh_test(tmp_path) -> None:
         retired_node_ids=set(result.retired_node_ids),
         reason="arrival",
     )
+    assert all(prior is None for prior in analyst.prior_capsules)
     registry.validate(tree)
     unaffected = (
         set(active_before)

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-export REPO_ROOT="/mnt/data/yaodong/codes/DynaMix2skill_tree_v2"
+export REPO_ROOT="/home/yaodong/codes/DynaMix2skill_ebst_strict_online"
 export DYNAMIX_PYTHON="/home/yaodong/miniconda3/envs/stableskill-skillrl/bin/python"
 export DATA_PATH="/mnt/data/yaodong/codes/Trace2Skill/data/spreadsheetbench_verified/spreadsheetbench_verified_400"
 export RECORDS_PATH="/absolute/path/to/current/recalc-aligned/records.json"
@@ -18,6 +18,9 @@ export ANALYST_TOKENIZER="/absolute/path/to/Qwen3.5-9B-AWQ"
 export WORKERS="16"
 export THINKING="false"
 export ROLLOUT_TEMPERATURE="0.0"
+export ROLLOUT_CLIENT_TIMEOUT_SECONDS="1200"
+export ROLLOUT_CLIENT_RETRY_WAIT_SECONDS="5,10,30"
+export ROLLOUT_DISABLE_RESPONSE_CACHE="true"
 export GENERATION_TEMPERATURE="0.0"
 export GENERATION_MAX_CONCURRENCY="16"
 export EMBEDDING_MAX_MODEL_LEN="32000"
@@ -29,3 +32,18 @@ export CHUNKED_EMBEDDING_OVERLAP_TOKENS="1000"
 export CHUNKED_EMBEDDING_POOLING="mean"
 
 export RUN_DIR="$REPO_ROOT/runs/ebst_v4_$(date +%Y%m%d_%H%M%S)"
+
+# Closed-loop uses the arrival_0120 checkpoint from the completed strict
+# open-loop scenario. Keep it in a separate run directory.
+export OPEN_LOOP_SCENARIO_DIR="$RUN_DIR/scenarios/dynamic_update"
+export CLOSED_LOOP_RUN_DIR="$REPO_ROOT/runs/ebst_v4_closed_loop_$(date +%Y%m%d_%H%M%S)"
+export BOOTSTRAP_COUNT="120"
+export TRAIN_END="200"
+export HELDOUT_START="200"
+export HELDOUT_END="400"
+export MAX_TURNS="30"
+export ROLLOUT_THINKING="$THINKING"
+export ROLLOUT_TIMEOUT_SECONDS="$ROLLOUT_CLIENT_TIMEOUT_SECONDS"
+export ROLLOUT_RETRY_WAIT_SECONDS="$ROLLOUT_CLIENT_RETRY_WAIT_SECONDS"
+export SKILLBANK_TOP_K="10"
+export EVALUATOR_BACKEND="auto"

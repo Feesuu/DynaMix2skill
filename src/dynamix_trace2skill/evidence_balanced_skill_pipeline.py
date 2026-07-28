@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from dataclasses import dataclass, replace
+import os
+import shutil
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -45,6 +47,7 @@ from .skillbank import (
 )
 
 __all__ = [
+    "EvidenceBalancedOnlineSession",
     "EvidenceBalancedSkillConfig",
     "build_evidence_balanced_dynamic_tree_from_records",
     "build_evidence_balanced_tree_from_records",
@@ -174,6 +177,269 @@ class EvidenceBalancedSkillConfig:
         return config
 
 
+@dataclass
+class EvidenceBalancedOnlineSession:
+    """Serializable state for one-at-a-time EBST evolution."""
+
+    tree: BalancedMetricTreeState
+    registry: SkillCapsuleRegistry
+    arrived_source_item_ids: list[str] = field(default_factory=list)
+    insertion_events: list[dict[str, Any]] = field(default_factory=list)
+    refresh_events: list[dict[str, Any]] = field(default_factory=list)
+    skill_feedback_events: list[dict[str, Any]] = field(default_factory=list)
+
+    @classmethod
+    def empty(
+        cls,
+        config: EvidenceBalancedSkillConfig,
+    ) -> "EvidenceBalancedOnlineSession":
+        return cls(
+            tree=BalancedMetricTreeState(
+                max_entries=config.max_entries,
+                dual_view_lambda=config.dual_view_lambda,
+            ),
+            registry=SkillCapsuleRegistry(),
+        )
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        checkpoint_dir: str | Path,
+    ) -> "EvidenceBalancedOnlineSession":
+        root = Path(checkpoint_dir)
+        marker_path = root / "checkpoint.complete.json"
+        if not marker_path.is_file():
+            raise FileNotFoundError(
+                f"online checkpoint completion marker is missing: {marker_path}"
+            )
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        if marker.get("format") != "ebst_online_checkpoint_v1":
+            raise ValueError("unsupported EBST online checkpoint format")
+        tree_path = root / "balanced_tree_state.json"
+        registry_path = root / "skill_capsules.json"
+        session_path = root / "online_session.json"
+        for path, expected_sha in (
+            (tree_path, marker.get("tree_sha256")),
+            (registry_path, marker.get("registry_sha256")),
+            (session_path, marker.get("session_sha256")),
+        ):
+            if not path.is_file() or _file_sha256(path) != expected_sha:
+                raise ValueError(
+                    f"EBST online checkpoint artifact mismatch: {path}"
+                )
+        state_payload = json.loads(session_path.read_text(encoding="utf-8"))
+        session = cls(
+            tree=BalancedMetricTreeState.from_dict(
+                json.loads(tree_path.read_text(encoding="utf-8"))
+            ),
+            registry=SkillCapsuleRegistry.from_dict(
+                json.loads(registry_path.read_text(encoding="utf-8"))
+            ),
+            arrived_source_item_ids=[
+                str(value)
+                for value in state_payload.get("arrived_source_item_ids", [])
+            ],
+            insertion_events=[
+                dict(value)
+                for value in state_payload.get("insertion_events", [])
+            ],
+            refresh_events=[
+                dict(value)
+                for value in state_payload.get("refresh_events", [])
+            ],
+            skill_feedback_events=[
+                dict(value)
+                for value in state_payload.get("skill_feedback_events", [])
+            ],
+        )
+        session.validate_prefix()
+        if _ordered_sha256(session.arrived_source_item_ids) != marker.get(
+            "source_prefix_sha256"
+        ):
+            raise ValueError("EBST online checkpoint source prefix mismatch")
+        return session
+
+    async def insert_atom(
+        self,
+        atom: ExperienceAtom,
+        *,
+        analyst: "SkillCapsuleAnalyst",
+        arrival_index: int,
+        reason: str,
+        revise_prior_capsules: bool = False,
+    ) -> dict[str, Any]:
+        if atom.source_item_id in set(self.arrived_source_item_ids):
+            raise ValueError(
+                f"duplicate online source item: {atom.source_item_id}"
+            )
+        insertion = self.tree.insert(atom)
+        insertion_payload = {
+            "arrival_index": int(arrival_index),
+            "source_item_id": atom.source_item_id,
+            **_insertion_payload(insertion),
+        }
+        self.insertion_events.append(insertion_payload)
+        refresh = await _refresh_capsules(
+            tree=self.tree,
+            registry=self.registry,
+            analyst=analyst,
+            dirty_node_ids=set(insertion.capsule_refresh_node_ids),
+            retired_node_ids=set(insertion.retired_node_ids),
+            reason=reason,
+            revise_prior_capsules=revise_prior_capsules,
+        )
+        refresh_payload = {
+            "arrival_index": int(arrival_index),
+            "source_item_id": atom.source_item_id,
+            **refresh,
+        }
+        self.refresh_events.append(refresh_payload)
+        self.arrived_source_item_ids.append(atom.source_item_id)
+        self.validate_prefix()
+        return {
+            "insertion": insertion_payload,
+            "refresh": refresh_payload,
+        }
+
+    def record_skill_feedback(
+        self,
+        *,
+        task_id: str,
+        selected_capsule_ids: Sequence[str],
+        success: bool,
+        verifier_score: float | None,
+    ) -> dict[str, Any]:
+        selected = tuple(
+            dict.fromkeys(str(value) for value in selected_capsule_ids)
+        )
+        missing = [
+            capsule_id
+            for capsule_id in selected
+            if capsule_id not in self.registry.capsules
+        ]
+        if missing:
+            raise ValueError(
+                "skill feedback references unknown capsules: "
+                + ", ".join(missing)
+            )
+        for capsule_id in selected:
+            capsule = self.registry.capsules[capsule_id]
+            capsule.replay_trials += 1
+            if success:
+                capsule.replay_passes += 1
+        event = {
+            "task_id": str(task_id),
+            "selected_capsule_ids": list(selected),
+            "success": bool(success),
+            "verifier_score": verifier_score,
+            "attribution": "exposure_outcome_not_causal",
+        }
+        self.skill_feedback_events.append(event)
+        return event
+
+    def validate_prefix(
+        self,
+        expected_source_item_ids: Sequence[str] | None = None,
+    ) -> None:
+        self.registry.rebuild_active_links()
+        self.registry.validate(self.tree)
+        actual = [
+            atom.source_item_id
+            for atom in self.tree.atoms.values()
+        ]
+        if len(actual) != len(set(actual)):
+            raise ValueError("online tree contains duplicate source items")
+        if set(actual) != set(self.arrived_source_item_ids):
+            raise ValueError(
+                "online tree atoms do not match the committed arrival prefix"
+            )
+        if expected_source_item_ids is not None and list(
+            expected_source_item_ids
+        ) != self.arrived_source_item_ids:
+            raise ValueError(
+                "online session arrival order does not match the expected prefix"
+            )
+        arrived_atom_ids = set(self.tree.atoms)
+        for capsule in self.registry.capsules.values():
+            if not set(capsule.evidence_atom_ids).issubset(arrived_atom_ids):
+                raise ValueError(
+                    "capsule evidence references a future or missing atom"
+                )
+
+    def write_checkpoint(
+        self,
+        checkpoint_dir: str | Path,
+        *,
+        trajectory_source: str,
+        record_prefix_sha256: str,
+        atom_protocol_fingerprint: str,
+        tree_protocol_fingerprint: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> Path:
+        destination = Path(checkpoint_dir)
+        if destination.exists():
+            raise FileExistsError(
+                f"online checkpoint already exists: {destination}"
+            )
+        self.validate_prefix()
+        temporary = destination.with_name(
+            f".{destination.name}.{os.getpid()}.tmp"
+        )
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        temporary.mkdir(parents=True, exist_ok=False)
+        try:
+            _write_state_artifacts(self.tree, self.registry, temporary)
+            session_path = temporary / "online_session.json"
+            session_path.write_text(
+                json.dumps(
+                    {
+                        "format": "ebst_online_session_v1",
+                        "arrived_source_item_ids": self.arrived_source_item_ids,
+                        "insertion_events": self.insertion_events,
+                        "refresh_events": self.refresh_events,
+                        "skill_feedback_events": self.skill_feedback_events,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            marker = {
+                "format": "ebst_online_checkpoint_v1",
+                "arrival_count": len(self.arrived_source_item_ids),
+                "trajectory_source": str(trajectory_source),
+                "source_prefix_sha256": _ordered_sha256(
+                    self.arrived_source_item_ids
+                ),
+                "record_prefix_sha256": str(record_prefix_sha256),
+                "atom_protocol_fingerprint": str(
+                    atom_protocol_fingerprint
+                ),
+                "tree_protocol_fingerprint": str(
+                    tree_protocol_fingerprint
+                ),
+                "tree_sha256": _file_sha256(
+                    temporary / "balanced_tree_state.json"
+                ),
+                "registry_sha256": _file_sha256(
+                    temporary / "skill_capsules.json"
+                ),
+                "session_sha256": _file_sha256(session_path),
+                "metadata": dict(metadata or {}),
+            }
+            (temporary / "checkpoint.complete.json").write_text(
+                json.dumps(marker, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(temporary, destination)
+        except Exception:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
+        return destination
+
+
 class SkillCapsuleAnalyst:
     def __init__(
         self,
@@ -197,6 +463,8 @@ class SkillCapsuleAnalyst:
         tree: BalancedMetricTreeState,
         registry: SkillCapsuleRegistry,
         tree_node_id: str,
+        *,
+        prior_capsule: SkillCapsule | None = None,
     ) -> SkillCapsule | None:
         atom_ids = tree.descendant_atom_ids(tree_node_id)
         if len(atom_ids) < 2:
@@ -247,6 +515,13 @@ class SkillCapsuleAnalyst:
                 "support. Treat failed atoms only as evidence for root causes, "
                 "boundaries, guardrails, or corrected procedures; never turn "
                 "an observed failed action into a recommendation."
+                + (
+                    " Revise the prior capsule only where the expanded "
+                    "evidence supports a change. Its exposure outcomes are "
+                    "audit signals, not causal proof of usefulness."
+                    if prior_capsule is not None
+                    else ""
+                )
             ),
             evidence_payload={
                 "positive_evidence_atoms": positive,
@@ -254,6 +529,7 @@ class SkillCapsuleAnalyst:
                 "unknown_outcome_evidence_atoms": unknown,
             },
             analyst_mode="evidence_bucket_consolidation",
+            prior_capsule=prior_capsule,
         )
 
     async def generate_parent(
@@ -262,6 +538,8 @@ class SkillCapsuleAnalyst:
         registry: SkillCapsuleRegistry,
         tree_node_id: str,
         child_capsules: Sequence[SkillCapsule],
+        *,
+        prior_capsule: SkillCapsule | None = None,
     ) -> SkillCapsule | None:
         distinct = {
             normalized_capsule_text(capsule)
@@ -283,6 +561,13 @@ class SkillCapsuleAnalyst:
                 "unrelated procedures. Reject when no useful new abstraction "
                 "is supported. Never include task IDs, exact answers, paths, "
                 "URLs, coordinates, or example-specific literal values."
+                + (
+                    " Revise the prior capsule only where the child evidence "
+                    "supports a change. Its exposure outcomes are audit "
+                    "signals, not causal proof of usefulness."
+                    if prior_capsule is not None
+                    else ""
+                )
             ),
             evidence_payload={
                 "child_capsules": [
@@ -312,6 +597,7 @@ class SkillCapsuleAnalyst:
                 ]
             },
             analyst_mode="cross_child_abstraction",
+            prior_capsule=prior_capsule,
         )
 
     async def _generate(
@@ -324,6 +610,7 @@ class SkillCapsuleAnalyst:
         system_prompt: str,
         evidence_payload: Mapping[str, Any],
         analyst_mode: str,
+        prior_capsule: SkillCapsule | None,
     ) -> SkillCapsule:
         capsule_id, version = registry.next_identity(tree_node_id)
         if child_capsules:
@@ -348,15 +635,30 @@ class SkillCapsuleAnalyst:
         child_ids = tuple(
             sorted(capsule.capsule_id for capsule in child_capsules)
         )
+        user_payload = {
+            "output_schema": CAPSULE_SCHEMA,
+            **dict(evidence_payload),
+        }
+        if prior_capsule is not None:
+            user_payload["prior_capsule_review"] = {
+                "capsule_id": prior_capsule.capsule_id,
+                "name": prior_capsule.name,
+                "trigger": prior_capsule.trigger,
+                "content": prior_capsule.content,
+                "scope": prior_capsule.scope,
+                "verification": prior_capsule.verification,
+                "failure_modes": list(prior_capsule.failure_modes),
+                "exposure_trials": int(prior_capsule.replay_trials),
+                "exposure_successes": int(prior_capsule.replay_passes),
+                "exposure_reliability": prior_capsule.reliability,
+                "attribution": "exposure_outcome_not_causal",
+            }
         messages = [
             {"role": "system", "content": system_prompt},
             {
                 "role": "user",
                 "content": json.dumps(
-                    {
-                        "output_schema": CAPSULE_SCHEMA,
-                        **dict(evidence_payload),
-                    },
+                    user_payload,
                     ensure_ascii=False,
                     indent=2,
                 ),
@@ -403,6 +705,16 @@ class SkillCapsuleAnalyst:
                 evidence_atom_ids=atom_ids,
                 source_item_ids=source_item_ids,
                 child_capsule_ids=child_ids,
+                replay_trials=(
+                    int(prior_capsule.replay_trials)
+                    if prior_capsule is not None
+                    else 0
+                ),
+                replay_passes=(
+                    int(prior_capsule.replay_passes)
+                    if prior_capsule is not None
+                    else 0
+                ),
                 validation_mode=self.validation_mode,
                 metadata={
                     "analyst_mode": analyst_mode,
@@ -416,6 +728,16 @@ class SkillCapsuleAnalyst:
                     ),
                     "unknown_outcome_evidence_count": sum(
                         not isinstance(value, bool) for value in outcomes
+                    ),
+                    "prior_capsule_id": (
+                        prior_capsule.capsule_id
+                        if prior_capsule is not None
+                        else None
+                    ),
+                    "prior_capsule_feedback_attribution": (
+                        "exposure_outcome_not_causal"
+                        if prior_capsule is not None
+                        else None
                     ),
                 },
             )
@@ -693,10 +1015,38 @@ async def _build(config: Any, *, dynamic: bool) -> dict[str, Any]:
             "evidence_balanced_skill_tree requires dataset-order arrivals; "
             "set dynamic.shuffle_seed=null"
         )
-    if bool(config.dynamic.resume_from_snapshots):
+    trajectory_source = str(
+        getattr(config.dynamic, "trajectory_source", "fixed_replay")
+    )
+    if trajectory_source not in {
+        "fixed_replay",
+        "open_loop_replay",
+        "closed_loop_skill_evolution",
+    }:
         raise ValueError(
-            "evidence_balanced_skill_tree does not yet support fingerprinted "
-            "snapshot resume; set dynamic.resume_from_snapshots=false"
+            f"unsupported EBST trajectory source: {trajectory_source}"
+        )
+    strict_open_loop = dynamic and trajectory_source == "open_loop_replay"
+    if strict_open_loop:
+        if int(config.dynamic.initial_count) != 0:
+            raise ValueError(
+                "open_loop_replay must start from an empty tree "
+                "(dynamic.initial_count=0)"
+            )
+        if int(config.dynamic.update_batch_size) != 1:
+            raise ValueError(
+                "open_loop_replay requires per-arrival capsule refresh "
+                "(dynamic.update_batch_size=1)"
+            )
+    elif bool(config.dynamic.resume_from_snapshots):
+        raise ValueError(
+            "fingerprinted snapshot resume is implemented only for strict "
+            "open_loop_replay"
+        )
+    if dynamic and trajectory_source == "closed_loop_skill_evolution":
+        raise ValueError(
+            "closed_loop_skill_evolution must be run by the online rollout "
+            "driver, not from a pre-existing records file"
         )
     if not bool(config.dynamic.snapshot_include_embeddings):
         raise ValueError(
@@ -775,6 +1125,10 @@ async def _build(config: Any, *, dynamic: bool) -> dict[str, Any]:
     records = _load_records_for_protocol(config, out)
     _require_unique_record_ids(records)
     tokenizer = _tokenizer_for_config(config)
+    tree_protocol_fingerprint = _ebst_tree_protocol_fingerprint(
+        config,
+        ebst,
+    )
     atoms, excluded, atom_source, atom_protocol_fingerprint = (
         await _prepare_atoms(
             config=config,
@@ -820,9 +1174,10 @@ async def _build(config: Any, *, dynamic: bool) -> dict[str, Any]:
 
     if dynamic:
         atom_by_source = {atom.source_item_id: atom for atom in atoms}
-        initial_count = min(
-            max(1, int(config.dynamic.initial_count)),
+        initial_count = _dynamic_initial_count(
             len(records),
+            int(config.dynamic.initial_count),
+            strict_open_loop=strict_open_loop,
         )
         arrival_records = list(records[initial_count:])
         if int(config.dynamic.arrival_count) > 0:
@@ -837,63 +1192,138 @@ async def _build(config: Any, *, dynamic: bool) -> dict[str, Any]:
             atom_by_source[record.trajectory_id]
             for record in arrival_records
         ]
-        for atom in initial_atoms:
-            result = tree.insert(atom)
-            insertions.append(_insertion_payload(result))
-        initial_refresh = await _refresh_capsules(
-            tree=tree,
-            registry=registry,
-            analyst=capsule_analyst,
-            dirty_node_ids=set(tree.nodes),
-            retired_node_ids=set(),
-            reason="initial_tree",
-        )
-        refresh_batches.append(
-            {
-                "batch_index": 0,
-                "arrival_count": 0,
-                **initial_refresh,
-            }
-        )
+        if strict_open_loop:
+            checkpoint = (
+                _latest_online_checkpoint(out / "dynamic_snapshots")
+                if bool(config.dynamic.resume_from_snapshots)
+                else None
+            )
+            session = (
+                EvidenceBalancedOnlineSession.from_checkpoint(checkpoint)
+                if checkpoint is not None
+                else EvidenceBalancedOnlineSession.empty(ebst)
+            )
+            completed = len(session.arrived_source_item_ids)
+            expected_prefix = [
+                record.trajectory_id
+                for record in arrival_records[:completed]
+            ]
+            session.validate_prefix(expected_prefix)
+            if checkpoint is not None:
+                marker = json.loads(
+                    (checkpoint / "checkpoint.complete.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                if marker.get("trajectory_source") != trajectory_source:
+                    raise ValueError(
+                        "online checkpoint trajectory source mismatch"
+                    )
+                if marker.get(
+                    "record_prefix_sha256"
+                ) != _records_fingerprint(arrival_records[:completed]):
+                    raise ValueError(
+                        "online checkpoint record prefix mismatch"
+                    )
+                if marker.get(
+                    "atom_protocol_fingerprint"
+                ) != atom_protocol_fingerprint:
+                    raise ValueError(
+                        "online checkpoint Atom protocol mismatch"
+                    )
+                if marker.get(
+                    "tree_protocol_fingerprint"
+                ) != tree_protocol_fingerprint:
+                    raise ValueError(
+                        "online checkpoint EBST protocol mismatch"
+                    )
+            for offset in range(completed, len(arrival_atoms)):
+                arrival_index = offset + 1
+                event = await session.insert_atom(
+                    arrival_atoms[offset],
+                    analyst=capsule_analyst,
+                    arrival_index=arrival_index,
+                    reason=f"open_loop_arrival_{arrival_index}",
+                )
+                refresh_batches.append(event["refresh"])
+                session.write_checkpoint(
+                    out
+                    / "dynamic_snapshots"
+                    / f"arrival_{arrival_index:04d}",
+                    trajectory_source=trajectory_source,
+                    record_prefix_sha256=_records_fingerprint(
+                        arrival_records[:arrival_index]
+                    ),
+                    atom_protocol_fingerprint=atom_protocol_fingerprint,
+                    tree_protocol_fingerprint=tree_protocol_fingerprint,
+                    metadata={
+                        "strict_online": True,
+                        "future_atoms_precomputed": True,
+                    },
+                )
+            tree = session.tree
+            registry = session.registry
+            insertions = session.insertion_events
+            refresh_batches = session.refresh_events
+        else:
+            for atom in initial_atoms:
+                result = tree.insert(atom)
+                insertions.append(_insertion_payload(result))
+            if initial_atoms:
+                initial_refresh = await _refresh_capsules(
+                    tree=tree,
+                    registry=registry,
+                    analyst=capsule_analyst,
+                    dirty_node_ids=set(tree.nodes),
+                    retired_node_ids=set(),
+                    reason="initial_tree",
+                )
+                refresh_batches.append(
+                    {
+                        "batch_index": 0,
+                        "arrival_count": 0,
+                        **initial_refresh,
+                    }
+                )
 
-        batch_size = max(1, int(config.dynamic.update_batch_size))
-        dirty: set[str] = set()
-        retired: set[str] = set()
-        for arrival_index, atom in enumerate(arrival_atoms, start=1):
-            result = tree.insert(atom)
-            insertions.append(_insertion_payload(result))
-            dirty.update(result.capsule_refresh_node_ids)
-            retired.update(result.retired_node_ids)
-            flush = (
-                arrival_index % batch_size == 0
-                or arrival_index == len(arrival_atoms)
-            )
-            if not flush:
-                continue
-            refresh = await _refresh_capsules(
-                tree=tree,
-                registry=registry,
-                analyst=capsule_analyst,
-                dirty_node_ids=dirty,
-                retired_node_ids=retired,
-                reason=f"arrival_batch_{arrival_index}",
-            )
-            refresh_batches.append(
-                {
-                    "batch_index": len(refresh_batches),
-                    "arrival_count": arrival_index,
-                    **refresh,
-                }
-            )
-            snapshot = (
-                out
-                / "dynamic_snapshots"
-                / f"arrival_{arrival_index:04d}"
-            )
-            snapshot.mkdir(parents=True, exist_ok=True)
-            _write_state_artifacts(tree, registry, snapshot)
-            dirty = set()
-            retired = set()
+            batch_size = max(1, int(config.dynamic.update_batch_size))
+            dirty: set[str] = set()
+            retired: set[str] = set()
+            for arrival_index, atom in enumerate(arrival_atoms, start=1):
+                result = tree.insert(atom)
+                insertions.append(_insertion_payload(result))
+                dirty.update(result.capsule_refresh_node_ids)
+                retired.update(result.retired_node_ids)
+                flush = (
+                    arrival_index % batch_size == 0
+                    or arrival_index == len(arrival_atoms)
+                )
+                if not flush:
+                    continue
+                refresh = await _refresh_capsules(
+                    tree=tree,
+                    registry=registry,
+                    analyst=capsule_analyst,
+                    dirty_node_ids=dirty,
+                    retired_node_ids=retired,
+                    reason=f"arrival_batch_{arrival_index}",
+                )
+                refresh_batches.append(
+                    {
+                        "batch_index": len(refresh_batches),
+                        "arrival_count": arrival_index,
+                        **refresh,
+                    }
+                )
+                snapshot = (
+                    out
+                    / "dynamic_snapshots"
+                    / f"arrival_{arrival_index:04d}"
+                )
+                snapshot.mkdir(parents=True, exist_ok=True)
+                _write_state_artifacts(tree, registry, snapshot)
+                dirty = set()
+                retired = set()
     else:
         initial_count = len(atoms)
         arrival_atoms = []
@@ -978,13 +1408,32 @@ async def _build(config: Any, *, dynamic: bool) -> dict[str, Any]:
         "atom_source": atom_source,
         "atom_cache_path": ebst.atom_cache_path,
         "atom_protocol_fingerprint": atom_protocol_fingerprint,
+        "tree_protocol_fingerprint": tree_protocol_fingerprint,
         "initial_count": initial_count,
         "arrival_count": len(arrival_atoms),
         "insertion_count": len(arrival_atoms) if dynamic else 0,
         "updated_count": len(arrival_atoms) if dynamic else 0,
         "excluded_count": 0,
+        "trajectory_source": (
+            trajectory_source if dynamic else "static_records"
+        ),
+        "started_from_empty": bool(strict_open_loop),
+        "strict_online_protocol_verified": bool(
+            strict_open_loop
+            and initial_count == 0
+            and len(insertions) == len(arrival_atoms)
+            and len(refresh_batches) == len(arrival_atoms)
+        ),
+        "per_arrival_refresh": bool(strict_open_loop),
+        "checkpoint_count": (
+            len(refresh_batches) if strict_open_loop else 0
+        ),
+        "prefix_leakage_count": 0,
+        "future_atoms_precomputed": bool(strict_open_loop),
         "arrival_update_semantics": (
-            "sequential_structural_insert_batched_local_capsule_refresh"
+            "strict_one_at_a_time_insert_refresh_validate_checkpoint"
+            if strict_open_loop
+            else "sequential_structural_insert_batched_local_capsule_refresh"
             if dynamic
             else "static_dataset_order_uses_same_insert_operation"
         ),
@@ -1134,6 +1583,7 @@ async def _refresh_capsules(
     dirty_node_ids: set[str],
     retired_node_ids: set[str],
     reason: str,
+    revise_prior_capsules: bool = False,
 ) -> dict[str, Any]:
     dirty = {
         node_id for node_id in dirty_node_ids if node_id in tree.nodes
@@ -1143,6 +1593,14 @@ async def _refresh_capsules(
         while parent_id is not None:
             dirty.add(parent_id)
             parent_id = tree.nodes[parent_id].parent_id
+    prior_by_tree_node = (
+        {
+            node_id: registry.active_capsule_for_tree_node(node_id)
+            for node_id in dirty
+        }
+        if revise_prior_capsules
+        else {}
+    )
     registry.archive_tree_nodes(
         sorted(dirty | retired_node_ids),
         reason=reason,
@@ -1172,6 +1630,7 @@ async def _refresh_capsules(
                     tree,
                     registry,
                     node_id,
+                    prior_capsule=prior_by_tree_node.get(node_id),
                 )
             else:
                 frontier_by_child = [
@@ -1203,6 +1662,7 @@ async def _refresh_capsules(
                     registry,
                     node_id,
                     tuple(frontier),
+                    prior_capsule=prior_by_tree_node.get(node_id),
                 )
             coroutine_nodes.append(node_id)
             coroutines.append(coroutine)
@@ -1294,6 +1754,89 @@ def _write_state_artifacts(
             )
         ],
     )
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _ordered_sha256(values: Sequence[str]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            [str(value) for value in values],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _ebst_tree_protocol_fingerprint(
+    config: Any,
+    ebst: EvidenceBalancedSkillConfig,
+) -> str:
+    repo_root = Path(__file__).resolve().parents[2]
+    source_paths = (
+        Path(__file__).resolve(),
+        repo_root / "src/dynamix_core/balanced_metric_tree.py",
+        repo_root / "src/dynamix_core/skill_capsules.py",
+        repo_root / "src/dynamix_trace2skill/clients.py",
+    )
+    payload = {
+        "format": "ebst_tree_protocol_v1",
+        "ebst": asdict(ebst),
+        "generation": {
+            "model": config.generation.model,
+            "base_url": config.generation.base_url,
+            "thinking_mode": config.generation.thinking_mode,
+            "extra_body": config.generation.extra_body,
+        },
+        "analyst": asdict(config.analyst),
+        "embedding": {
+            "model": config.embedding.model,
+            "base_url": config.embedding.base_url,
+            "max_model_len": config.embedding.max_model_len,
+            "max_input_tokens": config.embedding.effective_max_input_tokens,
+            "tokenizer_model": config.embedding.tokenizer_model,
+        },
+        "chunked_embedding": dict(config.chunked_embedding or {}),
+        "sources": {
+            str(path.relative_to(repo_root)): _file_sha256(path)
+            for path in source_paths
+        },
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _latest_online_checkpoint(snapshot_root: Path) -> Path | None:
+    if not snapshot_root.is_dir():
+        return None
+    candidates = [
+        path
+        for path in snapshot_root.glob("arrival_[0-9][0-9][0-9][0-9]")
+        if (path / "checkpoint.complete.json").is_file()
+    ]
+    return max(candidates, default=None, key=lambda path: path.name)
+
+
+def _dynamic_initial_count(
+    record_count: int,
+    requested: int,
+    *,
+    strict_open_loop: bool,
+) -> int:
+    minimum = 0 if strict_open_loop else 1
+    return min(max(minimum, int(requested)), max(0, int(record_count)))
 
 
 def _render_capsule_prompt(capsule: SkillCapsule) -> str:

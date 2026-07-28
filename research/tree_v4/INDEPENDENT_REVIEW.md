@@ -5,72 +5,52 @@ Date: 2026-07-28
 ## Reviewers
 
 - Spec and research-protocol reviewer:
-  `019fa738-9f6e-7d61-bf49-600eb26695f2`
-- Regression, fairness, security, and Ponytail reviewer:
-  `019fa739-5fde-7f12-a876-77e96997241b`
+  `019fa840-86f8-7140-9279-cd3bf8ee0e7d`
+- Regression, security/data, and Ponytail-complexity reviewer:
+  `019fa842-34f3-78b2-bddb-981c9082f2d1`
 
-Both reviewers inspected the live diff and did not edit files.
-After the fixes below, both completed a second pass with no remaining
-actionable findings.
+Both reviewers inspected the live diff and untracked files without editing
+them. After three repair passes, both returned `PASS` with no remaining P0/P1.
 
-## Findings And Resolutions
+## Main Findings Resolved
 
-### P1: legacy nodebank prompt regression
+- Resume now binds experiment contract, source, dataset and workbook content,
+  Atom protocol, tree protocol, record prefix, evaluator, and checkpoint.
+- Bootstrap must be an owned strict `open_loop_replay` prefix with matching
+  record and tree fingerprints.
+- Only strict open-loop permits an empty initial tree; legacy `fixed_replay`
+  retains its previous minimum-one seed behavior.
+- Closed-loop selection logs are bound to the exact task, query, top-k, active
+  node IDs, and score cardinality.
+- Open-loop/static capsule refresh keeps the prior prompt semantics; only
+  closed-loop revision receives the prior capsule and exposure audit.
+- The paired control manifest enforces model endpoint, thinking, temperature,
+  turns, workers, timeout, retries, response-cache policy, top-k, and evaluator.
+- Closed-loop train and the enclosing train-plus-heldout launcher both use
+  nonblocking run-directory locks.
+- Heldout resume binds input and ground-truth workbook hashes, nodebank/index,
+  retrieval environment, source query-vector manifest, and runtime sources.
+  Successful output workbooks are verified by SHA256 before a task is skipped.
+- Source query vectors are validated before heldout and audited afterward
+  against the paired open-loop manifest.
+- API-key values and hashes are excluded from persisted commands/contracts.
 
-The initial implementation used any non-empty `prompt_text`, which changed
-legacy GMM nodebank injection. The renderer now uses full prompts only for
-CDOST or EBST analyst modes. A regression test locks legacy, CDOST, and EBST
-rendering behavior.
+## Ponytail Review
 
-### P1: dynamic capsule vector-cache miss
-
-The initial dynamic configuration required every capsule text to already exist
-in the static cache. EBST now reuses existing vectors under
-`first_write_wins` and permits only newly created capsule texts to be added.
-CDOST's previous strict-cache behavior remains unchanged.
-
-### P1: incomplete build could leave a done marker
-
-Capsule runtime and prompt-budget failures are written to the audit artifacts,
-then the build process exits non-zero. The experiment runner therefore writes
-only a failed marker, and a resumed run rebuilds after the service recovers.
-
-### P1: shared retrieval code was not bound by the fairness gate
-
-The control contract now fingerprints `skillbank.py` and the antichain
-selection implementation in addition to the rollout and evaluator sources.
-Old control manifests without those fingerprints are not accepted as formal
-controls; the CDOST control must be rerun from the same commit.
-
-### P2: incomplete EBST topology and schema validation
-
-Heldout preflight and the selector both validate unique parents, closure,
-reachability, lineage, active lifecycle, non-empty semantic and prompt fields,
-the exact embedding-text contract, allowed analyst modes, and at least two
-unique evidence atoms. Malformed manifests fail before any heldout worker is
-started.
-
-### P2/P3: lifecycle wording and unused API parameter
-
-Archive events now record `archive_disposition=invalidated_stale`; the
-documentation no longer equates every archive with successful replacement.
-The unused `tree` argument was removed from `rebuild_active_links`.
-Documentation also states that the current dynamic run deterministically
-rebuilds the initial 120 frozen atoms and does not yet resume a serialized
-tree snapshot.
+Six repeated Python config reads in the closed-loop shell were reduced to one.
+No remaining simplification was accepted that would weaken experiment
+identity, logging, checkpoint safety, testing, or research-protocol evidence.
 
 ## Verification
 
-- Full test suite: `305 passed`, one pre-existing NumPy deprecation warning.
-- Targeted EBST/fairness tests: `23 passed`.
-- Offline frozen-Atom audit: 200 atoms, 41 structural nodes, 35 leaves,
-  6 internal nodes, height 2, occupancy 4-8.
-- Python compilation, shell syntax, and `git diff --check`: passed.
-- No live LLM or LibreOffice benchmark was run because model resources were
-  stopped.
+- Full tests: `323 passed`, one pre-existing NumPy deprecation warning.
+- Targeted tests: `184 passed`.
+- `py_compile`, launcher `bash -n`, and `git diff --check`: passed.
+- No real model or LibreOffice experiment was run in this implementation goal.
 
 ## Claim Boundary
 
-This gate supports implementation consistency, structural invariants, and
-experiment-protocol enforcement. It does not yet support a claim of improved
-capsule semantics, runtime, or downstream benchmark performance.
+This review supports code/spec alignment, online-order correctness, structural
+invariants, resume integrity, and paired-protocol enforcement. It does not
+support a claim that either setting improves SpreadsheetBench performance,
+runtime, or skill quality; those claims require the pending full experiments.
