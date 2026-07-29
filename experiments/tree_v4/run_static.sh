@@ -9,12 +9,27 @@ if [[ -z "${BASELINE_CDOST_RUN_DIR:-}" ]]; then
 fi
 BASELINE_ATOMS="$BASELINE_CDOST_RUN_DIR/dynamix_tree/experience_atoms.json"
 BASELINE_CONTROL="$BASELINE_CDOST_RUN_DIR/analysis/cdost_control_manifest.json"
-if [[ ! -f "$BASELINE_ATOMS" || ! -f "$BASELINE_CONTROL" ]]; then
+BASELINE_CONFIG="$BASELINE_CDOST_RUN_DIR/dynamix_config.json"
+if [[ ! -f "$BASELINE_ATOMS" || ! -f "$BASELINE_CONTROL" || ! -f "$BASELINE_CONFIG" ]]; then
   echo "ERROR: baseline CDOST atoms/control manifest are incomplete" >&2
+  exit 2
+fi
+SOURCE_EMBEDDING_CACHE="$(
+  "${DYNAMIX_PYTHON:-python3}" -c \
+    'import json, sys; print(json.load(open(sys.argv[1]))["embedding"]["cache_path"])' \
+    "$BASELINE_CONFIG"
+)"
+if [[ -z "$SOURCE_EMBEDDING_CACHE" ]]; then
+  echo "ERROR: baseline CDOST embedding cache path is empty" >&2
+  exit 2
+fi
+if [[ -n "${EMBEDDING_CACHE_PATH:-}" && "$EMBEDDING_CACHE_PATH" != "$SOURCE_EMBEDDING_CACHE" ]]; then
+  echo "ERROR: EMBEDDING_CACHE_PATH does not match the baseline CDOST cache" >&2
   exit 2
 fi
 
 export REPO_ROOT
+export EMBEDDING_CACHE_PATH="$SOURCE_EMBEDDING_CACHE"
 export TREE_SCENARIO="static_build"
 export TREE_POLICY="evidence_balanced_skill_tree"
 export GRAPH_KIND="single_parent_balanced_metric_tree"

@@ -5158,6 +5158,193 @@ def test_ebst_hierarchy_fingerprint_uses_only_active_policy_fields():
     }
 
 
+def _write_completed_frozen_atom_source(
+    tmp_path: Path,
+    *,
+    tree_policy: str,
+) -> tuple[Path, Path]:
+    source_dir = tmp_path / tree_policy
+    source_tree = source_dir / "dynamix_tree"
+    source_tree.mkdir(parents=True)
+    atom_cache = source_tree / "experience_atoms.json"
+    atom_cache.write_text('{"atoms":[]}', encoding="utf-8")
+    source_cache = source_dir / "embedding_cache.sqlite"
+    cache = _SqliteEmbeddingCache(source_cache)
+    cache.set("frozen-atoms", "atom text", [1.0, 0.0])
+    cache.close()
+    vector_manifest = source_tree / "embedding_vector_cache_manifest.json"
+    write_embedding_cache_manifest(
+        cache_path=source_cache,
+        output_path=vector_manifest,
+        requirements=[
+            {
+                "namespace": "frozen-atoms",
+                "text": "atom text",
+                "vector": [1.0, 0.0],
+                "purpose": "test",
+                "item_id": "atom-1",
+            }
+        ],
+    )
+    (source_dir / "dynamix_config.json").write_text(
+        json.dumps(
+            {
+                "scenario": "static_build",
+                "output_dir": str(source_tree),
+                "embedding": {"cache_path": str(source_cache)},
+                "hierarchy": {"tree_policy": tree_policy},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def identity(path: Path) -> dict[str, Any]:
+        return {
+            "exists": True,
+            "kind": "file",
+            "size": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+
+    marker_dir = source_dir / "stage_markers"
+    marker_dir.mkdir()
+    (marker_dir / "04_build_tree.done").write_text(
+        json.dumps(
+            {
+                "stage": "04_build_tree",
+                "outputs": [str(atom_cache), str(vector_manifest)],
+                "output_identities": {
+                    str(atom_cache): identity(atom_cache),
+                    str(vector_manifest): identity(vector_manifest),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return atom_cache, source_cache
+
+
+def _frozen_atom_consumer_config(
+    tmp_path: Path,
+    *,
+    cache_path: Path,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        scenario="static_build",
+        output_dir=str(tmp_path / "treatment" / "dynamix_tree"),
+        embedding=SimpleNamespace(
+            cache_path=str(cache_path),
+            cache_write_policy="first_write_wins",
+        ),
+        dynamic=SimpleNamespace(
+            trajectory_source="open_loop_replay",
+            initial_count=0,
+            arrival_count=2,
+            update_batch_size=1,
+            snapshot_include_embeddings=True,
+            resume_from_snapshots=False,
+        ),
+    )
+
+
+def test_ebst_frozen_atoms_require_source_embedding_cache(tmp_path: Path):
+    import dynamix_trace2skill.evidence_balanced_skill_pipeline as pipeline
+
+    atom_cache, _ = _write_completed_frozen_atom_source(
+        tmp_path,
+        tree_policy="certified_dual_view_otd",
+    )
+    config = _frozen_atom_consumer_config(
+        tmp_path,
+        cache_path=tmp_path / "treatment" / "embedding_cache.sqlite",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="share the source embedding cache",
+    ):
+        pipeline._validate_frozen_atom_cache_binding(
+            config,
+            str(atom_cache),
+            require_ebst_source=False,
+        )
+
+
+def test_ebst_frozen_atoms_accept_matching_source_cache(tmp_path: Path):
+    import dynamix_trace2skill.evidence_balanced_skill_pipeline as pipeline
+
+    atom_cache, source_cache = _write_completed_frozen_atom_source(
+        tmp_path,
+        tree_policy="certified_dual_view_otd",
+    )
+    config = _frozen_atom_consumer_config(
+        tmp_path,
+        cache_path=source_cache,
+    )
+
+    pipeline._validate_frozen_atom_cache_binding(
+        config,
+        str(atom_cache),
+        require_ebst_source=False,
+    )
+
+
+def test_ebst_dynamic_requires_completed_static_ebst_source(tmp_path: Path):
+    import dynamix_trace2skill.evidence_balanced_skill_pipeline as pipeline
+
+    cdost_atoms, cdost_cache = _write_completed_frozen_atom_source(
+        tmp_path,
+        tree_policy="certified_dual_view_otd",
+    )
+    config = _frozen_atom_consumer_config(
+        tmp_path,
+        cache_path=cdost_cache,
+    )
+    with pytest.raises(ValueError, match="evidence_balanced_skill_tree"):
+        pipeline._validate_frozen_atom_cache_binding(
+            config,
+            str(cdost_atoms),
+            require_ebst_source=True,
+        )
+
+    ebst_atoms, ebst_cache = _write_completed_frozen_atom_source(
+        tmp_path,
+        tree_policy="evidence_balanced_skill_tree",
+    )
+    config.embedding.cache_path = str(ebst_cache)
+    pipeline._validate_frozen_atom_cache_binding(
+        config,
+        str(ebst_atoms),
+        require_ebst_source=True,
+    )
+
+
+def test_ebst_frozen_atoms_reject_atom_mutation_after_completion(
+    tmp_path: Path,
+):
+    import dynamix_trace2skill.evidence_balanced_skill_pipeline as pipeline
+
+    atom_cache, source_cache = _write_completed_frozen_atom_source(
+        tmp_path,
+        tree_policy="certified_dual_view_otd",
+    )
+    atom_cache.write_text('{"atoms":[{"changed":true}]}', encoding="utf-8")
+    config = _frozen_atom_consumer_config(
+        tmp_path,
+        cache_path=source_cache,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="no longer matches its completed stage marker",
+    ):
+        pipeline._validate_frozen_atom_cache_binding(
+            config,
+            str(atom_cache),
+            require_ebst_source=False,
+        )
+
+
 def test_ebst_runtime_identity_records_online_balanced_semantics():
     runner = _load_experiment_runner_module()
     args = SimpleNamespace(

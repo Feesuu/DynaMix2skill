@@ -9,12 +9,27 @@ if [[ -z "${RUN_DIR:-}" ]]; then
 fi
 
 STATIC_ATOMS="$RUN_DIR/scenarios/static_build/dynamix_tree/experience_atoms.json"
-if [[ ! -f "$STATIC_ATOMS" ]]; then
+STATIC_CONFIG="$RUN_DIR/scenarios/static_build/dynamix_config.json"
+if [[ ! -f "$STATIC_ATOMS" || ! -f "$STATIC_CONFIG" ]]; then
   echo "ERROR: matching static atom cache is missing: $STATIC_ATOMS" >&2
+  exit 2
+fi
+SOURCE_EMBEDDING_CACHE="$(
+  "${DYNAMIX_PYTHON:-python3}" -c \
+    'import json, sys; print(json.load(open(sys.argv[1]))["embedding"]["cache_path"])' \
+    "$STATIC_CONFIG"
+)"
+if [[ -z "$SOURCE_EMBEDDING_CACHE" ]]; then
+  echo "ERROR: matching static embedding cache path is empty" >&2
+  exit 2
+fi
+if [[ -n "${EMBEDDING_CACHE_PATH:-}" && "$EMBEDDING_CACHE_PATH" != "$SOURCE_EMBEDDING_CACHE" ]]; then
+  echo "ERROR: EMBEDDING_CACHE_PATH does not match the matching static cache" >&2
   exit 2
 fi
 
 export REPO_ROOT
+export EMBEDDING_CACHE_PATH="$SOURCE_EMBEDDING_CACHE"
 export TREE_SCENARIO="dynamic_update"
 export TREE_POLICY="evidence_balanced_skill_tree"
 export GRAPH_KIND="single_parent_balanced_metric_tree"

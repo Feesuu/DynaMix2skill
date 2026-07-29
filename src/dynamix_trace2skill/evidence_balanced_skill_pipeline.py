@@ -34,6 +34,7 @@ from .certified_otd_pipeline import (
     _resolve_skill_output_dir,
     _tokenizer_for_config,
     _unsafe_reusable_text_reasons,
+    _validate_source_build_output,
     _write_vector_cache_manifest,
     _write_jsonl,
 )
@@ -996,6 +997,68 @@ async def build_evidence_balanced_dynamic_tree_from_records(
     return await _build(config, dynamic=True)
 
 
+def _validate_frozen_atom_cache_binding(
+    config: Any,
+    atom_cache_path: str,
+    *,
+    require_ebst_source: bool,
+) -> None:
+    resolved_atom_cache = Path(atom_cache_path).resolve()
+    if not resolved_atom_cache.is_file():
+        raise FileNotFoundError(
+            f"frozen atom cache is missing: {resolved_atom_cache}"
+        )
+    source_tree_dir = resolved_atom_cache.parent
+    source_config_path = source_tree_dir.parent / "dynamix_config.json"
+    if not source_config_path.is_file():
+        raise FileNotFoundError(
+            "matching static dynamix_config.json is missing: "
+            f"{source_config_path}"
+        )
+    source_config = json.loads(
+        source_config_path.read_text(encoding="utf-8")
+    )
+    expected_policy = (
+        "evidence_balanced_skill_tree"
+        if require_ebst_source
+        else "certified_dual_view_otd"
+    )
+    if (
+        source_config.get("scenario") != "static_build"
+        or source_config.get("hierarchy", {}).get("tree_policy")
+        != expected_policy
+    ):
+        raise ValueError(
+            "frozen atom cache is not bound to the required static "
+            f"{expected_policy} source"
+        )
+    if (
+        Path(str(source_config.get("output_dir") or "")).resolve()
+        != source_tree_dir
+    ):
+        raise ValueError(
+            "frozen atom cache is not bound to its source tree output"
+        )
+    source_vector_manifest = (
+        source_tree_dir / "embedding_vector_cache_manifest.json"
+    )
+    _validate_source_build_output(resolved_atom_cache)
+    _validate_source_build_output(source_vector_manifest)
+    source_cache = Path(
+        str(source_config.get("embedding", {}).get("cache_path") or "")
+    ).resolve()
+    current_cache = Path(str(config.embedding.cache_path)).resolve()
+    if source_cache != current_cache:
+        raise ValueError(
+            "frozen atom cache consumers must share the source "
+            "embedding cache"
+        )
+    validate_embedding_cache_manifest(
+        cache_path=current_cache,
+        manifest_path=source_vector_manifest,
+    )
+
+
 async def _build(config: Any, *, dynamic: bool) -> dict[str, Any]:
     from .pipeline import (
         _load_records_for_protocol,
@@ -1067,47 +1130,11 @@ async def _build(config: Any, *, dynamic: bool) -> dict[str, Any]:
             "controlled dynamic runs require ebst.atom_cache_path from the "
             "matching static atom extraction"
         )
-    if dynamic:
-        atom_cache_path = Path(str(ebst.atom_cache_path)).resolve()
-        if not atom_cache_path.is_file():
-            raise FileNotFoundError(
-                f"frozen atom cache is missing: {atom_cache_path}"
-            )
-        source_tree_dir = atom_cache_path.parent
-        source_config_path = source_tree_dir.parent / "dynamix_config.json"
-        if not source_config_path.is_file():
-            raise FileNotFoundError(
-                "matching static dynamix_config.json is missing: "
-                f"{source_config_path}"
-            )
-        source_config = json.loads(
-            source_config_path.read_text(encoding="utf-8")
-        )
-        if (
-            source_config.get("scenario") != "static_build"
-            or source_config.get("hierarchy", {}).get("tree_policy")
-            != "evidence_balanced_skill_tree"
-            or Path(str(source_config.get("output_dir") or "")).resolve()
-            != source_tree_dir
-        ):
-            raise ValueError(
-                "frozen atom cache is not bound to a matching static "
-                "evidence-balanced run"
-            )
-        source_cache = Path(
-            str(source_config.get("embedding", {}).get("cache_path") or "")
-        ).resolve()
-        current_cache = Path(str(config.embedding.cache_path)).resolve()
-        if source_cache != current_cache:
-            raise ValueError(
-                "paired static/dynamic evidence-balanced runs must share "
-                "the same embedding cache"
-            )
-        validate_embedding_cache_manifest(
-            cache_path=current_cache,
-            manifest_path=(
-                source_tree_dir / "embedding_vector_cache_manifest.json"
-            ),
+    if ebst.atom_cache_path:
+        _validate_frozen_atom_cache_binding(
+            config,
+            str(ebst.atom_cache_path),
+            require_ebst_source=dynamic,
         )
 
     out = Path(config.output_dir)

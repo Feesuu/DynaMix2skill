@@ -144,6 +144,7 @@ GENERATION_RETRY_WAIT_SECONDS="${GENERATION_RETRY_WAIT_SECONDS:-2,5,15}"
 EMBEDDING_BASE_URL="${EMBEDDING_BASE_URL:-http://10.26.1.184:18007/v1}"
 EMBEDDING_MODEL="${EMBEDDING_MODEL:-Qwen3-Embedding-8B}"
 EMBEDDING_TOKENIZER="${EMBEDDING_TOKENIZER:-/mnt/data/grouph_share/models/modelscope/models/Qwen/Qwen3-Embedding-8B}"
+EMBEDDING_CACHE_PATH="${EMBEDDING_CACHE_PATH:-}"
 
 EMBEDDING_MAX_MODEL_LEN="${EMBEDDING_MAX_MODEL_LEN:-32000}"
 EMBEDDING_MAX_INPUT_TOKENS="${EMBEDDING_MAX_INPUT_TOKENS:-32000}"
@@ -353,6 +354,7 @@ echo "[preflight] python=$(command -v python)"
 "$DYNAMIX_PYTHON" -c 'import sys; print("[preflight] sys.executable=" + sys.executable)'
 echo "[preflight] generation=$MODEL $OPENAI_BASE_URL thinking=$THINKING workers=$WORKERS"
 echo "[preflight] embedding=$EMBEDDING_MODEL $EMBEDDING_BASE_URL tokenizer=$EMBEDDING_TOKENIZER"
+echo "[preflight] embedding_cache=${EMBEDDING_CACHE_PATH:-<run-local>}"
 echo "[preflight] analyst_tokenizer=${ANALYST_TOKENIZER:-<missing>} analysis_bundle_max_chars=$ANALYSIS_BUNDLE_MAX_CHARS"
 echo "[preflight] heldout_query='instruction + Task type'; answer_position is not used for retrieval"
 if [[ "${ANALYST_TOKENIZER_REQUIRED,,}" == "true" && "${ANALYST_ALLOW_REGEX_TOKENIZER_FALLBACK,,}" != "true" && -z "$ANALYST_TOKENIZER" ]]; then
@@ -508,6 +510,10 @@ cmd=(
 
 if [[ -n "$ANALYST_TOKENIZER" ]]; then
   cmd+=("--analyst-tokenizer" "$ANALYST_TOKENIZER")
+fi
+
+if [[ -n "$EMBEDDING_CACHE_PATH" ]]; then
+  cmd+=("--embedding-cache-path" "$EMBEDDING_CACHE_PATH")
 fi
 
 if [[ -n "$RECORDS_PATH" ]]; then
