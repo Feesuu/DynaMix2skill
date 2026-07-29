@@ -66,6 +66,12 @@ driver. EBST snapshot resume remains disabled until snapshot identity and
 fingerprint validation are implemented; a failed launch must restart the
 dynamic build from its empty-tree input rather than trust a partial snapshot.
 
+If a reviewed runtime bug fix changes source fingerprints after the paired
+static run, set `EBST_RUNTIME_FIX_SOURCE_DELTA_MANIFEST` to an audit manifest
+bound to both control-contract hashes. Only exact `/source/...` differences
+listed by that manifest are accepted; model, split, retrieval, evaluator, and
+other protocol differences still fail closed.
+
 ## 2. Closed-Loop Skill Evolution
 
 The formal default uses the completed open-loop checkpoint after train item

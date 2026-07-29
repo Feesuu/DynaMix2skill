@@ -241,9 +241,28 @@ def test_ebst_dynamic_launcher_disables_unimplemented_snapshot_resume():
     launcher = (
         repo_root / "experiments" / "tree_v4" / "run_dynamic.sh"
     ).read_text(encoding="utf-8")
+    handoff = (
+        repo_root / "scripts" / "run_handoff_static_dynamic_experiment.sh"
+    ).read_text(encoding="utf-8")
 
     assert 'export DYNAMIC_RESUME_FROM_SNAPSHOTS="false"' in launcher
     assert 'export DYNAMIC_RESUME_FROM_SNAPSHOTS="true"' not in launcher
+    assert "EBST_RUNTIME_FIX_SOURCE_DELTA_MANIFEST" in handoff
+    assert "--ebst-runtime-fix-source-delta-manifest" in handoff
+
+
+def test_ebst_runtime_fix_audit_is_bound_to_build_marker():
+    repo_root = Path(__file__).resolve().parents[1]
+    runner = (
+        repo_root / "scripts" / "run_dynamix_trace2skill_experiment.py"
+    ).read_text(encoding="utf-8")
+
+    assert '"ebst_runtime_fix_source_delta_manifest": (' in runner
+    assert '"ebst_runtime_fix_compatibility": (' in runner
+    assert (
+        "build_outputs.append(ebst_runtime_fix_compatibility_path)"
+        in runner
+    )
 
 
 def test_react_async_openai_client_does_not_retry_runtime_timeout(
@@ -1025,6 +1044,181 @@ def test_cdost_control_manifest_rejects_protocol_drift(tmp_path):
         runner.validate_matching_cdost_control_manifest(
             current_manifest=current,
             source_manifest=source,
+        )
+
+
+def test_ebst_control_manifest_requires_explicit_runtime_fix_for_source_delta(
+    tmp_path,
+):
+    runner = _load_experiment_runner_module()
+    source = tmp_path / "source.json"
+    current = tmp_path / "current.json"
+    runner.write_ebst_control_manifest(
+        source,
+        {
+            "format": "ebst_control_contract_v1",
+            "tree": {"max_entries": 8},
+            "source": {"react_agent": {"sha256": "before"}},
+        },
+    )
+    runner.write_ebst_control_manifest(
+        current,
+        {
+            "format": "ebst_control_contract_v1",
+            "tree": {"max_entries": 8},
+            "source": {"react_agent": {"sha256": "after"}},
+        },
+    )
+
+    with pytest.raises(ValueError, match="control contract differs"):
+        runner.validate_matching_ebst_control_manifest(
+            current_manifest=current,
+            source_manifest=source,
+        )
+
+
+def test_ebst_control_manifest_accepts_exact_audited_source_delta(tmp_path):
+    runner = _load_experiment_runner_module()
+    source = tmp_path / "source.json"
+    current = tmp_path / "current.json"
+    runtime_fix = tmp_path / "runtime_fix.json"
+    source_payload = runner.write_ebst_control_manifest(
+        source,
+        {
+            "format": "ebst_control_contract_v1",
+            "tree": {"max_entries": 8},
+            "source": {"react_agent": {"sha256": "before"}},
+        },
+    )
+    current_payload = runner.write_ebst_control_manifest(
+        current,
+        {
+            "format": "ebst_control_contract_v1",
+            "tree": {"max_entries": 8},
+            "source": {"react_agent": {"sha256": "after"}},
+        },
+    )
+    runtime_fix.write_text(
+        json.dumps(
+            {
+                "format": "ebst_runtime_fix_source_delta_v1",
+                "source_contract_sha256": source_payload["contract_sha256"],
+                "current_contract_sha256": current_payload["contract_sha256"],
+                "allowed_contract_diff_paths": [
+                    "/source/react_agent/sha256",
+                ],
+                "change_summary": "Reject terminal context overflow without retry.",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    audit = runner.validate_matching_ebst_control_manifest(
+        current_manifest=current,
+        source_manifest=source,
+        runtime_fix_manifest=runtime_fix,
+    )
+
+    assert audit["compatible"] is True
+    assert audit["runtime_fix_used"] is True
+    assert audit["contract_diff_paths"] == ["/source/react_agent/sha256"]
+    assert audit["runtime_fix_manifest"]["sha256"] == runner.file_sha256(
+        runtime_fix
+    )
+
+
+def test_ebst_runtime_fix_manifest_cannot_allow_protocol_delta(tmp_path):
+    runner = _load_experiment_runner_module()
+    source = tmp_path / "source.json"
+    current = tmp_path / "current.json"
+    runtime_fix = tmp_path / "runtime_fix.json"
+    source_payload = runner.write_ebst_control_manifest(
+        source,
+        {
+            "format": "ebst_control_contract_v1",
+            "tree": {"max_entries": 8},
+            "source": {"react_agent": {"sha256": "same"}},
+        },
+    )
+    current_payload = runner.write_ebst_control_manifest(
+        current,
+        {
+            "format": "ebst_control_contract_v1",
+            "tree": {"max_entries": 9},
+            "source": {"react_agent": {"sha256": "same"}},
+        },
+    )
+    runtime_fix.write_text(
+        json.dumps(
+            {
+                "format": "ebst_runtime_fix_source_delta_v1",
+                "source_contract_sha256": source_payload["contract_sha256"],
+                "current_contract_sha256": current_payload["contract_sha256"],
+                "allowed_contract_diff_paths": ["/tree/max_entries"],
+                "change_summary": "Not a source-only change.",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="may only cover source fingerprints",
+    ):
+        runner.validate_matching_ebst_control_manifest(
+            current_manifest=current,
+            source_manifest=source,
+            runtime_fix_manifest=runtime_fix,
+        )
+
+
+def test_ebst_runtime_fix_manifest_must_match_all_observed_source_deltas(
+    tmp_path,
+):
+    runner = _load_experiment_runner_module()
+    source = tmp_path / "source.json"
+    current = tmp_path / "current.json"
+    runtime_fix = tmp_path / "runtime_fix.json"
+    source_payload = runner.write_ebst_control_manifest(
+        source,
+        {
+            "format": "ebst_control_contract_v1",
+            "source": {
+                "react_agent": {"sha256": "before"},
+                "skillbank": {"sha256": "before"},
+            },
+        },
+    )
+    current_payload = runner.write_ebst_control_manifest(
+        current,
+        {
+            "format": "ebst_control_contract_v1",
+            "source": {
+                "react_agent": {"sha256": "after"},
+                "skillbank": {"sha256": "after"},
+            },
+        },
+    )
+    runtime_fix.write_text(
+        json.dumps(
+            {
+                "format": "ebst_runtime_fix_source_delta_v1",
+                "source_contract_sha256": source_payload["contract_sha256"],
+                "current_contract_sha256": current_payload["contract_sha256"],
+                "allowed_contract_diff_paths": [
+                    "/source/react_agent/sha256",
+                ],
+                "change_summary": "Incomplete source delta declaration.",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="does not exactly match"):
+        runner.validate_matching_ebst_control_manifest(
+            current_manifest=current,
+            source_manifest=source,
+            runtime_fix_manifest=runtime_fix,
         )
 
 

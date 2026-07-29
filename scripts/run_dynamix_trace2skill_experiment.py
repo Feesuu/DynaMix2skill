@@ -707,11 +707,41 @@ def write_ebst_control_manifest(
     return payload
 
 
+def _contract_diff_paths(
+    left: object,
+    right: object,
+    *,
+    path: str = "",
+) -> list[str]:
+    if type(left) is not type(right):
+        return [path or "/"]
+    if isinstance(left, Mapping):
+        differences: list[str] = []
+        for key in sorted(set(left) | set(right)):
+            escaped = str(key).replace("~", "~0").replace("/", "~1")
+            child_path = f"{path}/{escaped}"
+            if key not in left or key not in right:
+                differences.append(child_path)
+                continue
+            differences.extend(
+                _contract_diff_paths(
+                    left[key],
+                    right[key],
+                    path=child_path,
+                )
+            )
+        return differences
+    if isinstance(left, list):
+        return [] if left == right else [path or "/"]
+    return [] if left == right else [path or "/"]
+
+
 def validate_matching_ebst_control_manifest(
     *,
     current_manifest: Path,
     source_manifest: Path,
-) -> None:
+    runtime_fix_manifest: Path | None = None,
+) -> dict[str, object]:
     current = json.loads(current_manifest.read_text(encoding="utf-8"))
     source = json.loads(source_manifest.read_text(encoding="utf-8"))
     for path, payload in (
@@ -726,11 +756,79 @@ def validate_matching_ebst_control_manifest(
             raise ValueError(
                 f"invalid evidence-balanced control manifest: {path}"
             )
-    if current["contract"] != source["contract"]:
+    difference_paths = _contract_diff_paths(
+        source["contract"],
+        current["contract"],
+    )
+    if not difference_paths:
+        return {
+            "format": "ebst_runtime_fix_compatibility_v1",
+            "compatible": True,
+            "runtime_fix_used": False,
+            "source_contract_sha256": source["contract_sha256"],
+            "current_contract_sha256": current["contract_sha256"],
+            "contract_diff_paths": [],
+        }
+    if runtime_fix_manifest is None:
         raise ValueError(
             "dynamic evidence-balanced control contract differs from the "
             "source static run"
         )
+    fix = json.loads(runtime_fix_manifest.read_text(encoding="utf-8"))
+    if fix.get("format") != "ebst_runtime_fix_source_delta_v1":
+        raise ValueError(
+            "invalid EBST runtime-fix source delta manifest: "
+            f"{runtime_fix_manifest}"
+        )
+    if (
+        fix.get("source_contract_sha256") != source["contract_sha256"]
+        or fix.get("current_contract_sha256") != current["contract_sha256"]
+    ):
+        raise ValueError(
+            "EBST runtime-fix source delta manifest is not bound to the "
+            "source and current control contracts"
+        )
+    allowed_paths = fix.get("allowed_contract_diff_paths")
+    if (
+        not isinstance(allowed_paths, list)
+        or not allowed_paths
+        or any(not isinstance(value, str) for value in allowed_paths)
+    ):
+        raise ValueError(
+            "EBST runtime-fix source delta manifest must declare non-empty "
+            "allowed_contract_diff_paths"
+        )
+    normalized_allowed_paths = sorted(set(allowed_paths))
+    if any(
+        not value.startswith("/source/")
+        for value in normalized_allowed_paths
+    ):
+        raise ValueError(
+            "EBST runtime-fix exceptions may only cover source fingerprints"
+        )
+    if sorted(difference_paths) != normalized_allowed_paths:
+        raise ValueError(
+            "EBST runtime-fix source delta manifest does not exactly match "
+            "the observed control-contract differences"
+        )
+    change_summary = fix.get("change_summary")
+    if not isinstance(change_summary, str) or not change_summary.strip():
+        raise ValueError(
+            "EBST runtime-fix source delta manifest requires change_summary"
+        )
+    return {
+        "format": "ebst_runtime_fix_compatibility_v1",
+        "compatible": True,
+        "runtime_fix_used": True,
+        "source_contract_sha256": source["contract_sha256"],
+        "current_contract_sha256": current["contract_sha256"],
+        "contract_diff_paths": difference_paths,
+        "runtime_fix_manifest": {
+            "path": str(runtime_fix_manifest.resolve()),
+            "sha256": file_sha256(runtime_fix_manifest),
+            "change_summary": change_summary.strip(),
+        },
+    }
 
 
 def _without_keys(
@@ -1933,6 +2031,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--ebst-runtime-fix-source-delta-manifest",
+        default=None,
+        help=(
+            "Explicit audit manifest permitting only the declared source "
+            "fingerprint differences from the paired static run"
+        ),
+    )
+    parser.add_argument(
         "--ebst-retrieval-token-budget",
         type=int,
         default=24000,
@@ -2779,6 +2885,14 @@ def main() -> None:
     ebst_control_manifest_path = (
         scenario_dir / "analysis" / "ebst_control_manifest.json"
     )
+    ebst_runtime_fix_compatibility_path = (
+        scenario_dir
+        / "analysis"
+        / "ebst_runtime_fix_compatibility.json"
+    )
+    ebst_runtime_fix_manifest_path = resolved_optional_path(
+        args.ebst_runtime_fix_source_delta_manifest
+    )
     source_cdost_control_manifest: Path | None = None
     source_ebst_control_manifest: Path | None = None
     if args.tree_policy == "certified_dual_view_otd":
@@ -2908,9 +3022,14 @@ def main() -> None:
             baseline_compatibility,
         )
         if source_ebst_control_manifest is not None:
-            validate_matching_ebst_control_manifest(
+            runtime_fix_compatibility = validate_matching_ebst_control_manifest(
                 current_manifest=ebst_control_manifest_path,
                 source_manifest=source_ebst_control_manifest,
+                runtime_fix_manifest=ebst_runtime_fix_manifest_path,
+            )
+            write_json_atomic(
+                ebst_runtime_fix_compatibility_path,
+                runtime_fix_compatibility,
             )
     if reuse_tree_dir is not None:
         if tree_dir.resolve() == reuse_tree_dir.resolve():
@@ -2992,6 +3111,16 @@ def main() -> None:
             if source_ebst_control_manifest is not None
             else {"exists": False}
         ),
+        "ebst_runtime_fix_source_delta_manifest": (
+            path_fingerprint(ebst_runtime_fix_manifest_path)
+            if ebst_runtime_fix_manifest_path is not None
+            else {"exists": False}
+        ),
+        "ebst_runtime_fix_compatibility": (
+            path_fingerprint(ebst_runtime_fix_compatibility_path)
+            if ebst_runtime_fix_compatibility_path.exists()
+            else {"exists": False}
+        ),
         "openai_api_key": api_key_fingerprint(args.openai_api_key),
         "tree_scenario": args.tree_scenario,
         "reuse_tree_dir": str(reuse_tree_dir) if reuse_tree_dir is not None else "",
@@ -3044,6 +3173,8 @@ def main() -> None:
                 / "ebst_baseline_compatibility.json",
             ]
         )
+        if source_ebst_control_manifest is not None:
+            build_outputs.append(ebst_runtime_fix_compatibility_path)
     run_stage(
         "04_build_tree",
         build_tree_cmd,
