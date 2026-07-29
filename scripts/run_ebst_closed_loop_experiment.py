@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import fcntl
 import hashlib
 import json
@@ -46,7 +47,6 @@ from dynamix_trace2skill.log_parser import (
 )
 from dynamix_trace2skill.pipeline import (
     DynaMixRunConfig,
-    _prepare_analyst_tokenizer_config,
     _refresh_skillbank_index,
 )
 from dynamix_trace2skill.schemas import RawTrajectoryRecord
@@ -68,6 +68,17 @@ def _parse_float_csv(value: str) -> tuple[float, ...]:
             "expected at least one comma-separated float"
         )
     return tuple(float(part) for part in parts)
+
+
+def _checkpoint_protocol_config(
+    config: DynaMixRunConfig,
+    source_tree_dir: Path,
+) -> DynaMixRunConfig:
+    checkpoint_config = copy.deepcopy(config)
+    checkpoint_config.analyst.prompt_token_report_path = str(
+        source_tree_dir / "analysis" / "cdost_prompt_token_report.json"
+    )
+    return checkpoint_config
 
 
 def _write_json_atomic(path: Path, payload: Any) -> None:
@@ -796,7 +807,6 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     policy = EvidenceBalancedSkillConfig.from_mapping(
         dict(config.hierarchy or {}).get("ebst", {})
     )
-    _prepare_analyst_tokenizer_config(config, tree_dir)
     _prepare_otd_analyst_config(config, tree_dir)
     tokenizer = _tokenizer_for_config(config)
     atom_config = CertifiedOtdConfig(
@@ -809,8 +819,12 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         config,
         atom_config,
     )
-    tree_protocol_fingerprint = _ebst_tree_protocol_fingerprint(
+    checkpoint_protocol_config = _checkpoint_protocol_config(
         config,
+        source_tree_dir,
+    )
+    tree_protocol_fingerprint = _ebst_tree_protocol_fingerprint(
+        checkpoint_protocol_config,
         policy,
     )
     dataset_instances, dataset_entries = _dataset_identity(

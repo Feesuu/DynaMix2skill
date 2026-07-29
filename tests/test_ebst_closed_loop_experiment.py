@@ -162,6 +162,77 @@ def test_closed_loop_launcher_parses_manifest_boolean_strings() -> None:
     assert '"thinking": bool(rollout["thinking"])' not in launcher
 
 
+def test_closed_loop_uses_ebst_tokenizer_preflight_only() -> None:
+    runner = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "run_ebst_closed_loop_experiment.py"
+    ).read_text(encoding="utf-8")
+
+    assert "_prepare_otd_analyst_config(config, tree_dir)" in runner
+    assert "_prepare_analyst_tokenizer_config" not in runner
+
+
+def test_checkpoint_fingerprint_ignores_only_runtime_report_location(
+    tmp_path: Path,
+) -> None:
+    module = _load_runner()
+    source_tree = tmp_path / "source-tree"
+    runtime_tree = tmp_path / "closed-loop-tree"
+    source_config = _config(tmp_path)
+    runtime_config = _config(tmp_path)
+
+    module._prepare_otd_analyst_config(source_config, source_tree)
+    module._prepare_otd_analyst_config(runtime_config, runtime_tree)
+    policy = module.EvidenceBalancedSkillConfig.from_mapping({})
+    checkpoint_config = module._checkpoint_protocol_config(
+        runtime_config,
+        source_tree,
+    )
+
+    source_fingerprint = module._ebst_tree_protocol_fingerprint(
+        source_config,
+        policy,
+    )
+    assert module._ebst_tree_protocol_fingerprint(
+        checkpoint_config,
+        policy,
+    ) == source_fingerprint
+    module._validate_checkpoint_protocol(
+        {
+            "trajectory_source": "open_loop_replay",
+            "atom_protocol_fingerprint": "atom",
+            "tree_protocol_fingerprint": source_fingerprint,
+            "record_prefix_sha256": "records",
+            "metadata": {"strict_online": True},
+        },
+        trajectory_source="open_loop_replay",
+        atom_protocol_fingerprint="atom",
+        tree_protocol_fingerprint=module._ebst_tree_protocol_fingerprint(
+            checkpoint_config,
+            policy,
+        ),
+        record_prefix_sha256="records",
+        require_strict_open_loop=True,
+    )
+    assert runtime_config.analyst.prompt_token_report_path == str(
+        runtime_tree / "analysis" / "cdost_prompt_token_report.json"
+    )
+    assert runtime_config.analyst.max_prompt_tokens == 85000
+    assert (
+        checkpoint_config.analyst.tokenizer_model
+        == runtime_config.analyst.tokenizer_model
+    )
+    assert (
+        checkpoint_config.analyst.tokenizer_required
+        == runtime_config.analyst.tokenizer_required
+    )
+    assert (
+        checkpoint_config.analyst.allow_regex_tokenizer_fallback
+        == runtime_config.analyst.allow_regex_tokenizer_fallback
+    )
+
+
 def test_closed_loop_feedback_is_attached_without_changing_task() -> None:
     module = _load_runner()
     record = RawTrajectoryRecord(
