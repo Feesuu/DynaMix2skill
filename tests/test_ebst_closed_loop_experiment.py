@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -139,6 +140,26 @@ def test_closed_loop_retry_schedule_is_parsed_as_floats() -> None:
         10.0,
         30.0,
     )
+
+
+def test_closed_loop_launcher_parses_manifest_boolean_strings() -> None:
+    module = _load_runner()
+    launcher = (
+        Path(__file__).resolve().parents[1]
+        / "experiments"
+        / "tree_v4"
+        / "run_closed_loop.sh"
+    ).read_text(encoding="utf-8")
+
+    assert module._parse_bool("false") is False
+    assert module._parse_bool(False) is False
+    assert '"thinking": _parse_bool(rollout["thinking"])' in launcher
+    assert re.search(
+        r'"response_cache_enabled": _parse_bool\(\s*'
+        r'rollout\["response_cache_enabled"\]',
+        launcher,
+    )
+    assert '"thinking": bool(rollout["thinking"])' not in launcher
 
 
 def test_closed_loop_feedback_is_attached_without_changing_task() -> None:

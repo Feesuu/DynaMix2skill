@@ -47,6 +47,7 @@ done
 import json
 import sys
 from evaluate_with_official import evaluation_runtime_identity
+from scripts.run_ebst_closed_loop_experiment import _parse_bool
 
 payload = json.load(open(sys.argv[1]))
 contract = payload["contract"]
@@ -54,7 +55,7 @@ rollout = contract["rollout"]
 retrieval = contract["retrieval"]
 observed = {
     "model": sys.argv[2],
-    "thinking": sys.argv[3].casefold() == "true",
+    "thinking": _parse_bool(sys.argv[3]),
     "max_turns": int(sys.argv[4]),
     "workers": int(sys.argv[5]),
     "timeout_seconds": float(sys.argv[6]),
@@ -62,12 +63,12 @@ observed = {
     "top_k": int(sys.argv[8]),
     "temperature": float(sys.argv[9]),
     "llm_client": sys.argv[10],
-    "response_cache_enabled": sys.argv[11].casefold() == "true",
+    "response_cache_enabled": _parse_bool(sys.argv[11]),
     "openai_base_url": sys.argv[13],
 }
 expected = {
     "model": rollout["model"],
-    "thinking": bool(rollout["thinking"]),
+    "thinking": _parse_bool(rollout["thinking"]),
     "max_turns": int(rollout["max_turns"]),
     "workers": int(rollout["workers"]),
     "timeout_seconds": float(rollout["timeout_seconds"]),
@@ -77,7 +78,7 @@ expected = {
     "top_k": int(retrieval["top_k"]),
     "temperature": float(rollout["generation_config"]["temperature"]),
     "llm_client": rollout["llm_client"],
-    "response_cache_enabled": bool(
+    "response_cache_enabled": _parse_bool(
         rollout["response_cache_enabled"]
     ),
     "openai_base_url": rollout["openai_base_url"],
