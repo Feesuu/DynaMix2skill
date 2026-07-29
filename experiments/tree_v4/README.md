@@ -58,11 +58,13 @@ arrival_count=200
 update_batch_size=1
 trajectory_source=open_loop_replay
 shuffle_seed=null
-resume_from_snapshots=true
+resume_from_snapshots=false
 ```
 
 `run_dynamic.sh` also runs heldout `200:400` through the common experiment
-driver.
+driver. EBST snapshot resume remains disabled until snapshot identity and
+fingerprint validation are implemented; a failed launch must restart the
+dynamic build from its empty-tree input rather than trust a partial snapshot.
 
 ## 2. Closed-Loop Skill Evolution
 

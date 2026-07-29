@@ -135,6 +135,73 @@ def test_react_openai_client_does_not_retry_runtime_timeout(monkeypatch):
     assert len(calls) == 1
 
 
+def test_react_openai_client_does_not_retry_context_overflow(monkeypatch):
+    import react_agent.models as models
+
+    calls = []
+
+    class FakeBadRequestError(Exception):
+        body = {
+            "message": (
+                "This model's maximum context length is 100000 tokens. "
+                "Your prompt contains at least 100001 input tokens."
+            ),
+            "type": "BadRequestError",
+            "param": "input_tokens",
+            "code": 400,
+        }
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            raise FakeBadRequestError(FakeBadRequestError.body["message"])
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setitem(
+        sys.modules,
+        "openai",
+        SimpleNamespace(OpenAI=FakeOpenAI, AsyncOpenAI=FakeOpenAI),
+    )
+    monkeypatch.setattr(
+        models.time,
+        "sleep",
+        lambda _: pytest.fail("context overflow must not be retried"),
+    )
+    client = models.OpenAIClient(
+        api_key="EMPTY",
+        base_url="http://example.invalid/v1",
+        use_cache=False,
+    )
+
+    with pytest.raises(models.RequestContextLengthExceeded):
+        client._send_request_with_retry(
+            [{"role": "user", "content": "test"}],
+            {},
+        )
+    assert len(calls) == 1
+
+
+def test_context_overflow_matcher_ignores_other_bad_requests():
+    import react_agent.models as models
+
+    class FakeBadRequestError(Exception):
+        body = {
+            "message": (
+                "This request mentions context length but has an invalid "
+                "temperature."
+            ),
+            "param": "temperature",
+            "code": 400,
+        }
+
+    error = FakeBadRequestError(FakeBadRequestError.body["message"])
+    assert models._extract_openai_error_message(error) == error.body["message"]
+    assert models._is_context_length_bad_request(error) is False
+
+
 def test_react_openai_client_keeps_retrying_non_timeout_errors(monkeypatch):
     import react_agent.models as models
 
@@ -167,6 +234,16 @@ def test_react_openai_client_keeps_retrying_non_timeout_errors(monkeypatch):
 
     assert client._send_request_with_retry([], {}) is expected
     assert len(calls) == 2
+
+
+def test_ebst_dynamic_launcher_disables_unimplemented_snapshot_resume():
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (
+        repo_root / "experiments" / "tree_v4" / "run_dynamic.sh"
+    ).read_text(encoding="utf-8")
+
+    assert 'export DYNAMIC_RESUME_FROM_SNAPSHOTS="false"' in launcher
+    assert 'export DYNAMIC_RESUME_FROM_SNAPSHOTS="true"' not in launcher
 
 
 def test_react_async_openai_client_does_not_retry_runtime_timeout(

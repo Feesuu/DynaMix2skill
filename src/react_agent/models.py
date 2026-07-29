@@ -35,10 +35,10 @@ def _extract_openai_error_message(exc: Exception) -> str:
     body = getattr(exc, "body", None)
     if isinstance(body, dict):
         error = body.get("error")
-        if isinstance(error, dict):
-            message = error.get("message")
-            if isinstance(message, str):
-                return message
+        details = error if isinstance(error, dict) else body
+        message = details.get("message")
+        if isinstance(message, str):
+            return message
     return str(exc)
 
 
@@ -48,14 +48,17 @@ def _is_context_length_bad_request(exc: Exception) -> bool:
     param = None
     if isinstance(body, dict):
         error = body.get("error")
-        if isinstance(error, dict):
-            param = error.get("param")
+        details = error if isinstance(error, dict) else body
+        param = details.get("param")
 
     message = _extract_openai_error_message(exc).lower()
     return (
         param == "input_tokens"
         and "context length" in message
-        and "maximum input length" in message
+        and (
+            "maximum input length" in message
+            or "maximum context length" in message
+        )
     )
 
 
