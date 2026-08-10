@@ -137,6 +137,14 @@ recovery
 source_atom_ids
 ```
 
+One contract denotes one operational capability, not one fixed procedure.
+Atoms with different selection criteria, output modes, or recovery paths remain
+compatible when explicit applicability conditions select mutually exclusive
+branches under a shared objective. `split_required` is reserved for regions
+with no meaningful shared operational objective, or where the same condition
+would require incompatible behavior. A refusal reason is concise and must not
+enumerate the candidate Atom IDs.
+
 Each conditional rule has:
 
 ```text

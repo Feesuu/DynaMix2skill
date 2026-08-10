@@ -53,7 +53,7 @@ SKILL_COMPILER_SCHEMA: dict[str, Any] = {
     "required": ["status", "reason", "contract"],
     "properties": {
         "status": {"type": "string", "enum": ["contract", "split_required"]},
-        "reason": {"type": "string"},
+        "reason": {"type": "string", "maxLength": 800},
         "contract": {
             "anyOf": [
                 {"type": "null"},
@@ -122,7 +122,7 @@ SKILL_COMPILER_SCHEMA: dict[str, Any] = {
 }
 
 ATOM_PROMPT_VERSION = "contract_cut_atom_v1"
-COMPILER_PROMPT_VERSION = "contract_cut_compiler_v1"
+COMPILER_PROMPT_VERSION = "contract_cut_compiler_v2"
 
 
 def _canonical_json(value: Any) -> str:
@@ -721,14 +721,20 @@ def _compiler_system_prompt() -> str:
     return (
         "You compile a complete reusable agent skill from a set of structured "
         "Contract Atoms that a metric tree placed in one candidate region. Do not "
-        "reanalyze raw trajectories. Return status contract only when the Atoms "
-        "can be organized as one coherent skill with explicit conditional rules, "
-        "shared invariants, verification, and recovery. Use status split_required "
-        "when the region contains incompatible objectives or cannot form one "
-        "complete executable skill without hiding contradictions. Do not create an "
-        "arbitrary DAG. Every rule must cite real source_atom_ids, and the top-level "
-        "source_atom_ids must cover every provided Atom exactly once as a set. Do "
-        "not introduce task IDs, paths, coordinates, exact answers, evaluator "
+        "reanalyze raw trajectories. A skill is one operational capability with "
+        "explicit applicability-based branches; it is not restricted to one fixed "
+        "procedure. Different selection criteria, output modes, or recovery paths "
+        "are compatible when their conditions unambiguously select the relevant "
+        "branch under a shared objective. Do not call such mutually exclusive "
+        "branches contradictions. Return status contract when the Atoms can be "
+        "organized this way with shared invariants, verification, and recovery. "
+        "Use status split_required only when there is no meaningful shared "
+        "operational objective, or when the same applicability condition requires "
+        "mutually incompatible behavior. Do not create an arbitrary DAG. Every "
+        "rule must cite real source_atom_ids, and the top-level source_atom_ids "
+        "must cover every provided Atom exactly once as a set. Keep reason under "
+        "80 words and never enumerate the candidate Atom IDs in reason. Do not "
+        "introduce task IDs, paths, coordinates, exact answers, evaluator "
         "language, or unsupported facts."
     )
 
@@ -917,9 +923,13 @@ class ContractCompiler:
     ) -> CompilerResult:
         status = str(payload.get("status") or "").strip()
         reason = str(payload.get("reason") or "").strip()
+        if len(reason) > 800:
+            raise ValueError("compiler reason exceeds 800 characters")
         if status == "split_required":
             if not reason:
                 raise ValueError("split_required result must include a reason")
+            if any(atom_id in reason for atom_id in member_atom_ids):
+                raise ValueError("split_required reason must not enumerate Atom IDs")
             if payload.get("contract") not in (None, {}):
                 raise ValueError("split_required result must not include a contract")
             return CompilerResult(

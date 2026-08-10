@@ -25,6 +25,7 @@ from dynamix_trace2skill.contract_cut_pipeline import (
     ContractCutBuildConfig,
     SkillContract,
     StableSkillRegistry,
+    _compiler_system_prompt,
     _lazy_contract_cut,
     atom_leakage_reasons,
     atom_messages,
@@ -152,6 +153,15 @@ class _PersistentLeakGeneration(_FakeGeneration):
             "verification": "Reopen and inspect representative results.",
             "failure_mode": "Incorrect key matching can duplicate rows.",
         }
+
+
+def test_compiler_prompt_treats_conditioned_variants_as_one_skill() -> None:
+    prompt = _compiler_system_prompt()
+
+    assert "one operational capability" in prompt
+    assert "mutually exclusive branches" in prompt
+    assert "same applicability condition" in prompt
+    assert "never enumerate the candidate Atom IDs" in prompt
 
 
 class _CompilerRepairGeneration(_FakeGeneration):
@@ -577,6 +587,51 @@ def test_compiler_over_budget_repair_becomes_split_required(tmp_path: Path) -> N
     assert result.status == "split_required"
     assert result.reason == "compiler_repair_prompt_over_budget"
     assert len(generation.calls) == 1
+
+
+def test_compiler_split_reason_rejects_atom_id_enumeration(tmp_path: Path) -> None:
+    compiler = ContractCompiler(
+        _FakeGeneration(),
+        tokenizer=_WhitespaceTokenizer(),
+        max_prompt_tokens=100_000,
+        cache_path=tmp_path / "compiler.json",
+    )
+
+    with pytest.raises(ValueError, match="must not enumerate Atom IDs"):
+        compiler._validate_result(
+            {
+                "status": "split_required",
+                "reason": "atom_0001 conflicts with the candidate region.",
+                "contract": None,
+            },
+            member_atom_ids=("atom_0001", "atom_0002"),
+            input_sha="input",
+            prompt_tokens=10,
+        )
+
+
+def test_compiler_split_reason_length_boundary(tmp_path: Path) -> None:
+    compiler = ContractCompiler(
+        _FakeGeneration(),
+        tokenizer=_WhitespaceTokenizer(),
+        max_prompt_tokens=100_000,
+        cache_path=tmp_path / "compiler.json",
+    )
+    accepted = compiler._validate_result(
+        {"status": "split_required", "reason": "x" * 800, "contract": None},
+        member_atom_ids=("atom_0001",),
+        input_sha="input",
+        prompt_tokens=10,
+    )
+    assert len(accepted.reason) == 800
+
+    with pytest.raises(ValueError, match="exceeds 800 characters"):
+        compiler._validate_result(
+            {"status": "split_required", "reason": "x" * 801, "contract": None},
+            member_atom_ids=("atom_0001",),
+            input_sha="input",
+            prompt_tokens=10,
+        )
 
 
 def test_export_refuses_to_replace_an_unowned_skills_directory(tmp_path: Path) -> None:
