@@ -517,10 +517,22 @@ class ContractAtomAnalyst:
                         ),
                     },
                 ]
-            raise ValueError(
-                "Contract Atom contains non-reusable literals after one revision: "
-                + ", ".join(last_reasons)
-            )
+            result = {
+                "status": "excluded",
+                "trajectory_id": record.trajectory_id,
+                "task_id": record.task_id,
+                "record_index": index,
+                "record_sha256": record_sha,
+                "protocol_sha256": self.protocol_sha256,
+                "reason": (
+                    "analyst_non_reusable_after_revision:"
+                    + ",".join(last_reasons)
+                ),
+                "prompt_tokens": _message_token_count(self.tokenizer, messages),
+                "prompt_budget": self.max_prompt_tokens,
+            }
+            await self._append_cache(result)
+            return result
 
         results = await asyncio.gather(
             *(extract(index, record) for index, record in enumerate(records)),

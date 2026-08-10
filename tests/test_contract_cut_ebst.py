@@ -141,6 +141,19 @@ class _RevisionGeneration(_FakeGeneration):
         return await super().chat_json(messages, schema_name=schema_name, **kwargs)
 
 
+class _PersistentLeakGeneration(_FakeGeneration):
+    async def chat_json(self, messages, *, schema_name, **kwargs):
+        self.calls.append((schema_name, messages, kwargs))
+        return {
+            "trigger": "Rows must move from RANGES to a target sheet.",
+            "scope": "Structured workbook edits.",
+            "decision": "Match rows by stable keys.",
+            "invariant": "Unrelated content remains unchanged.",
+            "verification": "Reopen and inspect representative results.",
+            "failure_mode": "Incorrect key matching can duplicate rows.",
+        }
+
+
 class _CompilerRepairGeneration(_FakeGeneration):
     async def chat_json(self, messages, *, schema_name, **kwargs):
         if not self.calls:
@@ -429,6 +442,33 @@ def test_atom_semantic_revision_includes_the_previous_draft(tmp_path: Path) -> N
     assert revision_messages[-2]["role"] == "assistant"
     assert "RANGES" in revision_messages[-2]["content"]
     assert "not the schema" in revision_messages[-1]["content"]
+
+
+def test_atom_that_still_leaks_after_revision_is_excluded_not_fatal(
+    tmp_path: Path,
+) -> None:
+    analyst = ContractAtomAnalyst(
+        _PersistentLeakGeneration(),
+        _FakeEmbedding(),
+        tokenizer=_WhitespaceTokenizer(),
+        max_prompt_tokens=100_000,
+        draft_cache_path=tmp_path / "drafts.jsonl",
+    )
+
+    atoms, exclusions = asyncio.run(
+        analyst.extract_many(
+            [
+                _record(
+                    0,
+                    instruction="Copy matching rows from 'RANGES' into a target sheet.",
+                )
+            ]
+        )
+    )
+
+    assert not atoms
+    assert len(exclusions) == 1
+    assert exclusions[0].reason.startswith("analyst_non_reusable_after_revision:")
 
 
 def test_over_budget_atom_is_explicitly_excluded(tmp_path: Path) -> None:
