@@ -1,0 +1,97 @@
+{
+  "format": "contract_cut_formal_run_audit_v1",
+  "run": "runs/contract_cut_ebst_v1_20260811_023336_r3_compiler_v2",
+  "audit_scope": "post_run_identity_and_public_export",
+  "atom_draft_reuse": {
+    "declared": true,
+    "scope": "atom_drafts_only",
+    "source_run": "runs/contract_cut_ebst_v1_20260811_023336_r2",
+    "source_artifact": "contract_cut/atom_drafts.jsonl",
+    "target_artifact": "runs/contract_cut_ebst_v1_20260811_023336_r3_compiler_v2/contract_cut/atom_drafts.jsonl",
+    "source_and_target_sha256": "e49efa0b431fd2ec993cf9724840dc182019fe2ce1a33eb1a8e5a744241ad987",
+    "source_protocol_file_sha256": "27bfb884536938f5547f406fe385c321cb6be33226cd2ee698a3046385850006",
+    "source_build_marker_sha256": "39a96c8d87c8abe43e17a7f4552ce0df0d953f4e10ca4a02b19e278d2f559103",
+    "source_experiment_fingerprint": "188d329c9a412c29f3a5919e2aed5a074f9cc1b5a58e809c1741cc0a18d8b988",
+    "analyst_protocol_sha256": "2b79d6341e0b859ad3a50c22cbdf92453197130aa9a90a8ccbd96280dad315a7",
+    "records_sha256": "f07519085195e8fa77d036e4cea5cc3654c57722d8cd9476fffc93da51075db1",
+    "row_count": 200,
+    "unique_record_indexes": 200,
+    "all_rows_share_analyst_protocol": true,
+    "source_generation": {
+      "model": "Qwen3.5-9B-AWQ",
+      "temperature": 0.0,
+      "thinking": false,
+      "max_tokens": null,
+      "workers": 8,
+      "timeout_seconds": 1200.0
+    },
+    "compiler_cache_reused": false,
+    "tree_state_reused": false,
+    "skills_reused": false,
+    "heldout_reused": false,
+    "verdict": "verified_declared_atom_reuse_with_fresh_downstream_build"
+  },
+  "public_skill_export": {
+    "source_skillbank_sha256": "7988c7397f64ace0dc840f305aa641570740b35a98dde4504864f9b861b36099",
+    "node_bank_manifest_sha256": "fbea1a46416cadf2a20fc590cfea241c913c627c486e349a926e6c9134d188ae",
+    "skill_count": 153,
+    "skill_md_count": 153,
+    "reference_file_count": 153,
+    "provenance_file_count": 153,
+    "semantic_file_count": 459,
+    "agent_readable_mirror_file_count_including_manifests": 463,
+    "reference_atom_allowed_keys": [
+      "atom_id",
+      "decision",
+      "failure_mode",
+      "invariant",
+      "scope",
+      "trigger",
+      "verification"
+    ],
+    "provenance_allowed_keys": [
+      "created_at_batch",
+      "derived_from",
+      "format",
+      "member_atom_ids",
+      "references",
+      "skill_id",
+      "skill_md_sha256",
+      "status",
+      "superseded_by",
+      "version"
+    ],
+    "forbidden_structured_key_hits": {
+      "task_id": 0,
+      "trajectory_id": 0,
+      "source_item_id": 0,
+      "source_item_ids": 0,
+      "record_index": 0,
+      "record_sha256": 0,
+      "evaluator_result": 0,
+      "gold_answer": 0,
+      "answer_position": 0,
+      "boundary_embedding": 0
+    },
+    "bounded_source_task_id_hits_in_semantic_files": 0,
+    "source_record_sha256_hits_in_semantic_files": 0,
+    "explicit_evaluator_or_gold_label_hits_in_semantic_files": 0,
+    "plaintext_api_key_hits": 0,
+    "private_home_or_mnt_path_hits_in_agent_readable_mirror": 0,
+    "verdict": "no_identifier_field_or_known_secret_leak_detected"
+  },
+  "retrieval": {
+    "selection_rows": 200,
+    "exact_instruction_plus_task_type_queries": 200,
+    "top1_rows": 200,
+    "answer_position_appended_as_separate_query_field": 0,
+    "singleton_skill_selections": 195,
+    "support_five_skill_selections": 2,
+    "support_eight_skill_selections": 3
+  },
+  "claim_boundary": {
+    "public_export_scan_is_not_a_proof_against_incidental_overlap_with_common_natural_language_or_numeric_values": true,
+    "reference_mirror_was_mounted_but_no_reference_read_action_was_observed": true,
+    "r3_is_not_a_fresh_atom_extraction": true
+  }
+}
