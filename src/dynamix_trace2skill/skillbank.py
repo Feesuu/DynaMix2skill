@@ -29,6 +29,7 @@ from .openai_compat import OpenAI as CompatOpenAI
 _STRICT_SINGLE_VECTOR_TREE_POLICIES = frozenset(
     {
         "certified_dual_view_otd",
+        "contract_cut_ebst",
         "evidence_balanced_skill_tree",
     }
 )
@@ -36,6 +37,7 @@ _FULL_PROMPT_ANALYST_MODES = frozenset(
     {
         "evidence_bucket_consolidation",
         "cross_child_abstraction",
+        "contract_cut_skill",
     }
 )
 
@@ -726,6 +728,12 @@ class SkillBankSelector:
         )
         if is_ebst and not self.expected_tree_policy:
             self.expected_tree_policy = "evidence_balanced_skill_tree"
+        is_contract_cut = (
+            reported_tree_policy == "contract_cut_ebst"
+            or self.expected_tree_policy == "contract_cut_ebst"
+        )
+        if is_contract_cut and not self.expected_tree_policy:
+            self.expected_tree_policy = "contract_cut_ebst"
         if (
             (is_cdost or is_ebst)
             and export_policy.get("heldout_retrieval")
@@ -849,6 +857,17 @@ class SkillBankSelector:
             return selected
         order = np.argsort(-scores)[: max(1, min(int(top_k), len(docs)))]
         return [SkillSelection(skill=docs[int(i)], score=float(scores[int(i)])) for i in order]
+
+    def prepare_index(self) -> dict[str, Any]:
+        """Materialize and validate the immutable document embedding index."""
+        docs, embeddings = self._load_or_build_index()
+        return {
+            "document_count": len(docs),
+            "embedding_dimension": (
+                int(embeddings.shape[1]) if embeddings.ndim == 2 else 0
+            ),
+            "cache_path": str(self.cache_path.resolve()),
+        }
 
     def _load_or_build_index(self) -> tuple[list[SkillNodeDocument], np.ndarray]:
         if self._docs is not None and self._embeddings is not None:
